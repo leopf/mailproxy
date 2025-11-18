@@ -78,7 +78,7 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
           reply(535, "5.7.8  Authentication credentials invalid")
 
       # following is only stuff allowed in auth
-      elif authenticated and (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>", line)):
+      elif authenticated and (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>( AUTH=.*)?", line)):
         logging.debug("sending mail from mailbox: " + m["mailbox"])
         sender = m["mailbox"]
         recipients.clear()
