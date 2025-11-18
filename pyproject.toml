@@ -1,0 +1,41 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools"]
+
+[project]
+name = "mailproxy"
+version = "0.4.0"
+authors = [{ name = "leopf" }]
+description = "An IMAP and SMTP proxy to get back control of your E-Mails."
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[project.urls]
+Repository = "https://github.com/leopf/mailproxy"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mailproxy*"]
+
+[tool.ruff]
+line-length = 150
+indent-width = 2
+target-version = "py313"
+preview = true
+
+lint.select = ["F", "W293", "W291", "W191", "W292", "W391", "E703"]
+
+include = [
+    "mailproxy/*.py",
+    "tests/**.py",
+    "extra/**.py",
+    "examples/**.py",
+    "setup.py",
+]
+
+[tool.setuptools.package-data]
+"mailproxy" = ["py.typed"]
