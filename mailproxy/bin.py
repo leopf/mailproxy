@@ -20,6 +20,9 @@ async def run_imap(config: Config):
 def smtp_forward_mail(config: Config, sender: str, recipients: tuple[str, ...], data: bytes):
   print("FORWARDING:", data.decode())
 
+def authenticate(username: str, password: str) -> bool:
+  return False
+
 async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
   def write_line(line: str):
     writer.write(line.encode("ascii"))
@@ -47,46 +50,39 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
       if match_line(r"QUIT", line):
         reply(221, f"{config.domain} closing transmission channel")
         return
-      
-      if (m:=match_line(r"EHLO (?P<domain>.*)\s*", line)) or (m:=match_line(r"HELO (?P<domain>.*)\s*", line)):
-        logging.debug("connected from domain: " + m["domain"])
+      elif (m:=match_line(r"HELO (?P<domain>.*)\s*", line)):
+        logging.debug("HELO connected from domain: " + m["domain"])
         reply(250, config.domain)
-
-      if match_line(r"NOOP(\s.*)?", line):
+      elif ((m:=match_line(r"EHLO (?P<domain>.*)\s*", line))):
+        logging.debug("EHLO connected from domain: " + m["domain"])
+        write_line(f"250-{config.domain} hello")
+        write_line("250 AUTH PLAIN") # space for last!
+      elif match_line(r"NOOP(\s.*)?", line):
         reply(250, "OK")
-
-      if match_line(r"RSET", line):
+      elif match_line(r"RSET", line):
         logging.debug("resetting connection")
         sender = ""
         recipients.clear()
         reply(250, "OK")
-
-      if match_line(r"VRFY (?P<user>.*)", line):
+      elif match_line(r"VRFY (?P<user>.*)", line):
         raise NotImplementedError("https://datatracker.ietf.org/doc/html/rfc5321#section-3.5")
         """
         if name is allowed, get mailbox name and return with 250 inside <>
         if not, return 553 with message
         """
         reply(250, "OK")
-
-      if match_line(r"EXPN .*", line):
-        reply(451, "not implemented")
-
-      if match_line(r"HELP(\s(?P<arg0>))?", line):
+      elif match_line(r"HELP(\s(?P<arg0>))?", line):
         reply(250, "OK, but I am not helpful...")
-
-      if (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>", line)):
+      elif (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>", line)):
         logging.debug("sending mail from mailbox: " + m["mailbox"])
         sender = m["mailbox"]
         recipients.clear()
         reply(250, "OK")
-
-      if (m:=match_line(r"RCPT TO:<(?P<recipient>.*)>", line)):
+      elif (m:=match_line(r"RCPT TO:<(?P<recipient>.*)>", line)):
         logging.debug("added recipient: " + m["recipient"])
         recipients.append(m["recipient"])
         reply(250, "OK")
-
-      if match_line(f"DATA", line):
+      elif match_line(f"DATA", line):
         reply(354, "Start mail input; end with <CRLF>.<CRLF>")
         mail_data = (await reader.readuntil(b"\r\n.\r\n"))[:-5]
         try:
@@ -98,6 +94,8 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
         finally:
           sender = ""
           recipients.clear()
+      else:
+        reply(500, "unknown")
 
   except Exception as e:
     logging.error("connection closing because of an error", e)
