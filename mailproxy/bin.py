@@ -35,6 +35,7 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
 
     write_line(f"{code} {textstring}")
 
+  authenticated: bool = False
   sender: str = ""
   recipients: list[str] = []
 
@@ -65,31 +66,35 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
         sender = ""
         recipients.clear()
         reply(250, "OK")
-      elif match_line(r"VRFY (?P<user>.*)", line):
+
+      # authorization
+      elif (m:=match_line(r"AUTH PLAIN (?P<data>.*)", line)):
+        data = base64.b64decode(m["data"]).split(b"\0")
+        if authenticate(data[1].decode(), data[1].decode()):
+          reply(235, "2.7.0  Authentication Succeeded")
+          authenticated = True
+        else:
+          authenticated = False
+          reply(535, "5.7.8  Authentication credentials invalid")
+
+      # following is only stuff allowed in auth
+      elif authenticated and match_line(r"VRFY (?P<user>.*)", line):
         raise NotImplementedError("https://datatracker.ietf.org/doc/html/rfc5321#section-3.5")
         """
         if name is allowed, get mailbox name and return with 250 inside <>
         if not, return 553 with message
         """
         reply(250, "OK")
-      elif (m:=match_line(r"AUTH PLAIN (?P<data>.*)", line)):
-        data = base64.b64decode(m["data"]).split(b"\0")
-        if authenticate(data[1].decode(), data[1].decode()):
-          reply(235, "2.7.0  Authentication Succeeded")
-        else:
-          reply(535, "5.7.8  Authentication credentials invalid")
-      elif match_line(r"HELP(\s(?P<arg0>))?", line):
-        reply(250, "OK, but I am not helpful...")
-      elif (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>", line)):
+      elif authenticated and (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>", line)):
         logging.debug("sending mail from mailbox: " + m["mailbox"])
         sender = m["mailbox"]
         recipients.clear()
         reply(250, "OK")
-      elif (m:=match_line(r"RCPT TO:<(?P<recipient>.*)>", line)):
+      elif authenticated and (m:=match_line(r"RCPT TO:<(?P<recipient>.*)>", line)):
         logging.debug("added recipient: " + m["recipient"])
         recipients.append(m["recipient"])
         reply(250, "OK")
-      elif match_line(f"DATA", line):
+      elif authenticated and match_line(f"DATA", line):
         reply(354, "Start mail input; end with <CRLF>.<CRLF>")
         mail_data = (await reader.readuntil(b"\r\n.\r\n"))[:-5]
         try:
