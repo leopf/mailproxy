@@ -1,4 +1,4 @@
-import functools, asyncio, dataclasses, re, logging
+import functools, asyncio, dataclasses, re, logging, base64
 
 def match_line(pattern: str, line: str, flags: int = re.I):
   m = re.fullmatch(pattern, line, flags)
@@ -21,7 +21,8 @@ def smtp_forward_mail(config: Config, sender: str, recipients: tuple[str, ...], 
   print("FORWARDING:", data.decode())
 
 def authenticate(username: str, password: str) -> bool:
-  return False
+  print("try auth", username, password)
+  return True
 
 async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
   def write_line(line: str):
@@ -71,6 +72,12 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
         if not, return 553 with message
         """
         reply(250, "OK")
+      elif (m:=match_line(r"AUTH PLAIN (?P<data>.*)", line)):
+        data = base64.b64decode(m["data"]).split(b"\0")
+        if authenticate(data[1].decode(), data[1].decode()):
+          reply(235, "2.7.0  Authentication Succeeded")
+        else:
+          reply(535, "5.7.8  Authentication credentials invalid")
       elif match_line(r"HELP(\s(?P<arg0>))?", line):
         reply(250, "OK, but I am not helpful...")
       elif (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>", line)):
