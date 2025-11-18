@@ -68,7 +68,7 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
         reply(250, "OK")
 
       # authorization
-      elif (m:=match_line(r"AUTH PLAIN (?P<data>.*)", line)):
+      elif (m:=match_line(r"AUTH PLAIN (?P<data>[a-z0-9\+\/]*(=|==)?)", line)):
         data = base64.b64decode(m["data"]).split(b"\0")
         if authenticate(data[1].decode(), data[1].decode()):
           reply(235, "2.7.0  Authentication Succeeded")
@@ -78,13 +78,6 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
           reply(535, "5.7.8  Authentication credentials invalid")
 
       # following is only stuff allowed in auth
-      elif authenticated and match_line(r"VRFY (?P<user>.*)", line):
-        raise NotImplementedError("https://datatracker.ietf.org/doc/html/rfc5321#section-3.5")
-        """
-        if name is allowed, get mailbox name and return with 250 inside <>
-        if not, return 553 with message
-        """
-        reply(250, "OK")
       elif authenticated and (m:=match_line(r"MAIL FROM:<(?P<mailbox>.*)>", line)):
         logging.debug("sending mail from mailbox: " + m["mailbox"])
         sender = m["mailbox"]
@@ -106,6 +99,13 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
         finally:
           sender = ""
           recipients.clear()
+      elif authenticated and match_line(r"VRFY (?P<user>.*)", line):
+        raise NotImplementedError("https://datatracker.ietf.org/doc/html/rfc5321#section-3.5")
+        """
+        if name is allowed, get mailbox name and return with 250 inside <>
+        if not, return 553 with message
+        """
+        reply(250, "OK")
       else:
         reply(500, "unknown")
 
