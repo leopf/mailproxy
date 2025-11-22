@@ -1,3 +1,4 @@
+from typing import Literal
 import functools, asyncio, dataclasses, re, logging, base64, enum, argparse, pathlib, json, webbrowser, urllib.parse, http.server, ssl, \
   importlib.resources, urllib.request, urllib.error
 
@@ -211,6 +212,96 @@ async def exec_run():
     imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.IMAP_port)
     tg.create_task(imap_server.serve_forever(), name="IMAP server")
 
+class TLSMode(enum.Enum):
+  DIRECT = "DIRECT"
+  STARTTLS = "STARTTLS"
+  NONE = "NONE"
+
+class IMAPClient:
+  def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    self._reader = reader
+    self._writer = writer
+    self._command_counter = 0
+
+  async def init(self):
+    logging.debug("IMAP init: " + await self._read_line())
+
+  async def capability(self):
+    caps: list[str] = []
+    rid = self._command("CAPABILITY")
+    async for uline in self._read_returns(rid):
+      if (m:=match_line(r"\*\s+CAPABILITY(?P<caps>(\s+[^\s]+)*)", uline)):
+        caps.extend(re.split(r"\s+",  m["caps"].strip()))
+    return tuple(caps)
+  
+  async def authenticate_xoauth2(self, email: str, access_token: str):
+    rid = self._command("AUTHENTICATE XOAUTH2")
+    if not (await self._read_line()).startswith("+"):
+      raise RuntimeError("Invalid response from server!")
+    self._writer.write(base64.b64encode(f"user={email}\1auth=Bearer {access_token}\1\1".encode()))
+    self._writer.write(b"\r\n")
+    async for _ in self._read_returns(rid): pass
+
+  async def list(self, refname: str, mailbox: str):
+    if "\"" in refname or "\"" in mailbox:
+      raise ValueError("neither base or search can have quote!")
+    rid = self._command(f"LIST \"{refname}\" \"{mailbox}\"")
+    async for uline in self._read_returns(rid):
+      if (m:=match_line(r"\*\s+LIST\s+(?P<rest>.*)", uline)):
+        print(m["rest"])
+    
+  async def start_tls(self):
+    rid = self._command("STARTTLS")
+    raise NotImplementedError()
+
+  async def _read_returns(self, rid: int):
+    end_linestart = str(rid) + " "
+    while not (line := await self._read_line()).startswith(end_linestart):
+      yield line
+
+    result = match_line(r"[^ ]+ (?P<code>[^ ]+) (?P<text>.*)", line)
+    assert result is not None
+    if result["code"] != "OK":
+      raise Exception(f"IMAP failed with code '{result['code']}' and message: {result['text']}")
+
+    logging.debug("IMAP command completed: " + line)
+
+  async def _read_line(self):
+    return (await self._reader.readuntil(b"\r\n"))[:-2].decode()
+
+  def _command(self, line: str):
+    self._command_counter += 1
+    self._writer.write(str(self._command_counter).encode())
+    self._writer.write(b" ")
+    self._writer.write(line.encode())
+    self._writer.write(b"\r\n")
+    return self._command_counter
+
+  @staticmethod
+  async def connect(host: str, port: int, tlsmode: TLSMode):
+    ssl_param = ssl.create_default_context() if tlsmode == TLSMode.DIRECT else None
+    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_param)
+    client = IMAPClient(reader, writer)
+    await client.init()
+    if tlsmode == TLSMode.STARTTLS:
+      await client.start_tls()
+
+    return client
+  
+
+async def exec_dev(config_path: pathlib.Path):
+  logging.basicConfig(level=logging.DEBUG)
+
+  config = json.loads(config_path.read_text())
+  # TODO validate...
+
+  client = await IMAPClient.connect(config["imap"]["host"], config["imap"]["port"], TLSMode(config["imap"]["tlsmode"].upper()))
+  capabilities = await client.capability()
+  assert "AUTH=XOAUTH2" in capabilities
+  
+  await client.authenticate_xoauth2(config["email"], config["access_token"])
+  print(await client.list("", ""))
+
 def exec_get_token(config_path: pathlib.Path):
   config = json.loads(config_path.read_text())
 
@@ -239,9 +330,13 @@ def exec_get_token(config_path: pathlib.Path):
       print("valid until: ", str(datetime.now() + timedelta(seconds=response_json["expires_in"])))
       print("access_token: ", response_json["access_token"])
 
+      if "refresh_token" in response_json:
+        config["refresh_token"] = response_json["refresh_token"]
+
   except urllib.request.HTTPError as e:
     print("failed to get refresh token: ", e.read())
 
+  config_path.write_text(json.dumps(config, indent=4))
 
 def exec_login(config_path: pathlib.Path):
   config = json.loads(config_path.read_text())
@@ -342,6 +437,10 @@ if __name__ == "__main__":
   get_token_parser = subparsers.add_parser("get-token")
   get_token_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
 
+  dev_parser = subparsers.add_parser("dev")
+  dev_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
+
+
   args = parser.parse_args()
 
   if args.command == "run":
@@ -350,5 +449,7 @@ if __name__ == "__main__":
     exec_login(args.config)
   elif args.command == "get-token":
     exec_get_token(args.config)
+  elif args.command == "dev":
+    asyncio.run(exec_dev(args.config))
   else:
     raise RuntimeError("unknown command!")
