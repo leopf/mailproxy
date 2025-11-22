@@ -38,4 +38,4 @@ include = [
 ]
 
 [tool.setuptools.package-data]
-"mailproxy" = ["py.typed"]
+"mailproxy" = ["py.typed", "assets/*"]
