@@ -1,20 +1,13 @@
-from typing import Literal
-import functools, asyncio, dataclasses, re, logging, base64, enum, argparse, pathlib, json, webbrowser, urllib.parse, http.server, ssl, \
-  importlib.resources, urllib.request, urllib.error
+import functools, asyncio, re, logging, base64, enum, argparse, pathlib, json, webbrowser, urllib.parse, http.server, ssl, \
+  importlib.resources
+
+from mailproxy.config import AuthenticationOAUTH2, Config
+from mailproxy.oauth import oauth_fetch_access_token_with_refresh_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
 
 def match_line(pattern: str, line: str, flags: int = re.I):
   m = re.fullmatch(pattern, line, flags)
   if m is None: return None
   else: return { "": "" } | m.groupdict()
-
-@dataclasses.dataclass
-class Config:
-  database_path: str
-  domain: str # verify!!
-  log_level: int = logging.ERROR
-  host: str = "127.0.0.1"
-  IMAP_port: int = 143
-  SMTP_port: int = 587
 
 def smtp_forward_mail(config: Config, sender: str, recipients: tuple[str, ...], data: bytes):
   print("FORWARDING:", data.decode())
@@ -194,22 +187,12 @@ async def handle_smtp(config: Config, reader: asyncio.StreamReader, writer: asyn
     logging.debug("connection closed")
     writer.close()
 
-async def exec_run():
-  config = Config(
-    log_level=logging.DEBUG,
-    database_path="/tmp/mailproxy.sqlite",
-    domain="example.com",
-    SMTP_port=1587,
-    IMAP_port=1143,
-  )
-
-  logging.basicConfig(level=config.log_level)
-
+async def exec_run(config: Config):
   async with asyncio.TaskGroup() as tg:
-    smtp_server = await asyncio.start_server(functools.partial(handle_smtp, config), config.host, config.SMTP_port)
+    smtp_server = await asyncio.start_server(functools.partial(handle_smtp, config), config.host, config.smtp_port)
     tg.create_task(smtp_server.serve_forever(), name="SMTP server")
 
-    imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.IMAP_port)
+    imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.imap_port)
     tg.create_task(imap_server.serve_forever(), name="IMAP server")
 
 class TLSMode(enum.Enum):
@@ -302,77 +285,47 @@ async def exec_dev(config_path: pathlib.Path):
   await client.authenticate_xoauth2(config["email"], config["access_token"])
   print(await client.list("", ""))
 
-def exec_get_token(config_path: pathlib.Path):
-  config = json.loads(config_path.read_text())
+def exec_get_token(config: Config, address: str):
+  try:
+    account = next(account for account in config.accounts if address in account.addresses)
+  except StopIteration:
+    raise RuntimeError(f"config has no account for address '{address}'")  
+  
+  auth = account.auth
+  if not isinstance(auth, AuthenticationOAUTH2):
+    raise RuntimeError("authentication for account must be oauth2 for login")
 
-  token_data = f"client_id={urllib.parse.quote(config["client_id"])}&scope={urllib.parse.quote(config["scope"])}" + \
-    f"&refresh_token={urllib.parse.quote(config["refresh_token"])}&grant_type=refresh_token"
-  if "client_secret" in config:
-    token_data += f"&client_secret={urllib.parse.quote(config["client_secret"])}"
+  access_token_result = oauth_fetch_access_token_with_refresh_token(auth, auth.initial_refresh_token)
 
-  token_request = urllib.request.Request(
-    config["token_endpoint"], 
-    data=token_data.encode(), 
-    method="POST", 
-    headers={
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Accept": "application/json",
-    }
-  )
+  print("success, we have an access and refresh token :)")
+  print("expires at: ", str(access_token_result.expires_at))
+  print("access token: ", access_token_result.access_token)
+  print("refresh token: ", access_token_result.refresh_token)
+
+def exec_login(config: Config, address: str):
+  try:
+    account = next(account for account in config.accounts if address in account.addresses)
+  except StopIteration:
+    raise RuntimeError(f"config has no account for address '{address}'")  
+  
+  auth = account.auth
+  if not isinstance(auth, AuthenticationOAUTH2):
+    raise RuntimeError("authentication for account must be oauth2 for login")
 
   try:
-    with urllib.request.urlopen(token_request) as resp:
-      response_json = json.loads(resp.read())
-      if response_json["token_type"] != "Bearer":
-        raise RuntimeError(f"wrong token response token_type: '{response_json["token_type"]}'") # sanity check      
-      
-      from datetime import datetime, timedelta
-      print("valid until: ", str(datetime.now() + timedelta(seconds=response_json["expires_in"])))
-      print("access_token: ", response_json["access_token"])
-
-      if "refresh_token" in response_json:
-        config["refresh_token"] = response_json["refresh_token"]
-
-  except urllib.request.HTTPError as e:
-    print("failed to get refresh token: ", e.read())
-
-  config_path.write_text(json.dumps(config, indent=4))
-
-def exec_login(config_path: pathlib.Path):
-  config = json.loads(config_path.read_text())
-
-  if "authorization_endpoint" not in config or not isinstance(config["authorization_endpoint"], str):
-    raise ValueError("""expected "authorization_endpoint" to be a str""")
-  
-  if "client_id" not in config or not isinstance(config["client_id"], str):
-    raise ValueError("""expected "client_id" to be a str""")
-  
-  if "authorization_endpoint" not in config or not isinstance(config["authorization_endpoint"], str):
-    raise ValueError("""expected "authorization_endpoint" to be a str""")
-  
-  if "redirection_endpoint" not in config or not isinstance(config["redirection_endpoint"], str):
-    raise ValueError("""expected "client_id" to be a str""")
-  
-  try:
-    redirection_endpoint: urllib.parse.ParseResult = urllib.parse.urlparse(config["redirection_endpoint"])
+    redirection_endpoint: urllib.parse.ParseResult = urllib.parse.urlparse(auth.redirect_url)
   except:
     raise ValueError("Invalid redirect url!")
+  
+  if redirection_endpoint.hostname is None:
+    raise ValueError("hostname of redirect url is None")
+  
+  if redirection_endpoint.port is None:
+    raise ValueError("port of redirect url is None")
 
-  if redirection_endpoint.hostname not in ("localhost", "127.0.0.1"): # overly restrictive
-    raise ValueError("Invalid redirect url!")
+  webbrowser.open(oauth_get_authorization_url(auth))
 
-  if "scope" not in config or not isinstance(config["scope"], str):
-    raise ValueError("""expected "scope" to be a list of strings""")
-
-
-  provider_query_base = f"client_id={urllib.parse.quote(config["client_id"])}&redirect_uri={urllib.parse.quote(redirection_endpoint.geturl())}" + \
-    f"&scope={urllib.parse.quote(config["scope"])}"
-
-  authorize_url = f"{config["authorization_endpoint"]}?{provider_query_base}&response_type=code&response_mode=query"
-    
-  webbrowser.open(authorize_url)
-
-  authorization_code: None | str = None# "M.C550_BL2.2.U.3f285045-c0c4-3f70-3ff3-732caa3f868c"
+  authorization_code: None | str = None # "M.C550_BL2.2.U.3f285045-c0c4-3f70-3ff3-732caa3f868c"
 
   class AuthorizationHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -387,7 +340,7 @@ def exec_login(config_path: pathlib.Path):
       self.end_headers()
       self.wfile.write(body)
 
-  auth_server = http.server.HTTPServer((redirection_endpoint.hostname, int(redirection_endpoint.port or 80)), AuthorizationHandler)
+  auth_server = http.server.HTTPServer((redirection_endpoint.hostname, redirection_endpoint.port), AuthorizationHandler)
 
   if redirection_endpoint.scheme == "https":
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -399,56 +352,40 @@ def exec_login(config_path: pathlib.Path):
   while authorization_code is None:
     auth_server.handle_request()
 
-  token_data = f"{provider_query_base}&code={urllib.parse.quote(authorization_code)}&grant_type=authorization_code"
-  if "client_secret" in config:
-    token_data += f"&client_secret={urllib.parse.quote(config["client_secret"])}"
+  access_token_result = oauth_fetch_access_token_with_authorization_code(auth, authorization_code)
 
-  token_request = urllib.request.Request(
-    config["token_endpoint"], 
-    data=token_data.encode(), 
-    method="POST", 
-    headers={
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Accept": "application/json",
-    }
-  )
-
-  try:
-    with urllib.request.urlopen(token_request) as resp:
-      response_json = json.loads(resp.read())
-      if response_json["token_type"] != "Bearer":
-        raise RuntimeError(f"wrong token response token_type: '{response_json["token_type"]}'") # sanity check      
-      config["refresh_token"] = response_json["refresh_token"]
-
-  except urllib.request.HTTPError as e:
-    print("failed to get refresh token: ", e.read())
-
-  config_path.write_text(json.dumps(config, indent=4))
+  print("success, we have an access and refresh token :)")
+  print("expires at: ", str(access_token_result.expires_at))
+  print("access token: ", access_token_result.access_token)
+  print("refresh token: ", access_token_result.refresh_token)
 
 if __name__ == "__main__":
   parser = argparse.ArgumentParser()
-  subparsers = parser.add_subparsers(dest="command")
+  parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
 
+  subparsers = parser.add_subparsers(dest="command")
+  
   run_parser = subparsers.add_parser("run")
 
   login_parser = subparsers.add_parser("login")
-  login_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
+  login_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
   
   get_token_parser = subparsers.add_parser("get-token")
-  get_token_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
+  get_token_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
 
-  dev_parser = subparsers.add_parser("dev")
-  dev_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
-
-
+  # ----
+  
   args = parser.parse_args()
 
+  config = Config.from_dict(json.loads(args.config.read_text()))
+  logging.basicConfig(level=config.log_level)
+
   if args.command == "run":
-    asyncio.run(exec_run())
+    asyncio.run(exec_run(config))
   elif args.command == "login":
-    exec_login(args.config)
+    exec_login(config, args.address)
   elif args.command == "get-token":
-    exec_get_token(args.config)
+    exec_get_token(config, args.address)
   elif args.command == "dev":
     asyncio.run(exec_dev(args.config))
   else:

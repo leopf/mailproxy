@@ -1,5 +1,5 @@
 import logging, dataclasses, enum, pathlib, re
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 
 T = TypeVar("T")
 def _get_type(d: Any, field_name: str, expected_type: type[T], default: T | None = None) -> T:
