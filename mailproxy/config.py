@@ -84,7 +84,8 @@ class AuthenticationPLAIN:
 @dataclasses.dataclass
 class Account:
   addresses: list[str]
-  
+  db_path: pathlib.Path
+
   imap_host: str
   imap_port: int
   imap_tlsmode: TLSMode
@@ -95,7 +96,7 @@ class Account:
   auth: AuthenticationOAUTH2 | AuthenticationPLAIN
 
   @staticmethod
-  def from_dict(d: Any):
+  def from_dict(d: Any, data_dir: pathlib.Path):
     if not isinstance(d, dict):
       raise ValueError("expected config to be a dict")
     
@@ -103,6 +104,8 @@ class Account:
     if not isinstance(addresses, list) or len(addresses) == 0 or \
         any(not isinstance(address, str) for address in addresses):
       raise ValueError("Invalid addresses")
+    
+    db_path_str = _get_str(d, "db_path", str(data_dir.joinpath(re.sub(r"[^a-zA-Z0-9]", "_", addresses[0]) + ".sqlite")))
       
     auth = AuthenticationPLAIN.from_dict(d.get("auth")) or AuthenticationOAUTH2.from_dict(d.get("auth"))
     if auth is None:
@@ -110,6 +113,7 @@ class Account:
 
     return Account(
       addresses=addresses,
+      db_path=pathlib.Path(db_path_str),
       imap_host=_get_host(d, "imap_host"),
       imap_port=_get_port(d, "imap_port"),
       imap_tlsmode=TLSMode.from_value(_get_str(d, "imap_tlsmode")),
@@ -122,7 +126,6 @@ class Account:
 
 @dataclasses.dataclass
 class Config:
-  data_dir: pathlib.Path
   accounts: list[Account]
   domain: str
   
@@ -145,8 +148,7 @@ class Config:
       raise ValueError("Invalid accounts")
 
     return Config(
-      data_dir=data_dir,
-      accounts=[ Account.from_dict(a) for a in d["accounts"] ],
+      accounts=[ Account.from_dict(a, data_dir) for a in d["accounts"] ],
       domain=_get_host(d, "domain"),
       log_level=logging.getLevelNamesMapping().get(_get_str(d, "log_level", "DEBUG"), logging.DEBUG),
       host=_get_host(d, "host"),
