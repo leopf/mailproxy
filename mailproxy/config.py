@@ -45,22 +45,21 @@ class TLSMode(enum.Enum):
 class AuthenticationOAUTH2:
   scope: str
   client_id: str
+  client_secret: str | None
   authorization_base_url: str
   token_url: str
   redirect_url: str
   initial_refresh_token: str
-  auth: Literal["OAUTH2"] = "OAUTH2"
 
   @staticmethod
   def from_dict(d: Any):
-    if not isinstance(d, dict):
-      raise ValueError("expected config to be a dict")
-    if _get_str(d, "auth") != "OAUTH2":
+    if _get_str(d, "type") != "OAUTH2":
       return None
     
     return AuthenticationOAUTH2(
       scope=_get_str(d, "scope"),
       client_id=_get_str(d, "client_id"),
+      client_secret=_get_str(d, "client_id", "") or None,
       authorization_base_url=_get_str(d, "authorization_base_url"),
       token_url=_get_str(d, "token_url"),
       redirect_url=_get_str(d, "redirect_url"),
@@ -70,13 +69,10 @@ class AuthenticationOAUTH2:
 @dataclasses.dataclass
 class AuthenticationPLAIN:
   password: str
-  auth: Literal["PLAIN"] = "PLAIN"
 
   @staticmethod
   def from_dict(d: Any):
-    if not isinstance(d, dict):
-      raise ValueError("expected config to be a dict")
-    if _get_str(d, "auth") != "PLAIN":
+    if _get_str(d, "type") != "PLAIN":
       return None
     
     return AuthenticationPLAIN(_get_str(d, "password"))
