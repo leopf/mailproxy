@@ -1,5 +1,5 @@
-import urllib.parse, urllib.request, json, datetime, dataclasses
-from mailproxy.config import AuthenticationOAUTH2
+import urllib.parse, urllib.request, json, datetime, dataclasses, base64
+from mailproxy.config import Account, AuthenticationOAUTH2, Config
 
 @dataclasses.dataclass
 class OAUTHAccessTokenResult:
@@ -43,3 +43,14 @@ def oauth_fetch_access_token_with_authorization_code(auth: AuthenticationOAUTH2,
 def oauth_get_authorization_url(auth: AuthenticationOAUTH2):
   data = { "client_id": auth.client_id, "scope": auth.scope, "redirect_uri": auth.redirect_url, "response_type": "code", "response_mode": "query" }
   return f"{auth.authorization_base_url}?{urllib.parse.urlencode(data)}"
+
+def authenticate_sasl(config: Config, sasl_b64: str):
+  data = base64.b64decode(sasl_b64).split(b"\0")
+  return authenticate(config, data[1].decode(), data[1].decode())
+
+def authenticate(config: Config, username: str, password: str) -> Account | None:
+  print("try auth", username, password)  
+  try:
+    return next(account for account in config.accounts if username in account.addresses)
+  except:
+    return None

@@ -24,8 +24,8 @@ def _get_port(d: Any, field_name: str, default: int | None = None):
     raise ValueError(f"port out of range for field '{field_name}'!")
   return value
 
-def _get_host(d, field_name: str):
-  value = _get_str(d, field_name).strip()
+def _get_host(d, field_name: str, default: str | None = None):
+  value = _get_str(d, field_name, default).strip()
   if not re.fullmatch(r"[A-Za-z0-9.-\[\]:]+", value):
     raise ValueError(f"Invalid characters in {field_name}")
   return value
@@ -124,12 +124,10 @@ class Account:
 class Config:
   accounts: list[Account]
   domain: str
-  
-  log_level: int = logging.ERROR
-
-  host: str = "0.0.0.0"
-  imap_port: int = 143
-  smtp_port: int = 587
+  log_level: int
+  host: str
+  imap_port: int
+  smtp_port: int
 
   @staticmethod
   def from_dict(d: Any):
@@ -145,9 +143,9 @@ class Config:
 
     return Config(
       accounts=[ Account.from_dict(a, data_dir) for a in d["accounts"] ],
-      domain=_get_host(d, "domain"),
       log_level=logging.getLevelNamesMapping().get(_get_str(d, "log_level", "DEBUG"), logging.DEBUG),
-      host=_get_host(d, "host"),
+      domain=_get_host(d, "domain"),
+      host=_get_host(d, "host", "0.0.0.0"),
       imap_port=_get_port(d, "imap_port", 143),
       smtp_port=_get_port(d, "smtp_port", 587),
     )
