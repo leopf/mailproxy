@@ -285,7 +285,7 @@ async def exec_dev(config_path: pathlib.Path):
   await client.authenticate_xoauth2(config["email"], config["access_token"])
   print(await client.list("", ""))
 
-def exec_get_token(config: Config, address: str):
+def exec_get_access_token(config: Config, address: str):
   try:
     account = next(account for account in config.accounts if address in account.addresses)
   except StopIteration:
@@ -325,7 +325,7 @@ def exec_login(config: Config, address: str):
 
   webbrowser.open(oauth_get_authorization_url(auth))
 
-  authorization_code: None | str = None # "M.C550_BL2.2.U.3f285045-c0c4-3f70-3ff3-732caa3f868c"
+  authorization_code: None | str = None
 
   class AuthorizationHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -384,8 +384,8 @@ if __name__ == "__main__":
     asyncio.run(exec_run(config))
   elif args.command == "login":
     exec_login(config, args.address)
-  elif args.command == "get-token":
-    exec_get_token(config, args.address)
+  elif args.command == "get-access-token":
+    exec_get_access_token(config, args.address)
   elif args.command == "dev":
     asyncio.run(exec_dev(args.config))
   else:
