@@ -41,7 +41,7 @@ class TLSMode(enum.Enum):
       raise ValueError("Invalid TLSMode!")
     return TLSMode(value)
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class AuthenticationOAUTH2:
   scope: str
   client_id: str
@@ -66,7 +66,7 @@ class AuthenticationOAUTH2:
       initial_refresh_token=_get_str(d, "initial_refresh_token"),
     )
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class AuthenticationPLAIN:
   password: str
 
@@ -77,7 +77,7 @@ class AuthenticationPLAIN:
     
     return AuthenticationPLAIN(_get_str(d, "password"))
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Account:
   addresses: list[str]
   db_path: pathlib.Path
@@ -120,7 +120,7 @@ class Account:
     )
     
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Config:
   accounts: list[Account]
   domain: str
