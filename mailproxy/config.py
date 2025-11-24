@@ -26,8 +26,8 @@ def _get_port(d: Any, field_name: str, default: int | None = None):
 
 def _get_host(d, field_name: str, default: str | None = None):
   value = _get_str(d, field_name, default).strip()
-  if not re.fullmatch(r"[A-Za-z0-9.-\[\]:]+", value):
-    raise ValueError(f"Invalid characters in {field_name}")
+  if not re.fullmatch(r"[A-Za-z0-9.\-\[\]:]+", value):
+    raise ValueError(f"Invalid characters in {field_name} regading value '{value}'")
   return value
 
 class TLSMode(enum.Enum):
@@ -59,7 +59,7 @@ class AuthenticationOAUTH2:
     return AuthenticationOAUTH2(
       scope=_get_str(d, "scope"),
       client_id=_get_str(d, "client_id"),
-      client_secret=_get_str(d, "client_id", "") or None,
+      client_secret=_get_str(d, "client_secret", "") or None,
       authorization_base_url=_get_str(d, "authorization_base_url"),
       token_url=_get_str(d, "token_url"),
       redirect_url=_get_str(d, "redirect_url"),
