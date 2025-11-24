@@ -31,8 +31,11 @@ def regex(pattern: str, flags: int = 0) -> Parser[re.Match]:
     match = matcher.match(s)
     if match is None:
       raise TryParseError(f"failed to parse '{pattern}'", s)
-    return match, s[match.endpos]
+    return match, s[match.end():]
   return _inner
+
+def regex_str(pattern: str, flags: int = 0) -> Parser[str]:
+  return transform(regex(pattern, flags), lambda match: match.group())
 
 def transform(parser: Parser[T], transformer: Callable[[T], U]) -> Parser[U]:
   def _inner(s: str):

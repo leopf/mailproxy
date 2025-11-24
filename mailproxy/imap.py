@@ -1,24 +1,29 @@
-import asyncio, base64, logging, ssl, re, enum
+import asyncio, base64, logging, ssl, re, enum, mailproxy.parser as P
+from types import SimpleNamespace
 from mailproxy.auth import authenticate_sasl
-from mailproxy.config import Config, TLSMode
+from mailproxy.config import Account, Config, TLSMode
 from mailproxy.utils import match_line
+
+G = SimpleNamespace()
+G.nil = P.transform(P.const("NIL"), lambda _: None)
+G.quoted = P.transform(P.regex(r'"(?P<inner>(?:[^"\\]|\\")*)"'), lambda parts: parts.group("inner"))
+G.astring = P.alt(G.quoted, P.regex_str(rf'[^{"".join(re.escape(c) for c in "(){ }*%\"\\")}\x00-\x1F\x7F]+'))
 
 class IMAPClient:
   def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._reader = reader
     self._writer = writer
     self._command_counter = 0
+    self.capabilities: tuple[str, ...] = ()
 
   async def init(self):
     logging.debug("IMAP init: " + await self._read_line())
-
-  async def capability(self):
     caps: list[str] = []
     rid = self._command("CAPABILITY")
     async for uline in self._read_returns(rid):
       if (m:=match_line(r"\*\s+CAPABILITY(?P<caps>(\s+[^\s]+)*)", uline)):
         caps.extend(re.split(r"\s+",  m["caps"].strip()))
-    return tuple(caps)
+    self.capabilities = tuple(caps)
   
   async def authenticate_xoauth2(self, email: str, access_token: str):
     rid = self._command("AUTHENTICATE XOAUTH2")
@@ -31,9 +36,12 @@ class IMAPClient:
   async def list(self, refname: str, mailbox: str):
     if "\"" in refname or "\"" in mailbox:
       raise ValueError("neither base or search can have quote!")
+    
     rid = self._command(f"LIST \"{refname}\" \"{mailbox}\"")
+    mailboxes: list[tuple[str, str]] = []
+  
     async for uline in self._read_returns(rid):
-      if (m:=match_line(r"\*\s+LIST\s+(?P<rest>.*)", uline)):
+      if (m:=match_line(r"\*\s+LIST\s+\((?P<attributes>[^\)]*)\)\s+\"(?P<delimiter>)\"\s+(?P<mailbox>(INBOX)|)", uline)):
         print(m["rest"])
     
   async def start_tls(self):
@@ -53,7 +61,20 @@ class IMAPClient:
     logging.debug("IMAP command completed: " + line)
 
   async def _read_line(self):
-    return (await self._reader.readuntil(b"\r\n"))[:-2].decode()
+    line = (await self._reader.readuntil(b"\r\n"))[:-2]
+    chunks: list[str] = []
+    index = 0
+    while index < len(line):
+      next_and = line.find(b"&", index)
+      if next_and == -1: 
+        chunks.append(line[index:].decode())
+        index = len(line)
+      else:
+        chunks.append(line[index:next_and].decode())
+        end_index = line.find(b"-", next_and + 1)
+        chunks.append(base64.b64decode(line[next_and + 1:end_index] + b"=" * (((5 - end_index + next_and) % 4) % 4)).decode("utf-16-be"))
+        index = end_index + 1
+    return ''.join(chunks)
 
   def _command(self, line: str):
     self._command_counter += 1
@@ -64,14 +85,13 @@ class IMAPClient:
     return self._command_counter
 
   @staticmethod
-  async def connect(host: str, port: int, tlsmode: TLSMode):
-    ssl_param = ssl.create_default_context() if tlsmode == TLSMode.DIRECT else None
-    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_param)
+  async def connect(account: Account):
+    ssl_param = ssl.create_default_context() if account.imap_tlsmode == TLSMode.DIRECT else None
+    reader, writer = await asyncio.open_connection(account.imap_host, account.imap_port, ssl=ssl_param)
     client = IMAPClient(reader, writer)
     await client.init()
-    if tlsmode == TLSMode.STARTTLS:
+    if account.imap_tlsmode == TLSMode.STARTTLS:
       await client.start_tls()
-
     return client
   
 class IMAPState(enum.Enum):
