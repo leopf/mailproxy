@@ -53,8 +53,8 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
 
   return conn
 
-def db_mailbox_id(db: sqlite3.Connection, name: bytes):
-  result = db.execute("SELECT id FROM mailboxes WHERE name=?", (name,)).fetchone()
+def db_mailbox_id(db: sqlite3.Connection, account_key: str, name: bytes):
+  result = db.execute("SELECT id FROM mailboxes WHERE account_key=? AND name=?", (name,)).fetchone()
   if result is None: return None
   return result[0]
 

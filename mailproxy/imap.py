@@ -196,20 +196,22 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
         userid = await imap_reader.read_astring_sp()
         password = await imap_reader.read_astring_sp()
         await imap_reader.end_line()
-        if authenticate(config, userid, password):
-          write_line(f"{tag} OK Success")
-        else:
+        if (login_account:=authenticate(config, userid, password)) is None:
           write_line(f"{tag} NO Failed")
+        else:
+          account = login_account
+          write_line(f"{tag} OK Success")
       elif command == b"AUTHENITCATE":
         try: await imap_reader.read_const(b"PLAIN")
         except IMAPError as e: raise IMAPError(b"Only plain auth supported for now!", e)
         await imap_reader.end_line()
         write_line("+")
         auth_line = await imap_reader.read_line_str()
-        if authenticate_sasl(config, auth_line):
-          write_line(f"{tag} OK Success")
-        else:
+        if (login_account:=authenticate_sasl(config, auth_line)) is None:
           write_line(f"{tag} NO Failed")
+        else:
+          account = login_account
+          write_line(f"{tag} OK Success")
       elif command == b"SUBSCRIBE":
         _ = await imap_reader.read_until(b"\r\n", br".*\r\n")
         write_line(f"{tag} OK SUBSCRIBE completed")
@@ -227,27 +229,24 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
           write_line(f"{tag} NO invalid state")
           continue
         with db_open(config.db_path) as db:
-          if mailbox is None:
-            tmailbox_id = mailbox_id
-          else:
-            tmailbox_id = db_mailbox_id(db, mailbox)
+          tmailbox_id = mailbox_id if mailbox is None else db_mailbox_id(db, account.key, mailbox)
           if tmailbox_id is None:
             write_line(f"{tag} NO invalid mailbox name")
             continue
 
           response: dict[str, int] = {}
           if "MESSAGES" in attrs:
-            response["MESSAGES"] = db_status_messages(db, account.key, mailbox_id)
+            response["MESSAGES"] = db_status_messages(db, account.key, tmailbox_id)
           if "UIDNEXT" in attrs:
-            response["UIDNEXT"] = db_status_uid_next(db, account.key, mailbox_id)
+            response["UIDNEXT"] = db_status_uid_next(db, account.key, tmailbox_id)
           if "UIDVALIDITY" in attrs:
-            response["UIDVALIDITY"] = db_status_uid_validity(db, account.key, mailbox_id)
+            response["UIDVALIDITY"] = db_status_uid_validity(db, account.key, tmailbox_id)
           if "UNSEEN" in attrs:
-            response["UNSEEN"] = db_status_unseen(db, account.key, mailbox_id)
+            response["UNSEEN"] = db_status_unseen(db, account.key, tmailbox_id)
           if "DELETED" in attrs:
-            response["DELETED"] = db_status_deleted(db, account.key, mailbox_id)
+            response["DELETED"] = db_status_deleted(db, account.key, tmailbox_id)
           if "SIZE" in attrs:
-            response["SIZE"] = db_status_size(db, account.key, mailbox_id)
+            response["SIZE"] = db_status_size(db, account.key, tmailbox_id)
 
           status_str = " ".join(f"{k} {v}" for k, v in response.items())
           write_line(f"* STATUS {mailbox} ({status_str})")
