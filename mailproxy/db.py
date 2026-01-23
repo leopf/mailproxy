@@ -28,12 +28,7 @@ CREATE TABLE IF NOT EXISTS messages (
   mailbox_id INTEGER,
   received_date INTEGER NOT NULL,
 
-  flag_seen BOOLEAN NOT NULL DEFAULT FALSE,
-  flag_answered BOOLEAN NOT NULL DEFAULT FALSE,
-  flag_flagged BOOLEAN NOT NULL DEFAULT FALSE,
-  flag_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-  flag_draft BOOLEAN NOT NULL DEFAULT FALSE,
-  flag_recent BOOLEAN NOT NULL DEFAULT FALSE,
+  flags TEXT NOT NULL DEFAULT '\\',
 
   size INTEGER NOT NULL,
   data BLOB NOT NULL,
@@ -69,10 +64,10 @@ def db_status_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id:
   return db.execute("SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()[0]
 
 def db_status_unseen(db: sqlite3.Connection, mailbox_id: int):
-  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flag_seen=0", (mailbox_id,)).fetchone()[0]
+  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags LIKE '%\\Unseen\\%'", (mailbox_id,)).fetchone()[0]
 
 def db_status_deleted(db: sqlite3.Connection, mailbox_id: int):
-  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flag_deleted=1", (mailbox_id,)).fetchone()[0]
+  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags LIKE '%\\Deleted\\%'", (mailbox_id,)).fetchone()[0]
 
 def db_status_size(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COALESCE(SUM(length(data)), 0) FROM messages WHERE mailbox_id=?", (mailbox_id,)).fetchone()[0]
