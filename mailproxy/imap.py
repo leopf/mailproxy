@@ -236,17 +236,17 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
 
           response: dict[str, int] = {}
           if "MESSAGES" in attrs:
-            response["MESSAGES"] = db_status_messages(db, account.key, tmailbox_id)
+            response["MESSAGES"] = db_status_messages(db, tmailbox_id)
           if "UIDNEXT" in attrs:
             response["UIDNEXT"] = db_status_uid_next(db, account.key, tmailbox_id)
           if "UIDVALIDITY" in attrs:
             response["UIDVALIDITY"] = db_status_uid_validity(db, account.key, tmailbox_id)
           if "UNSEEN" in attrs:
-            response["UNSEEN"] = db_status_unseen(db, account.key, tmailbox_id)
+            response["UNSEEN"] = db_status_unseen(db, tmailbox_id)
           if "DELETED" in attrs:
-            response["DELETED"] = db_status_deleted(db, account.key, tmailbox_id)
+            response["DELETED"] = db_status_deleted(db, tmailbox_id)
           if "SIZE" in attrs:
-            response["SIZE"] = db_status_size(db, account.key, tmailbox_id)
+            response["SIZE"] = db_status_size(db, tmailbox_id)
 
           status_str = " ".join(f"{k} {v}" for k, v in response.items())
           write_line(f"* STATUS {mailbox} ({status_str})")
