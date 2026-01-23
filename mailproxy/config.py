@@ -55,7 +55,7 @@ class AuthenticationOAUTH2:
   def from_dict(d: Any):
     if _get_str(d, "type") != "OAUTH2":
       return None
-    
+
     return AuthenticationOAUTH2(
       scope=_get_str(d, "scope"),
       client_id=_get_str(d, "client_id"),
@@ -74,13 +74,12 @@ class AuthenticationPLAIN:
   def from_dict(d: Any):
     if _get_str(d, "type") != "PLAIN":
       return None
-    
+
     return AuthenticationPLAIN(_get_str(d, "password"))
 
 @dataclasses.dataclass(frozen=True)
 class Account:
   addresses: list[str]
-  db_path: pathlib.Path
 
   imap_host: str
   imap_port: int
@@ -91,25 +90,26 @@ class Account:
 
   auth: AuthenticationOAUTH2 | AuthenticationPLAIN
 
+  @property
+  def key(self):
+    return self.addresses[0]
+
   @staticmethod
-  def from_dict(d: Any, data_dir: pathlib.Path):
+  def from_dict(d: Any):
     if not isinstance(d, dict):
       raise ValueError("expected config to be a dict")
-    
+
     addresses = d.get("addresses", [])
     if not isinstance(addresses, list) or len(addresses) == 0 or \
         any(not isinstance(address, str) for address in addresses):
       raise ValueError("Invalid addresses")
-    
-    db_path_str = _get_str(d, "db_path", str(data_dir.joinpath(re.sub(r"[^a-zA-Z0-9]", "_", addresses[0]) + ".sqlite")))
-      
+
     auth = AuthenticationPLAIN.from_dict(d.get("auth")) or AuthenticationOAUTH2.from_dict(d.get("auth"))
     if auth is None:
       raise ValueError("auth type invalid!")
 
     return Account(
       addresses=addresses,
-      db_path=pathlib.Path(db_path_str),
       imap_host=_get_host(d, "imap_host"),
       imap_port=_get_port(d, "imap_port"),
       imap_tlsmode=TLSMode.from_value(_get_str(d, "imap_tlsmode")),
@@ -118,7 +118,7 @@ class Account:
       smtp_tlsmode=TLSMode.from_value(_get_str(d, "smtp_tlsmode")),
       auth=auth,
     )
-    
+
 
 @dataclasses.dataclass(frozen=True)
 class Config:
@@ -128,21 +128,21 @@ class Config:
   host: str
   imap_port: int
   smtp_port: int
+  db_path: pathlib.Path
 
   @staticmethod
   def from_dict(d: Any):
     if not isinstance(d, dict):
       raise ValueError("expected config to be a dict")
 
-    data_dir = pathlib.Path(_get_str(d, "data_dir"))
-    if not data_dir.exists():
-      raise ValueError("Invalid data_dir")
+    db_path_str = _get_str(d, "db_path")
 
     if "accounts" not in d or not isinstance(d["accounts"], list) or len(d["accounts"]) == 0:
       raise ValueError("Invalid accounts")
 
     return Config(
-      accounts=[ Account.from_dict(a, data_dir) for a in d["accounts"] ],
+      db_path=pathlib.Path(db_path_str),
+      accounts=[ Account.from_dict(a) for a in d["accounts"] ],
       log_level=logging.getLevelNamesMapping().get(_get_str(d, "log_level", "DEBUG"), logging.DEBUG),
       domain=_get_host(d, "domain"),
       host=_get_host(d, "host", "0.0.0.0"),

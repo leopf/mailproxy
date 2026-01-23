@@ -1,6 +1,7 @@
+from mailproxy.db import db_mailbox_id, db_open, db_status_deleted, db_status_messages, db_status_size, \
+    db_status_uid_next, db_status_uid_validity, db_status_unseen
 import asyncio, base64, logging, ssl, re, enum, mailproxy.parser as P
-from types import SimpleNamespace
-from mailproxy.auth import authenticate_sasl
+from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.config import Account, Config, TLSMode
 from mailproxy.utils import match_line
 
@@ -9,23 +10,62 @@ class DataMissingError(Exception):
     super().__init__()
     self.n = n
 
+class IMAPError(Exception): pass
+
+class IMAPReader:
+  def __init__(self, reader: asyncio.StreamReader) -> None:
+    self._reader = reader
+
+  async def read_until(self, until: bytes, re_validate: bytes, re_flags: int = 0):
+    result = await self._reader.readuntil(until)
+    if re.fullmatch(re_validate, result, re_flags) is None:
+      raise IMAPError("Invalid sequence read by read_until!")
+    return result[:-len(until)]
+
+  async def end_line(self):
+    await self.read_until(b"\r\n", br"\r\n")
+
+  async def read_opening(self):
+    tag = await self.read_until(b" ", br"[^ ]+ ") # TODO better validation
+    command = await self.read_until(b" ", br"[^ ]+ ") # TODO better validation
+    return tag, command
+
+  async def read_const(self, seq: bytes):
+    res = await self._reader.readexactly(len(seq))
+    if res != seq:
+      raise IMAPError(f"Not all elements matched! {res} != {seq}!")
+
+  async def read_line_str(self):
+    return (await self._reader.readuntil(b"\r\n"))[:-2].decode()
+
+  async def read_nstring(self) -> bytes | None:
+    pass
+
+  async def read_astring_sp(self) -> bytes:
+    pass
+
+  async def read_address(self):
+    await self.read_const(b"(")
+    name = await self.read_nstring()
+    await self.read_const(b" ")
+    adl = await self.read_nstring()
+    await self.read_const(b" ")
+    mailbox = await self.read_nstring()
+    await self.read_const(b" ")
+    host = await self.read_nstring()
+    await self.read_const(b")")
+
 def literal_parser(s: bytes):
   m = re.match(rb"\{(?P<n>\d+)\}\r\n", s, re.DOTALL)
   if m is None:
     raise P.TryParseError("failed to parse literal", s)
-  
+
   n = int(m.group("n"))
   data_start = m.end()
   missing_n = n - len(s) + data_start
   if missing_n > 0:
     raise DataMissingError(missing_n)
   return s[data_start:data_start + n], s[data_start + n:]
-
-G = SimpleNamespace()
-G.nil = P.transform(P.const(b"NIL"), lambda _: None)
-G.quoted = P.transform(P.regex(rb'"(?P<inner>(?:[^"\\]|\\")*)"'), lambda parts: parts.group("inner"))
-G.literal = literal_parser
-# G.astring = P.alt(G.quoted, P.regex_str(rf'[^{"".join(re.escape(c) for c in "(){ }*%\"\\")}\x00-\x1F\x7F]+'))
 
 class IMAPClient:
   def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -42,7 +82,7 @@ class IMAPClient:
       if (m:=match_line(r"\*\s+CAPABILITY(?P<caps>(\s+[^\s]+)*)", uline)):
         caps.extend(re.split(r"\s+",  m["caps"].strip()))
     self.capabilities = tuple(caps)
-  
+
   async def authenticate_xoauth2(self, email: str, access_token: str):
     rid = self._command("AUTHENTICATE XOAUTH2")
     if not (await self._read_line()).startswith("+"):
@@ -54,14 +94,14 @@ class IMAPClient:
   async def list(self, refname: str, mailbox: str):
     if "\"" in refname or "\"" in mailbox:
       raise ValueError("neither base or search can have quote!")
-    
+
     rid = self._command(f"LIST \"{refname}\" \"{mailbox}\"")
     mailboxes: list[tuple[str, str]] = []
-  
+
     async for uline in self._read_returns(rid):
       if (m:=match_line(r"\*\s+LIST\s+\((?P<attributes>[^\)]*)\)\s+\"(?P<delimiter>)\"\s+(?P<mailbox>(INBOX)|)", uline)):
         print(m["rest"])
-    
+
   async def start_tls(self):
     rid = self._command("STARTTLS")
     raise NotImplementedError()
@@ -84,7 +124,7 @@ class IMAPClient:
     index = 0
     while index < len(line):
       next_and = line.find(b"&", index)
-      if next_and == -1: 
+      if next_and == -1:
         chunks.append(line[index:].decode())
         index = len(line)
       else:
@@ -111,54 +151,112 @@ class IMAPClient:
     if account.imap_tlsmode == TLSMode.STARTTLS:
       await client.start_tls()
     return client
-  
+
 class IMAPState(enum.Enum):
   NotAuthenticated = 1
   Authenticated = 2
   Selected = 3
 
 async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+  imap_reader = IMAPReader(reader)
+
   def write_line(line: str):
     writer.write(line.encode("ascii"))
     writer.write(b"\r\n")
 
-  async def read_line():
-    return (await reader.readuntil(b"\r\n"))[:-2].decode("utf-8").strip()
-
-  async def parse_line():
-    while True:
-      line = await read_line()
-      pline = match_line(r"(?P<tag>[a-z0-9]+)\s+(?P<rest>.*)", line)
-      if pline is None: continue
-      return pline["tag"], pline["rest"]
-
   state: IMAPState = IMAPState.NotAuthenticated
+  account: Account | None = None
+  mailbox_id: int | None = None
 
   try:
     write_line(f"220 {config.domain} Ready")
-
+    # TODO state validation!
     while not reader.at_eof():
-      tag, line = await parse_line()
-      logging.debug("Client: " + tag + " " + line)
+      tag, command = await imap_reader.read_opening()
+      logging.debug("Client: " + tag.decode() + " " + command.decode())
 
-      if match_line(r"CAPABILITY", line):
-        write_line(f"* CAPABILITY IMAP4rev2 AUTH=PLAIN")
+      if command == b"CAPABILITY":
+        await imap_reader.end_line()
+        write_line("* CAPABILITY IMAP4rev2 AUTH=PLAIN")
         write_line(f"{tag} OK CAPABILITY completed")
-      elif match_line(r"NOOP", line):
+      elif command == b"NOOP":
+        await imap_reader.end_line()
         if state is IMAPState.Selected:
           raise NotImplementedError("Need to implement polling updates")
         else:
           write_line(f"{tag} OK NOOP completed")
-      elif match_line(r"LOGOUT", line):
+      elif command == b"LOGOUT":
+        await imap_reader.end_line()
         write_line("* BYE Server logging out")
         write_line(f"{tag} OK LOGOUT completed")
-      elif match_line(r"AUTHENTICATE PLAIN", line):
-        write_line("+")
-        if (b64_match:=match_line(r"(?P<data>[a-z0-9\+\/]*(=|==)?)", await read_line())) and authenticate_sasl(config, b64_match["data"]):
+      elif command == b"STARTTLS":
+        await imap_reader.end_line()
+        write_line(f"{tag} NO Failed")
+      elif command == b"LOGIN":
+        userid = await imap_reader.read_astring_sp()
+        password = await imap_reader.read_astring_sp()
+        await imap_reader.end_line()
+        if authenticate(config, userid, password):
           write_line(f"{tag} OK Success")
         else:
           write_line(f"{tag} NO Failed")
-      elif (m:=match_line(r"(?P<mode>(SELECT|EXAMINE)) (?P<mailbox>.*)", line)):
+      elif command == b"AUTHENITCATE":
+        try: await imap_reader.read_const(b"PLAIN")
+        except IMAPError as e: raise IMAPError(b"Only plain auth supported for now!", e)
+        await imap_reader.end_line()
+        write_line("+")
+        auth_line = await imap_reader.read_line_str()
+        if authenticate_sasl(config, auth_line):
+          write_line(f"{tag} OK Success")
+        else:
+          write_line(f"{tag} NO Failed")
+      elif command == b"SUBSCRIBE":
+        _ = await imap_reader.read_until(b"\r\n", br".*\r\n")
+        write_line(f"{tag} OK SUBSCRIBE completed")
+      elif command == b"UNSUBSCRIBE":
+        _ = await imap_reader.read_until(b"\r\n", br".*\r\n")
+        write_line(f"{tag} NO UNSUBSCRIBE not allowed")
+      elif command == b"IDLE": pass # TODO: tag wont event be parsed correctly...
+      elif command == b"STATUS":
+        mailbox = await imap_reader.read_nstring()
+        await imap_reader.read_const(b"(")
+        attrs = (await imap_reader.read_until(b")", rb"[A-Z ]+\)")).split(b" ")
+        await imap_reader.end_line()
+        account = config.accounts[0]
+        if account is None:
+          write_line(f"{tag} NO invalid state")
+          continue
+        with db_open(config.db_path) as db:
+          if mailbox is None:
+            tmailbox_id = mailbox_id
+          else:
+            tmailbox_id = db_mailbox_id(db, mailbox)
+          if tmailbox_id is None:
+            write_line(f"{tag} NO invalid mailbox name")
+            continue
+
+          response: dict[str, int] = {}
+          if "MESSAGES" in attrs:
+            response["MESSAGES"] = db_status_messages(db, account.key, mailbox_id)
+          if "UIDNEXT" in attrs:
+            response["UIDNEXT"] = db_status_uid_next(db, account.key, mailbox_id)
+          if "UIDVALIDITY" in attrs:
+            response["UIDVALIDITY"] = db_status_uid_validity(db, account.key, mailbox_id)
+          if "UNSEEN" in attrs:
+            response["UNSEEN"] = db_status_unseen(db, account.key, mailbox_id)
+          if "DELETED" in attrs:
+            response["DELETED"] = db_status_deleted(db, account.key, mailbox_id)
+          if "SIZE" in attrs:
+            response["SIZE"] = db_status_size(db, account.key, mailbox_id)
+
+          status_str = " ".join(f"{k} {v}" for k, v in response.items())
+          write_line(f"* STATUS {mailbox} ({status_str})")
+        write_line(f"{tag} OK status completed")
+
+
+      elif command == b"SELECT": pass
+
+      if (m:=match_line(r"(?P<mode>(SELECT|EXAMINE)) (?P<mailbox>.*)", line)):
         raise NotImplementedError()
         mode = "" # CLOSED, READ-ONLY, READ-WRITE
         write_line("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)")
@@ -175,10 +273,7 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
         raise NotImplementedError()
         # TODO rename mailbox
         write_line(f"{tag} OK RENAME completed")
-      elif (m:=match_line(r"SUBSCRIBE .*", line)):
-        write_line(f"{tag} OK SUBSCRIBE completed")
-      elif (m:=match_line(r"UNSUBSCRIBE .*", line)):
-        write_line(f"{tag} NO UNSUBSCRIBE not allowed")
+
       else:
         write_line(f"{tag} NO failed to run command (wrong state or parsing error)")
 

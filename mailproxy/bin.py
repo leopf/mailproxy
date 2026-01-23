@@ -11,14 +11,14 @@ async def exec_run(config: Config):
 
     imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.imap_port)
     tg.create_task(imap_server.serve_forever(), name="IMAP server")
-  
+
 
 async def exec_dev(config: Config, address: str, token: str):
   account = next(account for account in config.accounts if address in account.addresses)
-  
+
   client = await IMAPClient.connect(account)
   assert "AUTH=XOAUTH2" in client.capabilities
-  
+
   await client.authenticate_xoauth2(account.addresses[0], token)
   print(await client.list("", "*"))
 
@@ -26,8 +26,8 @@ def exec_get_access_token(config: Config, address: str):
   try:
     account = next(account for account in config.accounts if address in account.addresses)
   except StopIteration:
-    raise RuntimeError(f"config has no account for address '{address}'")  
-  
+    raise RuntimeError(f"config has no account for address '{address}'")
+
   auth = account.auth
   if not isinstance(auth, AuthenticationOAUTH2):
     raise RuntimeError("authentication for account must be oauth2 for login")
@@ -43,8 +43,8 @@ def exec_login(config: Config, address: str):
   try:
     account = next(account for account in config.accounts if address in account.addresses)
   except StopIteration:
-    raise RuntimeError(f"config has no account for address '{address}'")  
-  
+    raise RuntimeError(f"config has no account for address '{address}'")
+
   auth = account.auth
   if not isinstance(auth, AuthenticationOAUTH2):
     raise RuntimeError("authentication for account must be oauth2 for login")
@@ -53,10 +53,10 @@ def exec_login(config: Config, address: str):
     redirection_endpoint: urllib.parse.ParseResult = urllib.parse.urlparse(auth.redirect_url)
   except:
     raise ValueError("Invalid redirect url!")
-  
+
   if redirection_endpoint.hostname is None:
     raise ValueError("hostname of redirect url is None")
-  
+
   if redirection_endpoint.port is None:
     raise ValueError("port of redirect url is None")
 
@@ -101,12 +101,12 @@ if __name__ == "__main__":
   parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
 
   subparsers = parser.add_subparsers(dest="command")
-  
+
   run_parser = subparsers.add_parser("run")
 
   login_parser = subparsers.add_parser("login")
   login_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
-  
+
   get_access_token_parser = subparsers.add_parser("get-access-token")
   get_access_token_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
 
@@ -115,7 +115,7 @@ if __name__ == "__main__":
   dev_parser.add_argument("--token", "-T", help="access token", required=True, type=str)
 
   # ----
-  
+
   args = parser.parse_args()
 
   config = Config.from_dict(json.loads(args.config.read_text()))

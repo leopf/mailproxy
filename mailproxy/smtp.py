@@ -1,16 +1,16 @@
-import asyncio, re, logging
+import asyncio, re, logging, pathlib
 from mailproxy.auth import authenticate_sasl
 from mailproxy.config import Account, Config
 from mailproxy.utils import match_line
 
-async def smtp_forward_mail(account: Account, sender: str, recipients: tuple[str, ...], mail_data: bytes):
-  pass
+async def smtp_forward_mail(db_path: pathlib.Path, account: Account, sender: str, recipients: tuple[str, ...], mail_data: bytes):
+  raise NotImplementedError("TODO")
 
 async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
   def write_line(line: str):
     writer.write(line.encode("ascii"))
     writer.write(b"\r\n")
-  
+
   def reply(code: int, textstring: str):
     if not re.fullmatch(r'[\t\x20-\x7E]+', textstring):
       raise ValueError("Invalid reply!", code, textstring)
@@ -26,7 +26,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
 
     while not reader.at_eof():
       line = (await reader.readuntil(b"\r\n"))[:-2].decode("ascii")
-      
+
       logging.debug("reading line: " + line)
 
       if match_line(r"QUIT", line):
@@ -69,7 +69,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
         reply(354, "Start mail input; end with <CRLF>.<CRLF>")
         mail_data = (await reader.readuntil(b"\r\n.\r\n"))[:-5]
         try:
-          await smtp_forward_mail(account, sender, tuple(recipients), mail_data)
+          await smtp_forward_mail(config.db_path, account, sender, tuple(recipients), mail_data)
           reply(250, "OK")
         except Exception as e:
           logging.error("failed to send message", e)
