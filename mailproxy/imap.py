@@ -251,8 +251,6 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
           status_str = " ".join(f"{k} {v}" for k, v in response.items())
           write_line(f"* STATUS {mailbox} ({status_str})")
         write_line(f"{tag} OK status completed")
-
-
       elif command == b"SELECT": pass
 
       if (m:=match_line(r"(?P<mode>(SELECT|EXAMINE)) (?P<mailbox>.*)", line)):

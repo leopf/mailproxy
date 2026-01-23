@@ -7,6 +7,7 @@ done:
 - authenticate
 - starttls
 - login
+- status
 
 todo:
 - append
@@ -18,7 +19,6 @@ todo:
 - namespace-command
 - rename
 - select
-- status
 
 later:
 - idle
