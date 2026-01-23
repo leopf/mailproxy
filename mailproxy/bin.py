@@ -13,18 +13,14 @@ async def exec_run(config: Config):
     tg.create_task(imap_server.serve_forever(), name="IMAP server")
   
 
-async def exec_dev(config_path: pathlib.Path):
-  logging.basicConfig(level=logging.DEBUG)
-
-  config = json.loads(config_path.read_text())
-  # TODO validate...
-
-  client = await IMAPClient.connect(config["imap"]["host"], config["imap"]["port"], TLSMode(config["imap"]["tlsmode"].upper()))
-  capabilities = await client.capability()
-  assert "AUTH=XOAUTH2" in capabilities
+async def exec_dev(config: Config, address: str, token: str):
+  account = next(account for account in config.accounts if address in account.addresses)
   
-  await client.authenticate_xoauth2(config["email"], config["access_token"])
-  print(await client.list("", ""))
+  client = await IMAPClient.connect(account)
+  assert "AUTH=XOAUTH2" in client.capabilities
+  
+  await client.authenticate_xoauth2(account.addresses[0], token)
+  print(await client.list("", "*"))
 
 def exec_get_access_token(config: Config, address: str):
   try:
@@ -111,8 +107,12 @@ if __name__ == "__main__":
   login_parser = subparsers.add_parser("login")
   login_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
   
-  get_token_parser = subparsers.add_parser("get-token")
-  get_token_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
+  get_access_token_parser = subparsers.add_parser("get-access-token")
+  get_access_token_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
+
+  dev_parser = subparsers.add_parser("dev")
+  dev_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
+  dev_parser.add_argument("--token", "-T", help="access token", required=True, type=str)
 
   # ----
   
@@ -128,6 +128,6 @@ if __name__ == "__main__":
   elif args.command == "get-access-token":
     exec_get_access_token(config, args.address)
   elif args.command == "dev":
-    asyncio.run(exec_dev(args.config))
+    asyncio.run(exec_dev(config, args.address, args.token))
   else:
     raise RuntimeError("unknown command!")

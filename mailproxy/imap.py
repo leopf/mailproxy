@@ -4,10 +4,28 @@ from mailproxy.auth import authenticate_sasl
 from mailproxy.config import Account, Config, TLSMode
 from mailproxy.utils import match_line
 
+class DataMissingError(Exception):
+  def __init__(self, n: int) -> None:
+    super().__init__()
+    self.n = n
+
+def literal_parser(s: bytes):
+  m = re.match(rb"\{(?P<n>\d+)\}\r\n", s, re.DOTALL)
+  if m is None:
+    raise P.TryParseError("failed to parse literal", s)
+  
+  n = int(m.group("n"))
+  data_start = m.end()
+  missing_n = n - len(s) + data_start
+  if missing_n > 0:
+    raise DataMissingError(missing_n)
+  return s[data_start:data_start + n], s[data_start + n:]
+
 G = SimpleNamespace()
-G.nil = P.transform(P.const("NIL"), lambda _: None)
-G.quoted = P.transform(P.regex(r'"(?P<inner>(?:[^"\\]|\\")*)"'), lambda parts: parts.group("inner"))
-G.astring = P.alt(G.quoted, P.regex_str(rf'[^{"".join(re.escape(c) for c in "(){ }*%\"\\")}\x00-\x1F\x7F]+'))
+G.nil = P.transform(P.const(b"NIL"), lambda _: None)
+G.quoted = P.transform(P.regex(rb'"(?P<inner>(?:[^"\\]|\\")*)"'), lambda parts: parts.group("inner"))
+G.literal = literal_parser
+# G.astring = P.alt(G.quoted, P.regex_str(rf'[^{"".join(re.escape(c) for c in "(){ }*%\"\\")}\x00-\x1F\x7F]+'))
 
 class IMAPClient:
   def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
