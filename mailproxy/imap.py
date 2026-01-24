@@ -93,11 +93,6 @@ class IMAPClient:
       await client.start_tls()
     return client
 
-class IMAPState(enum.Enum):
-  NotAuthenticated = 1
-  Authenticated = 2
-  Selected = 3
-
 class IMAPServerConnection:
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self.config = config

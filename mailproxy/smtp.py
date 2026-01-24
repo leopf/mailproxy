@@ -65,7 +65,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
         logging.debug("added recipient: " + m["recipient"])
         recipients.append(m["recipient"])
         reply(250, "OK")
-      elif account is not None and match_line(f"DATA", line):
+      elif account is not None and match_line("DATA", line):
         reply(354, "Start mail input; end with <CRLF>.<CRLF>")
         mail_data = (await reader.readuntil(b"\r\n.\r\n"))[:-5]
         try:
