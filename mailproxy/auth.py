@@ -7,6 +7,12 @@ class OAUTHAccessTokenResult:
   expires_at: datetime.datetime
   refresh_token: str | None
 
+@dataclasses.dataclass
+class OAUTHAccessToken:
+  access_token: str
+  expires_at: datetime.datetime
+  refresh_token: str
+
 def _fetch_access_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]):
   data = { "client_id": auth.client_id, "scope": auth.scope } | extra_data
   if auth.client_secret is not None:

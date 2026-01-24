@@ -16,7 +16,7 @@ class IMAPReader:
   def __init__(self, reader: asyncio.StreamReader) -> None:
     self._reader = reader
 
-  async def read_until(self, until: bytes, re_validate: bytes, re_flags: int = 0):
+  async def read_until(self, until: bytes | tuple[bytes, ...], re_validate: bytes, re_flags: int = 0):
     result = await self._reader.readuntil(until)
     if re.fullmatch(re_validate, result, re_flags) is None:
       raise IMAPError("Invalid sequence read by read_until!")
@@ -27,7 +27,7 @@ class IMAPReader:
 
   async def read_opening(self):
     tag = await self.read_until(b" ", br"[^ ]+ ") # TODO better validation
-    command = await self.read_until(b" ", br"[^ ]+ ") # TODO better validation
+    command = await self.read_until((b" ", b"\r\n"), br"[^\s]+( |(\r\n))") # TODO better validation
     return tag, command
 
   async def read_const(self, seq: bytes):
