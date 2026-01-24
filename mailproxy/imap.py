@@ -1,3 +1,4 @@
+from typing import Literal
 from mailproxy.db import db_mailbox_id, db_open, db_status_deleted, db_status_messages, db_status_size, \
     db_status_uid_next, db_status_uid_validity, db_status_unseen
 import asyncio, base64, logging, ssl, re, enum, mailproxy.parser as P
@@ -15,34 +16,6 @@ class IMAPError(Exception): pass
 class IMAPReader:
   def __init__(self, reader: asyncio.StreamReader) -> None:
     self._reader = reader
-
-  async def read_until(self, until: bytes | tuple[bytes, ...], re_validate: bytes, re_flags: int = 0):
-    result = await self._reader.readuntil(until)
-    if re.fullmatch(re_validate, result, re_flags) is None:
-      raise IMAPError("Invalid sequence read by read_until!")
-    return result[:-len(until)]
-
-  async def end_line(self):
-    await self.read_until(b"\r\n", br"\r\n")
-
-  async def read_opening(self):
-    tag = await self.read_until(b" ", br"[^ ]+ ") # TODO better validation
-    command = await self.read_until((b" ", b"\r\n"), br"[^\s]+( |(\r\n))") # TODO better validation
-    return tag, command
-
-  async def read_const(self, seq: bytes):
-    res = await self._reader.readexactly(len(seq))
-    if res != seq:
-      raise IMAPError(f"Not all elements matched! {res} != {seq}!")
-
-  async def read_line_str(self):
-    return (await self._reader.readuntil(b"\r\n"))[:-2].decode()
-
-  async def read_nstring(self) -> bytes | None:
-    pass
-
-  async def read_astring_sp(self) -> bytes:
-    pass
 
   async def read_address(self):
     await self.read_const(b"(")
@@ -157,27 +130,80 @@ class IMAPState(enum.Enum):
   Authenticated = 2
   Selected = 3
 
-async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-  imap_reader = IMAPReader(reader)
+class IMAPServerConnection:
+  def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    self.config = config
+    self.reader = reader
+    self.writer = writer
 
-  def write_line(line: str):
-    writer.write(line.encode("ascii"))
-    writer.write(b"\r\n")
+    self.last_tag: bytes | None = None
+    self.account: Account | None = None
+    self.mailbox_id: int | None = None
 
-  state: IMAPState = IMAPState.NotAuthenticated
-  account: Account | None = None
-  mailbox_id: int | None = None
+  def write_response(self, code: Literal[b"OK"] | Literal[b"NO"] | Literal[b"FAILED"], message: bytes):
+    assert self.last_tag is not None
+    self.writer.write(b"%s %s %s\r\n" % (self.last_tag, code, message))
+    self.last_tag = None
+
+  def write_line(self, line: bytes):
+    self.writer.write(line)
+    self.writer.write(b"\r\n")
+
+  async def read_until(self, until: bytes | tuple[bytes, ...], re_validate: bytes, re_flags: int = 0):
+    result = await self.reader.readuntil(until)
+    if re.fullmatch(re_validate, result, re_flags) is None:
+      raise IMAPError("Invalid sequence read by read_until!")
+    return result[:-len(until)]
+
+  async def end_line(self):
+    await self.read_until(b"\r\n", br"\r\n")
+
+  async def read_const(self, seq: bytes):
+    res = await self.reader.readexactly(len(seq))
+    if res != seq:
+      raise IMAPError(f"Not all elements matched! {res} != {seq}!")
+
+  async def read_line_str(self):
+    return (await self.reader.readuntil(b"\r\n"))[:-2].decode()
+
+  async def read_nstring(self) -> bytes | None:
+    pass
+
+  async def read_astring_sp(self) -> bytes:
+    pass
+
+  async def command_capability(self):
+    self.write_line(b"* CAPABILITY IMAP4rev2 AUTH=PLAIN")
+    self.write_response(b"OK", b"CAPABILITY completed")
+
+  async def handle_command(self):
+    self.last_tag = await self.read_until(b" ", br"[^ ]+ ") # TODO better validation
+    command = await self.read_until((b" ", b"\r\n"), br"[^\s]+( |(\r\n))") # TODO better validation
+    logging.debug("Client: " + self.last_tag.decode() + " " + command.decode())
+
+    match command:
+      case b"CAPABILITY": await self.command_capability()
+
+  async def run(self):
+    self.write_line(b"220 %s Ready" % (self.config.domain.encode("ASCII"),))
+    try:
+      while not self.reader.at_eof():
+        await self.handle_command()
+    except Exception as e:
+      logging.error("connection closing because of an error", e)
+    finally:
+      logging.debug("connection closed")
+      self.writer.close()
+
+
+
+async def handle_imap():
 
   try:
-    write_line(f"220 {config.domain} Ready")
     # TODO state validation!
     while not reader.at_eof():
-      tag, command = await imap_reader.read_opening()
-      logging.debug("Client: " + tag.decode() + " " + command.decode())
 
       if command == b"CAPABILITY":
-        write_line("* CAPABILITY IMAP4rev2 AUTH=PLAIN")
-        write_line(f"{tag} OK CAPABILITY completed")
       elif command == b"NOOP":
         if mailbox_id is None:
           raise NotImplementedError("Need to implement polling updates")
@@ -254,9 +280,3 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
       elif command == b"SELECT":
 
         pass
-
-  except Exception as e:
-    logging.error("connection closing because of an error", e)
-  finally:
-    logging.debug("connection closed")
-    writer.close()
