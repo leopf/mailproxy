@@ -6,39 +6,7 @@ from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.config import Account, Config, TLSMode
 from mailproxy.utils import match_line
 
-class DataMissingError(Exception):
-  def __init__(self, n: int) -> None:
-    super().__init__()
-    self.n = n
-
-class IMAPError(Exception): pass
-
-class IMAPReader:
-  def __init__(self, reader: asyncio.StreamReader) -> None:
-    self._reader = reader
-
-  async def read_address(self):
-    await self.read_const(b"(")
-    name = await self.read_nstring()
-    await self.read_const(b" ")
-    adl = await self.read_nstring()
-    await self.read_const(b" ")
-    mailbox = await self.read_nstring()
-    await self.read_const(b" ")
-    host = await self.read_nstring()
-    await self.read_const(b")")
-
-def literal_parser(s: bytes):
-  m = re.match(rb"\{(?P<n>\d+)\}\r\n", s, re.DOTALL)
-  if m is None:
-    raise P.TryParseError("failed to parse literal", s)
-
-  n = int(m.group("n"))
-  data_start = m.end()
-  missing_n = n - len(s) + data_start
-  if missing_n > 0:
-    raise DataMissingError(missing_n)
-  return s[data_start:data_start + n], s[data_start + n:]
+class IMAPCommandFailedError(Exception): pass
 
 class IMAPClient:
   def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -140,7 +108,7 @@ class IMAPServerConnection:
     self.account: Account | None = None
     self.mailbox_id: int | None = None
 
-  def write_response(self, code: Literal[b"OK"] | Literal[b"NO"] | Literal[b"FAILED"], message: bytes):
+  def write_response(self, code: Literal[b"OK"] | Literal[b"NO"] | Literal[b"BAD"], message: bytes):
     assert self.last_tag is not None
     self.writer.write(b"%s %s %s\r\n" % (self.last_tag, code, message))
     self.last_tag = None
@@ -152,21 +120,21 @@ class IMAPServerConnection:
   async def read_until(self, until: bytes | tuple[bytes, ...], re_validate: bytes, re_flags: int = 0):
     result = await self.reader.readuntil(until)
     if re.fullmatch(re_validate, result, re_flags) is None:
-      raise IMAPError("Invalid sequence read by read_until!")
+      raise IMAPCommandFailedError("Invalid sequence read by read_until!")
     return result[:-len(until)]
 
-  async def end_line(self):
+  async def read_end_line(self):
     await self.read_until(b"\r\n", br"\r\n")
 
   async def read_const(self, seq: bytes):
     res = await self.reader.readexactly(len(seq))
     if res != seq:
-      raise IMAPError(f"Not all elements matched! {res} != {seq}!")
+      raise IMAPCommandFailedError(f"Not all elements matched! {res} != {seq}!")
 
   async def read_line_str(self):
     return (await self.reader.readuntil(b"\r\n"))[:-2].decode()
 
-  async def read_nstring(self) -> bytes | None:
+  async def read_nstring_sp(self) -> bytes | None:
     pass
 
   async def read_astring_sp(self) -> bytes:
@@ -176,6 +144,87 @@ class IMAPServerConnection:
     self.write_line(b"* CAPABILITY IMAP4rev2 AUTH=PLAIN")
     self.write_response(b"OK", b"CAPABILITY completed")
 
+  async def command_noop(self):
+    if self.mailbox_id is not None:
+      raise NotImplementedError("Need to implement polling updates")
+    else:
+      self.write_response(b"OK", b"NOOP completed")
+
+  async def command_logout(self):
+    self.write_line(b"* BYE Server logging out")
+    self.write_response(b"OK", b"LOGOUT completed")
+
+  async def command_login(self):
+    userid = await self.read_astring_sp()
+    password = await self.read_astring_sp()
+    await self.read_end_line()
+    if (login_account:=authenticate(self.config, userid, password)) is None:
+      self.write_response(b"NO", b"login failed")
+    else:
+      self.account = login_account
+      self.write_response(b"OK", b"login completed")
+
+  async def command_authenticate(self):
+    try: await self.read_const(b"PLAIN")
+    except IMAPCommandFailedError as e: raise IMAPCommandFailedError(b"Only plain auth supported for now!", e)
+    await self.read_end_line()
+    self.write_line(b"+ login data")
+    auth_line = await self.read_line_str()
+    if (login_account:=authenticate_sasl(self.config, auth_line)) is None:
+      self.write_response(b"NO", b"auth failed")
+    else:
+      self.account = login_account
+      self.write_response(b"OK", b"auth completed")
+
+  async def command_subscribe(self):
+    _ = await self.read_until(b"\r\n", br".*\r\n")
+    self.write_response(b"OK", b"SUBSCRIBE completed")
+
+  async def command_unsubscribe(self):
+    _ = await self.read_until(b"\r\n", br".*\r\n")
+    self.write_response(b"NO", b"UNSUBSCRIBE not allowed")
+
+  async def command_idle(self):
+    self.write_line(b"+ idling")
+    if self.mailbox_id is not None:
+      raise NotImplementedError("Implement waiting for messages")
+    while (await self.read_line_str()) != "DONE": pass
+    self.write_response(b"OK", b"IDLE completed")
+
+  async def command_status(self):
+    mailbox = await self.read_nstring_sp()
+    await self.read_const(b"(")
+    attrs = (await self.read_until(b")", rb"[A-Z ]+\)")).split(b" ")
+    await self.read_end_line()
+    account = self.config.accounts[0]
+    if account is None:
+      return self.write_response(b"NO", b"invalid state")
+
+    with db_open(self.config.db_path) as db:
+      tmailbox_id = self.mailbox_id if mailbox is None else db_mailbox_id(db, account.key, mailbox)
+      if tmailbox_id is None:
+        return self.write_response(b"NO", b"invalid mailbox name")
+
+      response: dict[bytes, int] = {}
+      if b"MESSAGES" in attrs:
+        response[b"MESSAGES"] = db_status_messages(db, tmailbox_id)
+      if b"UIDNEXT" in attrs:
+        response[b"UIDNEXT"] = db_status_uid_next(db, account.key, tmailbox_id)
+      if b"UIDVALIDITY" in attrs:
+        response[b"UIDVALIDITY"] = db_status_uid_validity(db, account.key, tmailbox_id)
+      if b"UNSEEN" in attrs:
+        response[b"UNSEEN"] = db_status_unseen(db, tmailbox_id)
+      if b"DELETED" in attrs:
+        response[b"DELETED"] = db_status_deleted(db, tmailbox_id)
+      if b"SIZE" in attrs:
+        response[b"SIZE"] = db_status_size(db, tmailbox_id)
+
+      status_str = b" ".join(b"%s %d" % (k, v) for k, v in response.items())
+      self.write_line(b"* STATUS %s (%s)" % (mailbox or b"NIL", status_str))
+    self.write_response(b"OK", b"status completed")
+
+  async def command_template(self): pass
+
   async def handle_command(self):
     self.last_tag = await self.read_until(b" ", br"[^ ]+ ") # TODO better validation
     command = await self.read_until((b" ", b"\r\n"), br"[^\s]+( |(\r\n))") # TODO better validation
@@ -183,100 +232,30 @@ class IMAPServerConnection:
 
     match command:
       case b"CAPABILITY": await self.command_capability()
+      case b"NOOP": await self.command_noop()
+      case b"LOGOUT": await self.command_logout()
+      case b"LOGIN": await self.command_login()
+      case b"AUTHENTICATE": await self.command_authenticate()
+      case b"SUBSCRIBE": await self.command_subscribe()
+      case b"UNSUBSCRIBE": await self.command_unsubscribe()
+      case b"IDLE": await self.command_idle()
+      case b"STATUS": await self.command_status()
+      case b"STARTTLS": self.write_response(b"NO", b"tls not available!")
 
   async def run(self):
     self.write_line(b"220 %s Ready" % (self.config.domain.encode("ASCII"),))
     try:
       while not self.reader.at_eof():
-        await self.handle_command()
+        try:
+          await self.handle_command()
+        except IMAPCommandFailedError:
+          self.write_response(b"NO", b"command failed with internal error")
     except Exception as e:
       logging.error("connection closing because of an error", e)
     finally:
       logging.debug("connection closed")
       self.writer.close()
 
-
-
-async def handle_imap():
-
-  try:
-    # TODO state validation!
-    while not reader.at_eof():
-
-      if command == b"CAPABILITY":
-      elif command == b"NOOP":
-        if mailbox_id is None:
-          raise NotImplementedError("Need to implement polling updates")
-        else:
-          write_line(f"{tag} OK NOOP completed")
-      elif command == b"LOGOUT":
-        write_line("* BYE Server logging out")
-        write_line(f"{tag} OK LOGOUT completed")
-      elif command == b"STARTTLS":
-        write_line(f"{tag} NO Failed")
-      elif command == b"LOGIN":
-        userid = await imap_reader.read_astring_sp()
-        password = await imap_reader.read_astring_sp()
-        await imap_reader.end_line()
-        if (login_account:=authenticate(config, userid, password)) is None:
-          write_line(f"{tag} NO Failed")
-        else:
-          account = login_account
-          write_line(f"{tag} OK Success")
-      elif command == b"AUTHENITCATE":
-        try: await imap_reader.read_const(b"PLAIN")
-        except IMAPError as e: raise IMAPError(b"Only plain auth supported for now!", e)
-        await imap_reader.end_line()
-        write_line("+ login data")
-        auth_line = await imap_reader.read_line_str()
-        if (login_account:=authenticate_sasl(config, auth_line)) is None:
-          write_line(f"{tag} NO Failed")
-        else:
-          account = login_account
-          write_line(f"{tag} OK Success")
-      elif command == b"SUBSCRIBE":
-        _ = await imap_reader.read_until(b"\r\n", br".*\r\n")
-        write_line(f"{tag} OK SUBSCRIBE completed")
-      elif command == b"UNSUBSCRIBE":
-        _ = await imap_reader.read_until(b"\r\n", br".*\r\n")
-        write_line(f"{tag} NO UNSUBSCRIBE not allowed")
-      elif command == b"IDLE":
-        write_line("+ idling")
-        raise NotImplementedError("Implement waiting for messages")
-        while (await imap_reader.read_line_str()) != "DONE": pass
-        write_line(f"{tag} OK IDLE completed")
-      elif command == b"STATUS":
-        mailbox = await imap_reader.read_nstring()
-        await imap_reader.read_const(b"(")
-        attrs = (await imap_reader.read_until(b")", rb"[A-Z ]+\)")).split(b" ")
-        await imap_reader.end_line()
-        account = config.accounts[0]
-        if account is None:
-          write_line(f"{tag} NO invalid state")
-          continue
-        with db_open(config.db_path) as db:
-          tmailbox_id = mailbox_id if mailbox is None else db_mailbox_id(db, account.key, mailbox)
-          if tmailbox_id is None:
-            write_line(f"{tag} NO invalid mailbox name")
-            continue
-
-          response: dict[str, int] = {}
-          if "MESSAGES" in attrs:
-            response["MESSAGES"] = db_status_messages(db, tmailbox_id)
-          if "UIDNEXT" in attrs:
-            response["UIDNEXT"] = db_status_uid_next(db, account.key, tmailbox_id)
-          if "UIDVALIDITY" in attrs:
-            response["UIDVALIDITY"] = db_status_uid_validity(db, account.key, tmailbox_id)
-          if "UNSEEN" in attrs:
-            response["UNSEEN"] = db_status_unseen(db, tmailbox_id)
-          if "DELETED" in attrs:
-            response["DELETED"] = db_status_deleted(db, tmailbox_id)
-          if "SIZE" in attrs:
-            response["SIZE"] = db_status_size(db, tmailbox_id)
-
-          status_str = " ".join(f"{k} {v}" for k, v in response.items())
-          write_line(f"* STATUS {mailbox} ({status_str})")
-        write_line(f"{tag} OK status completed")
-      elif command == b"SELECT":
-
-        pass
+async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+  connection = IMAPServerConnection(config, reader, writer)
+  await connection.run()
