@@ -176,21 +176,17 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
       logging.debug("Client: " + tag.decode() + " " + command.decode())
 
       if command == b"CAPABILITY":
-        await imap_reader.end_line()
         write_line("* CAPABILITY IMAP4rev2 AUTH=PLAIN")
         write_line(f"{tag} OK CAPABILITY completed")
       elif command == b"NOOP":
-        await imap_reader.end_line()
-        if state is IMAPState.Selected:
+        if mailbox_id is None:
           raise NotImplementedError("Need to implement polling updates")
         else:
           write_line(f"{tag} OK NOOP completed")
       elif command == b"LOGOUT":
-        await imap_reader.end_line()
         write_line("* BYE Server logging out")
         write_line(f"{tag} OK LOGOUT completed")
       elif command == b"STARTTLS":
-        await imap_reader.end_line()
         write_line(f"{tag} NO Failed")
       elif command == b"LOGIN":
         userid = await imap_reader.read_astring_sp()
@@ -205,7 +201,7 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
         try: await imap_reader.read_const(b"PLAIN")
         except IMAPError as e: raise IMAPError(b"Only plain auth supported for now!", e)
         await imap_reader.end_line()
-        write_line("+")
+        write_line("+ login data")
         auth_line = await imap_reader.read_line_str()
         if (login_account:=authenticate_sasl(config, auth_line)) is None:
           write_line(f"{tag} NO Failed")
@@ -218,7 +214,11 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
       elif command == b"UNSUBSCRIBE":
         _ = await imap_reader.read_until(b"\r\n", br".*\r\n")
         write_line(f"{tag} NO UNSUBSCRIBE not allowed")
-      elif command == b"IDLE": pass # TODO: tag wont event be parsed correctly...
+      elif command == b"IDLE":
+        write_line("+ idling")
+        raise NotImplementedError("Implement waiting for messages")
+        while (await imap_reader.read_line_str()) != "DONE": pass
+        write_line(f"{tag} OK IDLE completed")
       elif command == b"STATUS":
         mailbox = await imap_reader.read_nstring()
         await imap_reader.read_const(b"(")
@@ -251,29 +251,9 @@ async def handle_imap(config: Config, reader: asyncio.StreamReader, writer: asyn
           status_str = " ".join(f"{k} {v}" for k, v in response.items())
           write_line(f"* STATUS {mailbox} ({status_str})")
         write_line(f"{tag} OK status completed")
-      elif command == b"SELECT": pass
+      elif command == b"SELECT":
 
-      if (m:=match_line(r"(?P<mode>(SELECT|EXAMINE)) (?P<mailbox>.*)", line)):
-        raise NotImplementedError()
-        mode = "" # CLOSED, READ-ONLY, READ-WRITE
-        write_line("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)")
-        write_line(f"{tag} OK [{mode}] SELECT completed")
-      elif (m:=match_line(r"CREATE (?P<mailbox>.*)", line)):
-        raise NotImplementedError()
-        # TODO create mailbox, respond no if not allowed or exists
-        write_line(f"{tag} OK CREATE completed")
-      elif (m:=match_line(r"DELETE (?P<mailbox>.*)", line)):
-        raise NotImplementedError()
-        # TODO delete mailbox, respond no if not allowed or not exists
-        write_line(f"{tag} OK DELETE completed")
-      elif (m:=match_line(r"RENAME (?P<mailbox>.*)", line)):
-        raise NotImplementedError()
-        # TODO rename mailbox
-        write_line(f"{tag} OK RENAME completed")
-
-      else:
-        write_line(f"{tag} NO failed to run command (wrong state or parsing error)")
-
+        pass
 
   except Exception as e:
     logging.error("connection closing because of an error", e)
