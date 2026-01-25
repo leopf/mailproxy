@@ -6,9 +6,11 @@ PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
 
-CREATE TABLE IF NOT EXISTS login_data (
+CREATE TABLE IF NOT EXISTS oauth2_data (
   account_key TEXT PRIMARY KEY,
-  data TEXT NOT NULL
+  access_token TEXT NOT NULL,
+  refresh_token TEXT NOT NULL,
+  expries_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS mailboxes (

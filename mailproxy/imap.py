@@ -2,9 +2,9 @@ from typing import Literal
 from mailproxy.db import db_mailbox_id, db_open, db_status_deleted, db_status_messages, db_status_size, \
     db_status_uid_next, db_status_uid_validity, db_status_unseen
 import asyncio, base64, logging, ssl, re, enum, mailproxy.parser as P
-from mailproxy.auth import authenticate, authenticate_sasl
-from mailproxy.config import Account, Config, TLSMode
-from mailproxy.utils import match_line
+from mailproxy.auth import account_get_oauth_access_token, authenticate, authenticate_sasl
+from mailproxy.config import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
+from mailproxy.utils import match_line, match_lineb
 
 class IMAPCommandFailedError(Exception): pass
 
@@ -92,6 +92,85 @@ class IMAPClient:
     if account.imap_tlsmode == TLSMode.STARTTLS:
       await client.start_tls()
     return client
+
+
+class IMAPRemoteConnection:
+  def __init__(self, config: Config, account: Account, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    self._config = config
+    self._account = account
+    self._reader = reader
+    self._writer = writer
+    self._command_counter = 0
+    self._use_imb_cte = True
+    self._capabilities: list[bytes] = []
+
+  async def _init(self):
+    logging.debug("IMAP init: " + (await self._read_line()).decode())
+    self._capabilities = await self._command_capabilities()
+    if self._account.imap_tlsmode == TLSMode.STARTTLS:
+      if b"STARTTLS" not in self._capabilities:
+        raise IMAPCommandFailedError("STARTTLS required by account but not supported by remote!")
+      await self._command_starttls()
+      self._capabilities = await self._command_capabilities()
+
+    enable_imap4_rev2 = b"IMAP4rev2" in self._capabilities
+    self._use_imb_cte = not enable_imap4_rev2
+    if enable_imap4_rev2:
+      self._start_command(b"ENABLE IMAP4rev2")
+      await self._read_until_response()
+
+    if isinstance(self._account.auth, AuthenticationOAUTH2):
+      with db_open(self._config.db_path) as db:
+        access_token = account_get_oauth_access_token(db, self._account)
+      await self._command_authenticate(b"XOAUTH2", f"user={self._account.addresses[0]}\1auth=Bearer {access_token}\1\1".encode())
+    elif isinstance(self._account.auth, AuthenticationPLAIN):
+      await self._command_authenticate(b"PLAIN", b"%s\0%s" % (self._account.addresses[0].encode(), self._account.auth.password.encode()))
+
+  async def _command_authenticate(self, auth_type: bytes, auth_data: bytes):
+    # TODO check if supported
+    self._start_command(b"AUTHENTICATE %s" % (auth_type,))
+    if not (await self._read_line()).startswith(b"+"):
+      await self._read_until_response()
+      raise IMAPCommandFailedError("Invalid response from server!")
+    self._writer.write(base64.b64encode(auth_data))
+    self._writer.write(b"\r\n")
+    await self._read_until_response()
+
+  async def _command_capabilities(self):
+    self._start_command(b"CAPABILITY")
+    capabilities: list[bytes] = []
+    async for line in self._read_response_lines():
+      if (capdict:=match_lineb(rb"* CAPABILITY (?P<caps>.*)", line)) is not None:
+        capabilities.extend(capdict["caps"].split(b" "))
+    return capabilities
+
+  async def _command_starttls(self):
+    pass
+
+  def _start_command(self, command: bytes):
+    self._command_counter += 1
+    self._writer.write(b"A%d %s\r\n" % (self._command_counter, command))
+
+  async def _read_line(self):
+    return (await self._reader.readuntil(b"\r\n"))[:-2]
+
+  async def _read_until_response(self):
+    async for _ in self._read_response_lines(): pass
+  async def _read_response_lines(self):
+    expected_tag = b"A%d " % (self._command_counter,)
+    while (line:=await self._read_line()).startswith(expected_tag):
+      yield line
+    code, message = line[len(expected_tag):].split(b" ", maxsplit=1)
+    if code.lower() != b"OK":
+      raise IMAPCommandFailedError(f"remote command failed: {code.decode()} {message.decode()}")
+
+  @staticmethod
+  async def open(config: Config, account: Account):
+    ssl_param = ssl.create_default_context() if account.imap_tlsmode == TLSMode.DIRECT else None
+    reader, writer = await asyncio.open_connection(account.imap_host, account.imap_port, ssl=ssl_param)
+    connection = IMAPRemoteConnection(config, account, reader, writer)
+    await connection._init()
+    return connection
 
 class IMAPServerConnection:
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
