@@ -95,6 +95,8 @@ class IMAPClient:
 
 
 class IMAPRemoteConnection:
+  _tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
   def __init__(self, config: Config, account: Account, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._config = config
     self._account = account
@@ -145,7 +147,9 @@ class IMAPRemoteConnection:
     return capabilities
 
   async def _command_starttls(self):
-    pass
+    self._start_command(b"STARTTLS")
+    await self._read_until_response()
+    await self._writer.start_tls(IMAPRemoteConnection._tls_context)
 
   def _start_command(self, command: bytes):
     self._command_counter += 1
