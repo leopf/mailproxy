@@ -1,11 +1,15 @@
 import functools, asyncio, logging, argparse, pathlib, json, webbrowser, urllib.parse, http.server, ssl, importlib.resources
 from mailproxy.config import AuthenticationOAUTH2, Config, config_from_dict
+from mailproxy.db import db_init, db_open
 from mailproxy.imap import IMAPRemoteConnection, handle_imap
 from mailproxy.auth import oauth_fetch_access_token_with_refresh_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
 from mailproxy.smtp import smtp_server_handle_client
 
 async def exec_run(config: Config):
   async with asyncio.TaskGroup() as tg:
+    with db_open(config.db_path) as db:
+      db_init(db, config)
+
     smtp_server = await asyncio.start_server(functools.partial(smtp_server_handle_client, config), config.host, config.smtp_port)
     tg.create_task(smtp_server.serve_forever(), name="SMTP server")
 

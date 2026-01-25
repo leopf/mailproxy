@@ -59,5 +59,10 @@ class Mailbox:
   uid_next: int
   uid_validity: int
   name: str
+  flags_s: str
   is_virtual: bool
   is_remote: bool
+
+  @property
+  def flags(self):
+    return tuple("\\" + flag for flag in self.flags_s.rstrip("\\").split("\\"))

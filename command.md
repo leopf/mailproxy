@@ -8,12 +8,12 @@ done:
 - starttls
 - login
 - status
+- enable
 
 todo:
 - append
 - create
 - delete
-- enable
 - examine
 - list
 - namespace-command

@@ -1,6 +1,4 @@
-from http import server
 from typing import Literal
-from typing_extensions import final
 from mailproxy.db import db_mailbox_by_name, db_open, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_size, \
     db_mailbox_uid_next, db_mailbox_uid_validity, db_mailbox_count_unseen
 import asyncio, base64, logging, ssl, re
@@ -73,7 +71,7 @@ class IMAPRemoteConnection:
       await self._command_authenticate(b"PLAIN", b"%s\0%s" % (self.account.addresses[0].encode(), self.account.auth.password.encode()))
 
   async def _command_select(self, mailbox_name: str):
-    self._start_command(b"SELECT %s" % (self._encode_str(mailbox_name),))
+    self._start_command(b"SELECT %s" % (self._encode_mailbox(mailbox_name),))
     await self._read_until_response()
 
   async def _command_authenticate(self, auth_type: bytes, auth_data: bytes):
@@ -104,7 +102,7 @@ class IMAPRemoteConnection:
     self._command_counter += 1
     self._writer.write(b"A%d %s\r\n" % (self._command_counter, command))
 
-  async def _encode_str(self, s: str) -> bytes:
+  async def _encode_mailbox(self, s: str) -> bytes:
     raise NotImplementedError()
     return b""
 
@@ -130,6 +128,8 @@ class IMAPRemoteConnection:
     return connection
 
 class IMAPServerConnection:
+  capabilities = (b"IMAP4rev2", b"AUTH=PLAIN")
+
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._config = config
     self._reader = reader
@@ -165,10 +165,10 @@ class IMAPServerConnection:
   async def _read_line_str(self):
     return (await self._reader.readuntil(b"\r\n"))[:-2].decode()
 
-  async def _read_nstring_sp(self) -> bytes | None:
+  async def _read_nstring(self, until: bytes) -> bytes | None:
     pass
 
-  async def _read_astring_sp(self) -> bytes:
+  async def _read_astring(self, until: bytes) -> bytes:
     pass
 
   def _write_mailbox_update(self):
@@ -186,7 +186,7 @@ class IMAPServerConnection:
       await self._remote_connection.sync_mailbox(self._mailbox.name)
 
   async def _command_capability(self):
-    self._write_line(b"* CAPABILITY IMAP4rev2 AUTH=PLAIN")
+    self._write_line(b"* CAPABILITY %s" % (b" ".join(IMAPServerConnection.capabilities),))
     self._write_response(b"OK", b"CAPABILITY completed")
 
   async def _command_noop(self):
@@ -196,14 +196,21 @@ class IMAPServerConnection:
       self._write_mailbox_update()
     self._write_response(b"OK", b"NOOP completed")
 
+  async def _command_enable(self):
+    caps_str = await self._read_until(b"\r\n", br"[^\r]+\r\n")
+    caps = caps_str.split(b" ")
+    if all(c in IMAPServerConnection.capabilities for c in caps):
+      self._write_response(b"OK", b"ENABLE completed")
+    else:
+      self._write_response(b"NO", b"not supported")
+
   async def _command_logout(self):
     self._write_line(b"* BYE Server logging out")
     self._write_response(b"OK", b"LOGOUT completed")
 
   async def _command_login(self):
-    userid = await self._read_astring_sp()
-    password = await self._read_astring_sp()
-    await self._read_end_line()
+    userid = await self._read_astring(b" ")
+    password = await self._read_astring(b"\r\n")
     if (login_account:=authenticate(self._config, userid, password)) is None:
       self._write_response(b"NO", b"login failed")
     else:
@@ -251,7 +258,8 @@ class IMAPServerConnection:
       await asyncio.wait(tasks)
 
   async def _command_status(self):
-    mailbox_name = await self._read_nstring_sp()
+    mailbox_name_raw = await self._read_nstring(b" ")
+    mailbox_name = None if mailbox_name_raw is None else mailbox_name_raw.decode()
     await self._read_const(b"(")
     attrs = (await self._read_until(b")", rb"[A-Z ]+\)")).split(b" ")
     await self._read_end_line()
@@ -285,6 +293,32 @@ class IMAPServerConnection:
       self._write_line(b"* STATUS %s (%s)" % (mailbox or b"NIL", status_str))
     self._write_response(b"OK", b"status completed")
 
+  async def _command_select(self):
+    if self._remote_connection is None:
+      raise IMAPCommandFailedError("Tried to select mailbox before before authentication!")
+
+    mailbox_name = (await self._read_astring(b"\r\n")).decode()
+    account = self._remote_connection.account
+
+    with db_open(self._config.db_path) as db:
+      mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
+      if mailbox is None or mailbox.is_remote:
+        await self._remote_connection.sync_mailbox(mailbox_name)
+      mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
+
+      if mailbox is None:
+        raise IMAPCommandFailedError("mailbox unknown")
+
+      if self._mailbox is not None:
+        self._write_line(b"* OK [CLOSED] Previous mailbox is now closed")
+      self._mailbox = mailbox
+
+      self._write_line(b"* FLAGS (%s)" % (" ".join(mailbox.flags).encode(),))
+      self._write_line(b"* %d EXISTS" % (db_mailbox_count_messages(db, mailbox.id),))
+      raise NotImplementedError("more responses")
+
+    self._write_response(b"OK", b"[READ-WRITE] SELECT completed")
+
   async def _command_template(self): pass
 
   async def _open_remote(self, account: Account):
@@ -300,6 +334,7 @@ class IMAPServerConnection:
     match command:
       case b"CAPABILITY": await self._command_capability()
       case b"NOOP": await self._command_noop()
+      case b"ENABLE": await self._command_enable()
       case b"LOGOUT": await self._command_logout()
       case b"LOGIN": await self._command_login()
       case b"AUTHENTICATE": await self._command_authenticate()
@@ -307,6 +342,7 @@ class IMAPServerConnection:
       case b"UNSUBSCRIBE": await self._command_unsubscribe()
       case b"IDLE": await self._command_idle()
       case b"STATUS": await self._command_status()
+      case b"SELECT": await self._command_select()
       case b"STARTTLS": self._write_response(b"NO", b"tls not available!")
 
   async def run(self):

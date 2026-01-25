@@ -1,6 +1,6 @@
 import sqlite3, pathlib
 
-from mailproxy.model import Mailbox
+from mailproxy.model import Config, Mailbox
 
 _DB_INIT_SCIPT = """
 PRAGMA journal_mode=WAL;
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS mailboxes (
   uid_next INTEGER NOT NULL DEFAULT 1,
   uid_validity INTEGER NOT NULL DEFAULT (unixepoch('now')),
   name TEXT NOT NULL,
-  attributes TEXT NOT NULL DEFAULT '',
+  flags_s TEXT NOT NULL DEFAULT '\\\\' CHECK (flags_s LIKE '\\%\\'),
   is_virtual INTEGER NOT NULL DEFAULT 0,
   is_remote INTEGER NOT NULL DEFAULT 0,
   UNIQUE(account_key, name)
@@ -32,8 +32,7 @@ CREATE TABLE IF NOT EXISTS messages (
   mailbox_id INTEGER,
   received_date INTEGER NOT NULL,
 
-  flags TEXT NOT NULL DEFAULT '\\',
-
+  flags_s TEXT NOT NULL DEFAULT '\\\\' CHECK (flags_s LIKE '\\%\\'),
   size INTEGER NOT NULL,
   data BLOB NOT NULL,
   remote_uid TEXT,
@@ -53,11 +52,15 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
 
   return conn
 
+def db_init(db: sqlite3.Connection, config: Config):
+  # TODO create virtual mailboxes
+  raise NotImplementedError()
+
 def _mailbox_from_row(row: sqlite3.Row):
   return Mailbox(id=row["id"], account_key=row["account_key"], uid_next=row["uid_next"], uid_validity=row["uid_validity"], \
-    name=row["name"], is_virtual=bool(row["is_virtual"]), is_remote=bool(row["is_remote"]))
+    name=row["name"], flags_s=row["flags_s"], is_virtual=bool(row["is_virtual"]), is_remote=bool(row["is_remote"]))
 
-def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: bytes):
+def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: str):
   result = db.execute("SELECT * FROM mailboxes WHERE account_key=? AND name=?", (account_key, name)).fetchone()
   return None if result is None else _mailbox_from_row(result)
 
@@ -71,10 +74,10 @@ def db_mailbox_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id
   return db.execute("SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()["uid_validity"]
 
 def db_mailbox_count_unseen(db: sqlite3.Connection, mailbox_id: int):
-  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags LIKE '%\\Unseen\\%'", (mailbox_id,)).fetchone()[0]
+  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags_s LIKE '%\\Unseen\\%'", (mailbox_id,)).fetchone()[0]
 
 def db_mailbox_count_deleted(db: sqlite3.Connection, mailbox_id: int):
-  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags LIKE '%\\Deleted\\%'", (mailbox_id,)).fetchone()[0]
+  return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags_s LIKE '%\\Deleted\\%'", (mailbox_id,)).fetchone()[0]
 
 def db_mailbox_size(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COALESCE(SUM(length(data)), 0) FROM messages WHERE mailbox_id=?", (mailbox_id,)).fetchone()[0]
