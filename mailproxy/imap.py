@@ -129,7 +129,8 @@ class IMAPRemoteConnection:
       await self._command_authenticate(b"PLAIN", b"%s\0%s" % (self._account.addresses[0].encode(), self._account.auth.password.encode()))
 
   async def _command_authenticate(self, auth_type: bytes, auth_data: bytes):
-    # TODO check if supported
+    if (b"AUTH=%s" % (auth_type,)) not in self._capabilities:
+      raise IMAPCommandFailedError(f"Auth type '{auth_type.decode()}' not supported!")
     self._start_command(b"AUTHENTICATE %s" % (auth_type,))
     if not (await self._read_line()).startswith(b"+"):
       await self._read_until_response()
