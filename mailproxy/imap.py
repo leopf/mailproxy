@@ -1,98 +1,12 @@
 from typing import Literal
 from mailproxy.db import db_mailbox_id, db_open, db_status_deleted, db_status_messages, db_status_size, \
     db_status_uid_next, db_status_uid_validity, db_status_unseen
-import asyncio, base64, logging, ssl, re, enum, mailproxy.parser as P
+import asyncio, base64, logging, ssl, re
 from mailproxy.auth import account_get_oauth_access_token, authenticate, authenticate_sasl
 from mailproxy.config import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
-from mailproxy.utils import match_line, match_lineb
+from mailproxy.utils import match_lineb
 
 class IMAPCommandFailedError(Exception): pass
-
-class IMAPClient:
-  def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    self._reader = reader
-    self._writer = writer
-    self._command_counter = 0
-    self.capabilities: tuple[str, ...] = ()
-
-  async def init(self):
-    logging.debug("IMAP init: " + await self._read_line())
-    caps: list[str] = []
-    rid = self._command("CAPABILITY")
-    async for uline in self._read_returns(rid):
-      if (m:=match_line(r"\*\s+CAPABILITY(?P<caps>(\s+[^\s]+)*)", uline)):
-        caps.extend(re.split(r"\s+",  m["caps"].strip()))
-    self.capabilities = tuple(caps)
-
-  async def authenticate_xoauth2(self, email: str, access_token: str):
-    rid = self._command("AUTHENTICATE XOAUTH2")
-    if not (await self._read_line()).startswith("+"):
-      raise RuntimeError("Invalid response from server!")
-    self._writer.write(base64.b64encode(f"user={email}\1auth=Bearer {access_token}\1\1".encode()))
-    self._writer.write(b"\r\n")
-    async for _ in self._read_returns(rid): pass
-
-  async def list(self, refname: str, mailbox: str):
-    if "\"" in refname or "\"" in mailbox:
-      raise ValueError("neither base or search can have quote!")
-
-    rid = self._command(f"LIST \"{refname}\" \"{mailbox}\"")
-    mailboxes: list[tuple[str, str]] = []
-
-    async for uline in self._read_returns(rid):
-      if (m:=match_line(r"\*\s+LIST\s+\((?P<attributes>[^\)]*)\)\s+\"(?P<delimiter>)\"\s+(?P<mailbox>(INBOX)|)", uline)):
-        print(m["rest"])
-
-  async def start_tls(self):
-    rid = self._command("STARTTLS")
-    raise NotImplementedError()
-
-  async def _read_returns(self, rid: int):
-    end_linestart = str(rid) + " "
-    while not (line := await self._read_line()).startswith(end_linestart):
-      yield line
-
-    result = match_line(r"[^ ]+ (?P<code>[^ ]+) (?P<text>.*)", line)
-    assert result is not None
-    if result["code"] != "OK":
-      raise Exception(f"IMAP failed with code '{result['code']}' and message: {result['text']}")
-
-    logging.debug("IMAP command completed: " + line)
-
-  async def _read_line(self):
-    line = (await self._reader.readuntil(b"\r\n"))[:-2]
-    chunks: list[str] = []
-    index = 0
-    while index < len(line):
-      next_and = line.find(b"&", index)
-      if next_and == -1:
-        chunks.append(line[index:].decode())
-        index = len(line)
-      else:
-        chunks.append(line[index:next_and].decode())
-        end_index = line.find(b"-", next_and + 1)
-        chunks.append(base64.b64decode(line[next_and + 1:end_index] + b"=" * (((5 - end_index + next_and) % 4) % 4)).decode("utf-16-be"))
-        index = end_index + 1
-    return ''.join(chunks)
-
-  def _command(self, line: str):
-    self._command_counter += 1
-    self._writer.write(str(self._command_counter).encode())
-    self._writer.write(b" ")
-    self._writer.write(line.encode())
-    self._writer.write(b"\r\n")
-    return self._command_counter
-
-  @staticmethod
-  async def connect(account: Account):
-    ssl_param = ssl.create_default_context() if account.imap_tlsmode == TLSMode.DIRECT else None
-    reader, writer = await asyncio.open_connection(account.imap_host, account.imap_port, ssl=ssl_param)
-    client = IMAPClient(reader, writer)
-    await client.init()
-    if account.imap_tlsmode == TLSMode.STARTTLS:
-      await client.start_tls()
-    return client
-
 
 class IMAPRemoteConnection:
   _tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

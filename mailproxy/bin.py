@@ -1,6 +1,6 @@
 import functools, asyncio, logging, argparse, pathlib, json, webbrowser, urllib.parse, http.server, ssl, importlib.resources
-from mailproxy.config import AuthenticationOAUTH2, Config, TLSMode
-from mailproxy.imap import IMAPClient, handle_imap
+from mailproxy.config import AuthenticationOAUTH2, Config
+from mailproxy.imap import IMAPRemoteConnection, handle_imap
 from mailproxy.auth import oauth_fetch_access_token_with_refresh_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
 from mailproxy.smtp import smtp_server_handle_client
 
@@ -12,15 +12,9 @@ async def exec_run(config: Config):
     imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.imap_port)
     tg.create_task(imap_server.serve_forever(), name="IMAP server")
 
-
 async def exec_dev(config: Config, address: str, token: str):
   account = next(account for account in config.accounts if address in account.addresses)
-
-  client = await IMAPClient.connect(account)
-  assert "AUTH=XOAUTH2" in client.capabilities
-
-  await client.authenticate_xoauth2(account.addresses[0], token)
-  print(await client.list("", "*"))
+  client = await IMAPRemoteConnection.open(config, account)
 
 def exec_get_access_token(config: Config, address: str):
   try:
