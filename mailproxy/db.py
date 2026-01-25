@@ -53,28 +53,28 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
 
   return conn
 
-def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: bytes):
-  result = db.execute("""
-    SELECT id, account_key, uid_next, uid_validity, name, is_virtual, is_remote
-    FROM mailboxes WHERE account_key=? AND name=?""", (account_key, name)).fetchone()
-  if result is None: return None
-  return Mailbox(id=result["id"], account_key=result["account_key"], uid_next=result["uid_next"], uid_validity=result["uid_validity"], \
-    name=result["name"], is_virtual=result["is_virtual"], is_remote=result["is_remote"])
+def _mailbox_from_row(row: sqlite3.Row):
+  return Mailbox(id=row["id"], account_key=row["account_key"], uid_next=row["uid_next"], uid_validity=row["uid_validity"], \
+    name=row["name"], is_virtual=bool(row["is_virtual"]), is_remote=bool(row["is_remote"]))
 
-def db_status_messages(db: sqlite3.Connection, mailbox_id: int):
+def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: bytes):
+  result = db.execute("SELECT * FROM mailboxes WHERE account_key=? AND name=?", (account_key, name)).fetchone()
+  return None if result is None else _mailbox_from_row(result)
+
+def db_mailbox_count_messages(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=?", (mailbox_id,)).fetchone()[0]
 
-def db_status_uid_next(db: sqlite3.Connection, account_key: str, mailbox_id: int):
+def db_mailbox_uid_next(db: sqlite3.Connection, account_key: str, mailbox_id: int):
   return db.execute("SELECT uid_next FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()["uid_next"]
 
-def db_status_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id: int):
+def db_mailbox_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id: int):
   return db.execute("SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()["uid_validity"]
 
-def db_status_unseen(db: sqlite3.Connection, mailbox_id: int):
+def db_mailbox_count_unseen(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags LIKE '%\\Unseen\\%'", (mailbox_id,)).fetchone()[0]
 
-def db_status_deleted(db: sqlite3.Connection, mailbox_id: int):
+def db_mailbox_count_deleted(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags LIKE '%\\Deleted\\%'", (mailbox_id,)).fetchone()[0]
 
-def db_status_size(db: sqlite3.Connection, mailbox_id: int):
+def db_mailbox_size(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COALESCE(SUM(length(data)), 0) FROM messages WHERE mailbox_id=?", (mailbox_id,)).fetchone()[0]

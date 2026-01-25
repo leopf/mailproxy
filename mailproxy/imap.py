@@ -1,9 +1,12 @@
+from http import server
 from typing import Literal
-from mailproxy.db import db_mailbox_id, db_open, db_status_deleted, db_status_messages, db_status_size, \
-    db_status_uid_next, db_status_uid_validity, db_status_unseen
+from typing_extensions import final
+from mailproxy.db import db_mailbox_by_name, db_open, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_size, \
+    db_mailbox_uid_next, db_mailbox_uid_validity, db_mailbox_count_unseen
 import asyncio, base64, logging, ssl, re
 from mailproxy.auth import account_get_oauth_access_token, authenticate, authenticate_sasl
 from mailproxy.config import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
+from mailproxy.model import Mailbox
 from mailproxy.utils import match_lineb
 
 class IMAPCommandFailedError(Exception): pass
@@ -29,6 +32,24 @@ class IMAPRemoteConnection:
     finally:
       self._writer.close()
 
+  async def sync_mailbox(self, mailbox_name: str):
+    pass
+
+  async def wait_for_update(self, mailbox_name: str, update_event: asyncio.Event):
+    try:
+      await self._command_select(mailbox_name)
+      self._start_command(b"IDLE")
+      server_response = await self._read_line()
+      if not server_response.startswith(b"+"):
+        raise RuntimeError("server didnt respond with + in idle!")
+      while True:
+        line = await self._read_line()
+        if match_lineb(br"* \d+ (EXISTS|EXPUNGE|FETCH).*", line):
+          update_event.set()
+    finally:
+      self._writer.write(b"DONE\r\n")
+      await self._read_until_response()
+
   async def _init(self):
     logging.debug("IMAP init: " + (await self._read_line()).decode())
     self._capabilities = await self._command_capabilities()
@@ -50,6 +71,10 @@ class IMAPRemoteConnection:
       await self._command_authenticate(b"XOAUTH2", f"user={self.account.addresses[0]}\1auth=Bearer {access_token}\1\1".encode())
     elif isinstance(self.account.auth, AuthenticationPLAIN):
       await self._command_authenticate(b"PLAIN", b"%s\0%s" % (self.account.addresses[0].encode(), self.account.auth.password.encode()))
+
+  async def _command_select(self, mailbox_name: str):
+    self._start_command(b"SELECT %s" % (self._encode_str(mailbox_name),))
+    await self._read_until_response()
 
   async def _command_authenticate(self, auth_type: bytes, auth_data: bytes):
     if (b"AUTH=%s" % (auth_type,)) not in self._capabilities:
@@ -78,6 +103,10 @@ class IMAPRemoteConnection:
   def _start_command(self, command: bytes):
     self._command_counter += 1
     self._writer.write(b"A%d %s\r\n" % (self._command_counter, command))
+
+  async def _encode_str(self, s: str) -> bytes:
+    raise NotImplementedError()
+    return b""
 
   async def _read_line(self):
     return (await self._reader.readuntil(b"\r\n"))[:-2]
@@ -108,7 +137,7 @@ class IMAPServerConnection:
 
     self._last_tag: bytes | None = None
     self._remote_connection: IMAPRemoteConnection | None = None
-    self._mailbox_id: int | None = None
+    self._mailbox: Mailbox | None = None
 
   def _write_response(self, code: Literal[b"OK"] | Literal[b"NO"] | Literal[b"BAD"], message: bytes):
     assert self._last_tag is not None
@@ -142,15 +171,30 @@ class IMAPServerConnection:
   async def _read_astring_sp(self) -> bytes:
     pass
 
+  def _write_mailbox_update(self):
+    if self._mailbox is None:
+      return
+    with db_open(self._config.db_path) as db:
+      n_messages = db_mailbox_count_messages(db, self._mailbox.id)
+      self._write_line(b"* %d EXISTS" % (n_messages,))
+
+  async def _sync_mailbox(self):
+    if self._mailbox is None:
+      raise IMAPCommandFailedError("No mailbox selected!")
+    assert self._remote_connection is not None, "if a mailbox is selected, a remote connection must be open!"
+    if self._mailbox.is_remote:
+      await self._remote_connection.sync_mailbox(self._mailbox.name)
+
   async def _command_capability(self):
     self._write_line(b"* CAPABILITY IMAP4rev2 AUTH=PLAIN")
     self._write_response(b"OK", b"CAPABILITY completed")
 
   async def _command_noop(self):
-    if self._mailbox_id is not None:
-      raise NotImplementedError("Need to implement polling updates")
-    else:
-      self._write_response(b"OK", b"NOOP completed")
+    if self._mailbox is not None:
+      assert self._remote_connection is not None, "if a mailbox is selected, a remote connection must be open!"
+      await self._remote_connection.sync_mailbox(self._mailbox.name)
+      self._write_mailbox_update()
+    self._write_response(b"OK", b"NOOP completed")
 
   async def _command_logout(self):
     self._write_line(b"* BYE Server logging out")
@@ -188,13 +232,26 @@ class IMAPServerConnection:
 
   async def _command_idle(self):
     self._write_line(b"+ idling")
-    if self._mailbox_id is not None:
-      raise NotImplementedError("Implement waiting for messages")
-    while (await self._read_line_str()) != "DONE": pass
-    self._write_response(b"OK", b"IDLE completed")
+    tasks: list[asyncio.Task] = []
+    if self._mailbox is not None:
+      assert self._remote_connection is not None
+      update_event = asyncio.Event()
+      async def _update_on_event():
+        while True:
+          await update_event.wait()
+          await self._sync_mailbox()
+          self._write_mailbox_update()
+          update_event.clear()
+      tasks.extend((asyncio.Task(self._remote_connection.wait_for_update(self._mailbox.name, update_event)), asyncio.Task(_update_on_event())))
+    try:
+      await self._read_const(b"DONE\r\n")
+      self._write_response(b"OK", b"IDLE completed")
+    finally:
+      for task in tasks: task.cancel()
+      await asyncio.wait(tasks)
 
   async def _command_status(self):
-    mailbox = await self._read_nstring_sp()
+    mailbox_name = await self._read_nstring_sp()
     await self._read_const(b"(")
     attrs = (await self._read_until(b")", rb"[A-Z ]+\)")).split(b" ")
     await self._read_end_line()
@@ -202,27 +259,27 @@ class IMAPServerConnection:
     if self._remote_connection is None:
       return self._write_response(b"NO", b"invalid state")
 
-    await self._remote_connection.sync_mailbox(mailbox)
-
     account = self._remote_connection.account
     with db_open(self._config.db_path) as db:
-      tmailbox_id = self._mailbox_id if mailbox is None else db_mailbox_id(db, account.key, mailbox)
-      if tmailbox_id is None:
+      mailbox = self._mailbox if mailbox_name is None else db_mailbox_by_name(db, account.key, mailbox_name)
+      if mailbox is None:
         return self._write_response(b"NO", b"invalid mailbox name")
+
+      await self._remote_connection.sync_mailbox(mailbox.name)
 
       response: dict[bytes, int] = {}
       if b"MESSAGES" in attrs:
-        response[b"MESSAGES"] = db_status_messages(db, tmailbox_id)
+        response[b"MESSAGES"] = db_mailbox_count_messages(db, mailbox.id)
       if b"UIDNEXT" in attrs:
-        response[b"UIDNEXT"] = db_status_uid_next(db, account.key, tmailbox_id)
+        response[b"UIDNEXT"] = db_mailbox_uid_next(db, account.key, mailbox.id)
       if b"UIDVALIDITY" in attrs:
-        response[b"UIDVALIDITY"] = db_status_uid_validity(db, account.key, tmailbox_id)
+        response[b"UIDVALIDITY"] = db_mailbox_uid_validity(db, account.key, mailbox.id)
       if b"UNSEEN" in attrs:
-        response[b"UNSEEN"] = db_status_unseen(db, tmailbox_id)
+        response[b"UNSEEN"] = db_mailbox_count_unseen(db, mailbox.id)
       if b"DELETED" in attrs:
-        response[b"DELETED"] = db_status_deleted(db, tmailbox_id)
+        response[b"DELETED"] = db_mailbox_count_deleted(db, mailbox.id)
       if b"SIZE" in attrs:
-        response[b"SIZE"] = db_status_size(db, tmailbox_id)
+        response[b"SIZE"] = db_mailbox_size(db, mailbox.id)
 
       status_str = b" ".join(b"%s %d" % (k, v) for k, v in response.items())
       self._write_line(b"* STATUS %s (%s)" % (mailbox or b"NIL", status_str))
