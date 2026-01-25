@@ -198,10 +198,13 @@ class IMAPServerConnection:
     await self._read_const(b"(")
     attrs = (await self._read_until(b")", rb"[A-Z ]+\)")).split(b" ")
     await self._read_end_line()
-    account = self._config.accounts[0]
-    if account is None:
+
+    if self._remote_connection is None:
       return self._write_response(b"NO", b"invalid state")
 
+    await self._remote_connection.sync_mailbox(mailbox)
+
+    account = self._remote_connection.account
     with db_open(self._config.db_path) as db:
       tmailbox_id = self._mailbox_id if mailbox is None else db_mailbox_id(db, account.key, mailbox)
       if tmailbox_id is None:

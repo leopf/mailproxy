@@ -1,5 +1,6 @@
-import sqlite3, pathlib, datetime, json
-from mailproxy.auth import OAUTHAccessToken
+import sqlite3, pathlib
+
+from mailproxy.model import Mailbox
 
 _DB_INIT_SCIPT = """
 PRAGMA journal_mode=WAL;
@@ -52,43 +53,22 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
 
   return conn
 
-def store_account_access_token(db: sqlite3.Connection, account_key: str, token: OAUTHAccessToken):
-  token_data = json.dumps({
-    "access_token": token.access_token,
-    "expires_at": token.expires_at.isoformat(),
-    "refresh_token": token.refresh_token,
-  })
-
-  db.execute("""
-  INSERT INTO login_data (account_key, data) VALUES (?, ?)
-  ON CONFLICT(account_key) DO UPDATE SET data = excluded.data;
-  """, (account_key, token_data))
-
-def load_account_access_token(db: sqlite3.Connection, account_key: str) -> OAUTHAccessToken | None:
-  result = db.execute("SELECT data FROM login_data WHERE account_key=?", (account_key,)).fetchone()
-  if result is None:
-    return None
-
-  token_data = json.loads(result[0])
-  return OAUTHAccessToken(
-    access_token=token_data["access_token"],
-    expires_at=datetime.datetime.fromisoformat(token_data["expires_at"]),
-    refresh_token=token_data["refresh_token"],
-  )
-
-def db_mailbox_id(db: sqlite3.Connection, account_key: str, name: bytes):
-  result = db.execute("SELECT id FROM mailboxes WHERE account_key=? AND name=?", (account_key, name)).fetchone()
+def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: bytes):
+  result = db.execute("""
+    SELECT id, account_key, uid_next, uid_validity, name, is_virtual, is_remote
+    FROM mailboxes WHERE account_key=? AND name=?""", (account_key, name)).fetchone()
   if result is None: return None
-  return result[0]
+  return Mailbox(id=result["id"], account_key=result["account_key"], uid_next=result["uid_next"], uid_validity=result["uid_validity"], \
+    name=result["name"], is_virtual=result["is_virtual"], is_remote=result["is_remote"])
 
 def db_status_messages(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=?", (mailbox_id,)).fetchone()[0]
 
 def db_status_uid_next(db: sqlite3.Connection, account_key: str, mailbox_id: int):
-  return db.execute("SELECT uid_next FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()[0]
+  return db.execute("SELECT uid_next FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()["uid_next"]
 
 def db_status_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id: int):
-  return db.execute("SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()[0]
+  return db.execute("SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)).fetchone()["uid_validity"]
 
 def db_status_unseen(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags LIKE '%\\Unseen\\%'", (mailbox_id,)).fetchone()[0]

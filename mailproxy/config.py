@@ -1,5 +1,6 @@
-import logging, dataclasses, enum, pathlib, re
+import logging, pathlib, re
 from typing import Any, TypeVar
+from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
 
 T = TypeVar("T")
 def _get_type(d: Any, field_name: str, expected_type: type[T], default: T | None = None) -> T:
@@ -30,122 +31,70 @@ def _get_host(d, field_name: str, default: str | None = None):
     raise ValueError(f"Invalid characters in {field_name} regading value '{value}'")
   return value
 
-class TLSMode(enum.Enum):
-  DIRECT = "DIRECT"
-  STARTTLS = "STARTTLS"
-  NONE = "NONE"
+def tls_mode_from_value(raw: Any):
+  if not isinstance(raw, str) or (value:=raw.upper()) not in TLSMode:
+    raise ValueError("Invalid TLSMode!")
+  return TLSMode(value)
 
-  @staticmethod
-  def from_value(raw: Any):
-    if not isinstance(raw, str) or (value:=raw.upper()) not in TLSMode:
-      raise ValueError("Invalid TLSMode!")
-    return TLSMode(value)
+def auth_oauth2_from_dict(d: Any):
+  if _get_str(d, "type") != "OAUTH2":
+    return None
 
-@dataclasses.dataclass(frozen=True)
-class AuthenticationOAUTH2:
-  scope: str
-  client_id: str
-  client_secret: str | None
-  authorization_base_url: str
-  token_url: str
-  redirect_url: str
-  initial_refresh_token: str
+  return AuthenticationOAUTH2(
+    scope=_get_str(d, "scope"),
+    client_id=_get_str(d, "client_id"),
+    client_secret=_get_str(d, "client_secret", "") or None,
+    authorization_base_url=_get_str(d, "authorization_base_url"),
+    token_url=_get_str(d, "token_url"),
+    redirect_url=_get_str(d, "redirect_url"),
+    initial_refresh_token=_get_str(d, "initial_refresh_token"),
+  )
 
-  @staticmethod
-  def from_dict(d: Any):
-    if _get_str(d, "type") != "OAUTH2":
-      return None
+def auth_plain_from_dict(d: Any):
+  if _get_str(d, "type") != "PLAIN":
+    return None
 
-    return AuthenticationOAUTH2(
-      scope=_get_str(d, "scope"),
-      client_id=_get_str(d, "client_id"),
-      client_secret=_get_str(d, "client_secret", "") or None,
-      authorization_base_url=_get_str(d, "authorization_base_url"),
-      token_url=_get_str(d, "token_url"),
-      redirect_url=_get_str(d, "redirect_url"),
-      initial_refresh_token=_get_str(d, "initial_refresh_token"),
-    )
+  return AuthenticationPLAIN(_get_str(d, "password"))
 
-@dataclasses.dataclass(frozen=True)
-class AuthenticationPLAIN:
-  password: str
+def account_from_dict(d: Any):
+  if not isinstance(d, dict):
+    raise ValueError("expected config to be a dict")
 
-  @staticmethod
-  def from_dict(d: Any):
-    if _get_str(d, "type") != "PLAIN":
-      return None
+  addresses = d.get("addresses", [])
+  if not isinstance(addresses, list) or len(addresses) == 0 or \
+      any(not isinstance(address, str) for address in addresses):
+    raise ValueError("Invalid addresses")
 
-    return AuthenticationPLAIN(_get_str(d, "password"))
+  auth = auth_plain_from_dict(d.get("auth")) or auth_oauth2_from_dict(d.get("auth"))
+  if auth is None:
+    raise ValueError("auth type invalid!")
 
-@dataclasses.dataclass(frozen=True)
-class Account:
-  addresses: list[str]
+  return Account(
+    addresses=addresses,
+    imap_host=_get_host(d, "imap_host"),
+    imap_port=_get_port(d, "imap_port"),
+    imap_tlsmode=tls_mode_from_value(_get_str(d, "imap_tlsmode")),
+    smtp_host=_get_host(d, "smtp_host"),
+    smtp_port=_get_port(d, "smtp_port"),
+    smtp_tlsmode=tls_mode_from_value(_get_str(d, "smtp_tlsmode")),
+    auth=auth,
+  )
 
-  imap_host: str
-  imap_port: int
-  imap_tlsmode: TLSMode
-  smtp_host: str
-  smtp_port: int
-  smtp_tlsmode: TLSMode
+def config_from_dict(d: Any):
+  if not isinstance(d, dict):
+    raise ValueError("expected config to be a dict")
 
-  auth: AuthenticationOAUTH2 | AuthenticationPLAIN
+  db_path_str = _get_str(d, "db_path")
 
-  @property
-  def key(self):
-    return self.addresses[0]
+  if "accounts" not in d or not isinstance(d["accounts"], list) or len(d["accounts"]) == 0:
+    raise ValueError("Invalid accounts")
 
-  @staticmethod
-  def from_dict(d: Any):
-    if not isinstance(d, dict):
-      raise ValueError("expected config to be a dict")
-
-    addresses = d.get("addresses", [])
-    if not isinstance(addresses, list) or len(addresses) == 0 or \
-        any(not isinstance(address, str) for address in addresses):
-      raise ValueError("Invalid addresses")
-
-    auth = AuthenticationPLAIN.from_dict(d.get("auth")) or AuthenticationOAUTH2.from_dict(d.get("auth"))
-    if auth is None:
-      raise ValueError("auth type invalid!")
-
-    return Account(
-      addresses=addresses,
-      imap_host=_get_host(d, "imap_host"),
-      imap_port=_get_port(d, "imap_port"),
-      imap_tlsmode=TLSMode.from_value(_get_str(d, "imap_tlsmode")),
-      smtp_host=_get_host(d, "smtp_host"),
-      smtp_port=_get_port(d, "smtp_port"),
-      smtp_tlsmode=TLSMode.from_value(_get_str(d, "smtp_tlsmode")),
-      auth=auth,
-    )
-
-
-@dataclasses.dataclass(frozen=True)
-class Config:
-  accounts: list[Account]
-  domain: str
-  log_level: int
-  host: str
-  imap_port: int
-  smtp_port: int
-  db_path: pathlib.Path
-
-  @staticmethod
-  def from_dict(d: Any):
-    if not isinstance(d, dict):
-      raise ValueError("expected config to be a dict")
-
-    db_path_str = _get_str(d, "db_path")
-
-    if "accounts" not in d or not isinstance(d["accounts"], list) or len(d["accounts"]) == 0:
-      raise ValueError("Invalid accounts")
-
-    return Config(
-      db_path=pathlib.Path(db_path_str),
-      accounts=[ Account.from_dict(a) for a in d["accounts"] ],
-      log_level=logging.getLevelNamesMapping().get(_get_str(d, "log_level", "DEBUG"), logging.DEBUG),
-      domain=_get_host(d, "domain"),
-      host=_get_host(d, "host", "0.0.0.0"),
-      imap_port=_get_port(d, "imap_port", 143),
-      smtp_port=_get_port(d, "smtp_port", 587),
-    )
+  return Config(
+    db_path=pathlib.Path(db_path_str),
+    accounts=[ account_from_dict(a) for a in d["accounts"] ],
+    log_level=logging.getLevelNamesMapping().get(_get_str(d, "log_level", "DEBUG"), logging.DEBUG),
+    domain=_get_host(d, "domain"),
+    host=_get_host(d, "host", "0.0.0.0"),
+    imap_port=_get_port(d, "imap_port", 143),
+    smtp_port=_get_port(d, "smtp_port", 587),
+  )

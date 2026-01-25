@@ -1,5 +1,5 @@
 import functools, asyncio, logging, argparse, pathlib, json, webbrowser, urllib.parse, http.server, ssl, importlib.resources
-from mailproxy.config import AuthenticationOAUTH2, Config
+from mailproxy.config import AuthenticationOAUTH2, Config, config_from_dict
 from mailproxy.imap import IMAPRemoteConnection, handle_imap
 from mailproxy.auth import oauth_fetch_access_token_with_refresh_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
 from mailproxy.smtp import smtp_server_handle_client
@@ -112,7 +112,7 @@ if __name__ == "__main__":
 
   args = parser.parse_args()
 
-  config = Config.from_dict(json.loads(args.config.read_text()))
+  config = config_from_dict(json.loads(args.config.read_text()))
   logging.basicConfig(level=config.log_level)
 
   if args.command == "run":
