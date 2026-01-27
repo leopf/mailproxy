@@ -7,6 +7,9 @@ from mailproxy.config import Account, AuthenticationOAUTH2, AuthenticationPLAIN,
 from mailproxy.model import Mailbox
 from mailproxy.utils import match_lineb
 
+def imap_to_quoted_string(value: bytes):
+  return b"\"%s\"" % (value.replace(b"\"", b"\\\""),)
+
 class IMAPCommandFailedError(Exception): pass
 
 class IMAPRemoteConnection:
@@ -139,6 +142,12 @@ class IMAPServerConnection:
     self._remote_connection: IMAPRemoteConnection | None = None
     self._mailbox: Mailbox | None = None
 
+  def _encode_mailbox_name(self, mailbox_name: str):
+    return mailbox_name.encode()
+
+  def _decode_mailbox_name(self, mailbox_name: bytes):
+    return mailbox_name.decode()
+
   def _write_response(self, code: Literal[b"OK"] | Literal[b"NO"] | Literal[b"BAD"], message: bytes):
     assert self._last_tag is not None
     self._writer.write(b"%s %s %s\r\n" % (self._last_tag, code, message))
@@ -177,6 +186,12 @@ class IMAPServerConnection:
     with db_open(self._config.db_path) as db:
       n_messages = db_mailbox_count_messages(db, self._mailbox.id)
       self._write_line(b"* %d EXISTS" % (n_messages,))
+
+  def _write_mailbox_list_response(self, mailbox: Mailbox):
+    flags = " ".join(mailbox.flags).encode("ascii")
+    hierachry_delimiter_s = imap_to_quoted_string(mailbox.hierachry_delimiter.encode("ascii"))
+    name_s = imap_to_quoted_string(self._encode_mailbox_name(mailbox.name))
+    self._write_line(b"* LIST (%s) %s %s" % (flags, hierachry_delimiter_s, name_s))
 
   async def _sync_mailbox(self):
     if self._mailbox is None:
@@ -311,11 +326,14 @@ class IMAPServerConnection:
 
       if self._mailbox is not None:
         self._write_line(b"* OK [CLOSED] Previous mailbox is now closed")
-      self._mailbox = mailbox
 
-      self._write_line(b"* FLAGS (%s)" % (" ".join(mailbox.flags).encode(),))
+      self._write_line(b"* FLAGS (%s)" % (" ".join(mailbox.flags).encode("ascii"),))
       self._write_line(b"* %d EXISTS" % (db_mailbox_count_messages(db, mailbox.id),))
-      raise NotImplementedError("more responses")
+      self._write_mailbox_list_response(mailbox)
+      self._write_line(b"* OK [PERMANENTFLAGS (\\Deleted \\Seen \\Answered \\Flagged \\Draft \\*)]")
+      self._write_line(b"* OK [UIDNEXT %d]" % (mailbox.uid_next,))
+      self._write_line(b"* OK [UIDVALIDITY %d]" % (mailbox.uid_validity,))
+      self._mailbox = mailbox
 
     self._write_response(b"OK", b"[READ-WRITE] SELECT completed")
 
@@ -346,7 +364,7 @@ class IMAPServerConnection:
       case b"STARTTLS": self._write_response(b"NO", b"tls not available!")
 
   async def run(self):
-    self._write_line(b"220 %s Ready" % (self._config.domain.encode("ASCII"),))
+    self._write_line(b"220 %s Ready" % (self._config.domain.encode("ascii"),))
     try:
       while not self._reader.at_eof():
         try:

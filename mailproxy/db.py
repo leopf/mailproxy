@@ -2,6 +2,9 @@ import sqlite3, pathlib
 
 from mailproxy.model import Config, Mailbox
 
+# TODO: hierachry_delimiter needs check for single digit
+# TODO: more validation for flags, check what is acutally allowed char wise (cuz encoding...)
+
 _DB_INIT_SCIPT = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -20,6 +23,7 @@ CREATE TABLE IF NOT EXISTS mailboxes (
   uid_next INTEGER NOT NULL DEFAULT 1,
   uid_validity INTEGER NOT NULL DEFAULT (unixepoch('now')),
   name TEXT NOT NULL,
+  hierachry_delimiter TEXT NOT NULL DEFAULT "/",
   flags_s TEXT NOT NULL DEFAULT '\\\\' CHECK (flags_s LIKE '\\%\\'),
   is_virtual INTEGER NOT NULL DEFAULT 0,
   is_remote INTEGER NOT NULL DEFAULT 0,
@@ -58,7 +62,7 @@ def db_init(db: sqlite3.Connection, config: Config):
 
 def _mailbox_from_row(row: sqlite3.Row):
   return Mailbox(id=row["id"], account_key=row["account_key"], uid_next=row["uid_next"], uid_validity=row["uid_validity"], \
-    name=row["name"], flags_s=row["flags_s"], is_virtual=bool(row["is_virtual"]), is_remote=bool(row["is_remote"]))
+    name=row["name"], hierachry_delimiter=row["hierachry_delimiter"], flags_s=row["flags_s"], is_virtual=bool(row["is_virtual"]), is_remote=bool(row["is_remote"]))
 
 def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: str):
   result = db.execute("SELECT * FROM mailboxes WHERE account_key=? AND name=?", (account_key, name)).fetchone()

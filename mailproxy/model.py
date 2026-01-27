@@ -59,6 +59,7 @@ class Mailbox:
   uid_next: int
   uid_validity: int
   name: str
+  hierachry_delimiter: str
   flags_s: str
   is_virtual: bool
   is_remote: bool
