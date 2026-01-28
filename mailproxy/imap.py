@@ -1,11 +1,11 @@
 from typing import Literal
-from mailproxy.db import db_mailbox_by_name, db_open, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_size, \
+from mailproxy.db import db_list_mailboxes, db_mailbox_by_name, db_open, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_size, \
     db_mailbox_uid_next, db_mailbox_uid_validity, db_mailbox_count_unseen
 import asyncio, base64, logging, ssl, re
 from mailproxy.auth import account_get_oauth_access_token, authenticate, authenticate_sasl
 from mailproxy.config import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
 from mailproxy.model import Mailbox
-from mailproxy.utils import match_lineb
+from mailproxy.utils import BacktrackingStreamReader, match_lineb
 
 def imap_to_quoted_string(value: bytes):
   return b"\"%s\"" % (value.replace(b"\"", b"\\\""),)
@@ -135,7 +135,7 @@ class IMAPServerConnection:
 
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._config = config
-    self._reader = reader
+    self._reader = BacktrackingStreamReader(reader)
     self._writer = writer
 
     self._last_tag: bytes | None = None
@@ -156,23 +156,6 @@ class IMAPServerConnection:
   def _write_line(self, line: bytes):
     self._writer.write(line)
     self._writer.write(b"\r\n")
-
-  async def _read_until(self, until: bytes | tuple[bytes, ...], re_validate: bytes, re_flags: int = 0):
-    result = await self._reader.readuntil(until)
-    if re.fullmatch(re_validate, result, re_flags) is None:
-      raise IMAPCommandFailedError("Invalid sequence read by read_until!")
-    return result[:-len(until)]
-
-  async def _read_end_line(self):
-    await self._read_until(b"\r\n", br"\r\n")
-
-  async def _read_const(self, seq: bytes):
-    res = await self._reader.readexactly(len(seq))
-    if res != seq:
-      raise IMAPCommandFailedError(f"Not all elements matched! {res} != {seq}!")
-
-  async def _read_line_str(self):
-    return (await self._reader.readuntil(b"\r\n"))[:-2].decode()
 
   async def _read_nstring(self, until: bytes) -> bytes | None:
     pass
@@ -212,7 +195,7 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"NOOP completed")
 
   async def _command_enable(self):
-    caps_str = await self._read_until(b"\r\n", br"[^\r]+\r\n")
+    caps_str = await self._reader.read_line()
     caps = caps_str.split(b" ")
     if all(c in IMAPServerConnection.capabilities for c in caps):
       self._write_response(b"OK", b"ENABLE completed")
@@ -233,11 +216,11 @@ class IMAPServerConnection:
       self._write_response(b"OK", b"login completed")
 
   async def _command_authenticate(self):
-    try: await self._read_const(b"PLAIN")
+    try: await self._reader.read_const(b"PLAIN", case_sensitive=False)
     except IMAPCommandFailedError as e: raise IMAPCommandFailedError(b"Only plain auth supported for now!", e)
-    await self._read_end_line()
+    await self._reader.read_crlf()
     self._write_line(b"+ login data")
-    auth_line = await self._read_line_str()
+    auth_line = await self._reader.read_line()
     if (login_account:=authenticate_sasl(self._config, auth_line)) is None:
       self._write_response(b"NO", b"auth failed")
     else:
@@ -245,11 +228,11 @@ class IMAPServerConnection:
       self._write_response(b"OK", b"auth completed")
 
   async def _command_subscribe(self):
-    _ = await self._read_until(b"\r\n", br".*\r\n")
+    _ = await self._reader.read_line()
     self._write_response(b"OK", b"SUBSCRIBE completed")
 
   async def _command_unsubscribe(self):
-    _ = await self._read_until(b"\r\n", br".*\r\n")
+    _ = await self._reader.read_line()
     self._write_response(b"NO", b"UNSUBSCRIBE not allowed")
 
   async def _command_idle(self):
@@ -266,7 +249,7 @@ class IMAPServerConnection:
           update_event.clear()
       tasks.extend((asyncio.Task(self._remote_connection.wait_for_update(self._mailbox.name, update_event)), asyncio.Task(_update_on_event())))
     try:
-      await self._read_const(b"DONE\r\n")
+      await self._reader.read_const(b"DONE\r\n", case_sensitive=False)
       self._write_response(b"OK", b"IDLE completed")
     finally:
       for task in tasks: task.cancel()
@@ -275,9 +258,10 @@ class IMAPServerConnection:
   async def _command_status(self):
     mailbox_name_raw = await self._read_nstring(b" ")
     mailbox_name = None if mailbox_name_raw is None else mailbox_name_raw.decode()
-    await self._read_const(b"(")
-    attrs = (await self._read_until(b")", rb"[A-Z ]+\)")).split(b" ")
-    await self._read_end_line()
+    await self._reader.read_const(b"(")
+    attrs_res = await self._reader.readuntil_re(b")", rb"(?P<attrs>[A-Z ]+)\)")
+    attrs = attrs_res["attrs"].split(b" ")
+    await self._reader.read_crlf()
 
     if self._remote_connection is None:
       return self._write_response(b"NO", b"invalid state")
@@ -337,6 +321,24 @@ class IMAPServerConnection:
 
     self._write_response(b"OK", b"[READ-WRITE] SELECT completed")
 
+  async def _command_list(self):
+    reference_name_raw = await self._read_astring(b" ")
+    pattern_raw = await self._read_astring(b" ") # TODO: whats the format grammer here?
+
+    raise NotImplementedError("how do i parse this?")
+
+    if self._remote_connection is None:
+      raise IMAPCommandFailedError("invalid state, must be logged in")
+
+    reference_name = self._decode_mailbox_name(reference_name_raw)
+    pattern = self._decode_mailbox_name(pattern_raw)
+
+    with db_open(self._config.db_path) as db:
+      for mailbox in db_list_mailboxes(db, self._remote_connection.account.key, reference_name, pattern):
+        self._write_mailbox_list_response(mailbox)
+
+    self._write_response(b"OK", b"list completed")
+
   async def _command_template(self): pass
 
   async def _open_remote(self, account: Account):
@@ -345,8 +347,9 @@ class IMAPServerConnection:
     self._remote_connection = await IMAPRemoteConnection.open(self._config, account)
 
   async def _handle_command(self):
-    self._last_tag = await self._read_until(b" ", br"[^ ]+ ") # TODO better validation
-    command = await self._read_until((b" ", b"\r\n"), br"[^\s]+( |(\r\n))") # TODO better validation
+    self._last_tag = await self._reader.readuntil(b" ") # TODO better validation
+    command_raw = await self._reader.readuntil((b" ", b"\r\n")) # TODO better validation
+    command = command_raw.upper()
     logging.debug("Client: " + self._last_tag.decode() + " " + command.decode())
 
     match command:
@@ -361,13 +364,15 @@ class IMAPServerConnection:
       case b"IDLE": await self._command_idle()
       case b"STATUS": await self._command_status()
       case b"SELECT": await self._command_select()
+      case b"LIST": await self._command_list()
       case b"STARTTLS": self._write_response(b"NO", b"tls not available!")
 
   async def run(self):
     self._write_line(b"220 %s Ready" % (self._config.domain.encode("ascii"),))
     try:
-      while not self._reader.at_eof():
+      while not self._reader.at_eof:
         try:
+          self._reader.mark()
           await self._handle_command()
         except IMAPCommandFailedError:
           self._write_response(b"NO", b"command failed with internal error")

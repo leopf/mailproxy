@@ -42,7 +42,7 @@ def oauth_get_authorization_url(auth: AuthenticationOAUTH2):
   data = { "client_id": auth.client_id, "scope": auth.scope, "redirect_uri": auth.redirect_url, "response_type": "code", "response_mode": "query" }
   return f"{auth.authorization_base_url}?{urllib.parse.urlencode(data)}"
 
-def authenticate_sasl(config: Config, sasl_b64: str):
+def authenticate_sasl(config: Config, sasl_b64: bytes):
   data = base64.b64decode(sasl_b64).split(b"\0")
   return authenticate(config, data[1], data[1])
 

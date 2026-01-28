@@ -9,16 +9,16 @@ done:
 - login
 - status
 - enable
+- select
 
 todo:
+- list
 - append
 - create
 - delete
 - examine
-- list
 - namespace-command
 - rename
-- select
 
 later:
 - idle

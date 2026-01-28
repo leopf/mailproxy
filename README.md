@@ -2,6 +2,12 @@
 
 (WIP)
 
+## TODO
+- handle mailbox name encodings correctly
+- support imap4rev1
+- case sensitivity
+- dont need perma flags?? see https://datatracker.ietf.org/doc/html/rfc9051#name-sample-imap4rev2-connection
+
 ## RFCs
 - [OAUTH2](https://www.rfc-editor.org/rfc/rfc6749.html)
 - [NET-UNICODE](https://www.rfc-editor.org/rfc/rfc5198.html)

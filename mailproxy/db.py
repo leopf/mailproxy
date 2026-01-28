@@ -68,6 +68,12 @@ def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: str):
   result = db.execute("SELECT * FROM mailboxes WHERE account_key=? AND name=?", (account_key, name)).fetchone()
   return None if result is None else _mailbox_from_row(result)
 
+def db_list_mailboxes(db: sqlite3.Connection, account_key: str, reference_name: str, search_pat: str):
+  result = db.execute("SELECT * FROM mailboxes WHERE account_key=?") # TODO: more options!
+  while (item:=result.fetchone()) is not None:
+    yield _mailbox_from_row(item)
+  raise NotImplementedError("do the actual matching!")
+
 def db_mailbox_count_messages(db: sqlite3.Connection, mailbox_id: int):
   return db.execute("SELECT COUNT(*) FROM messages WHERE mailbox_id=?", (mailbox_id,)).fetchone()[0]
 
