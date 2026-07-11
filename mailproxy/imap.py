@@ -5,7 +5,7 @@ import asyncio, base64, logging, ssl, re
 from mailproxy.auth import account_get_oauth_access_token, authenticate, authenticate_sasl
 from mailproxy.config import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
 from mailproxy.model import Mailbox
-from mailproxy.utils import BacktrackingStreamReader, match_lineb
+from mailproxy.utils import ScopedStreamReader, match_lineb
 
 def imap_to_quoted_string(value: bytes):
   return b"\"%s\"" % (value.replace(b"\"", b"\\\""),)
@@ -21,7 +21,7 @@ class IMAPRemoteConnection:
     self._reader = reader
     self._writer = writer
     self._command_counter = 0
-    self._use_imb_cte = True
+    self._use_ascii_mailbox_encoding = True
     self._capabilities: list[bytes] = []
 
   async def shutdown(self):
@@ -61,7 +61,7 @@ class IMAPRemoteConnection:
       self._capabilities = await self._command_capabilities()
 
     enable_imap4_rev2 = b"IMAP4rev2" in self._capabilities
-    self._use_imb_cte = not enable_imap4_rev2
+    self._use_ascii_mailbox_encoding = not enable_imap4_rev2
     if enable_imap4_rev2:
       self._start_command(b"ENABLE IMAP4rev2")
       await self._read_until_response()
@@ -135,7 +135,7 @@ class IMAPServerConnection:
 
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._config = config
-    self._reader = BacktrackingStreamReader(reader)
+    self._reader = ScopedStreamReader(reader)
     self._writer = writer
 
     self._last_tag: bytes | None = None
@@ -372,10 +372,12 @@ class IMAPServerConnection:
     try:
       while not self._reader.at_eof:
         try:
-          self._reader.mark()
+          self._reader.open_scope()
           await self._handle_command()
         except IMAPCommandFailedError:
           self._write_response(b"NO", b"command failed with internal error")
+        finally:
+          self._reader.close_scope(True)
     except Exception as e:
       logging.error("connection closing because of an error", e)
     finally:
