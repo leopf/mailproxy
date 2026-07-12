@@ -79,7 +79,16 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
           reply(250, "OK")
         case "DATA" if account is not None:
           reply(354, "Start mail input; end with <CRLF>.<CRLF>")
-          mail_data = (await reader.readuntil(b"\r\n.\r\n"))[:-5]
+          mail_buf = bytearray()
+          while True:
+            data_line = await reader.readuntil(b"\r\n")
+            if data_line == b".\r\n":
+              break
+            if data_line.startswith(b".."):
+              mail_buf.extend(data_line[1:])
+            else:
+              mail_buf.extend(data_line)
+          mail_data = bytes(mail_buf)
           try:
             await smtp_forward_mail(config.db_path, account, sender, tuple(recipients), mail_data)
             reply(250, "OK")
