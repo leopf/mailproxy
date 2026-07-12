@@ -1,5 +1,6 @@
 import pathlib, tempfile, unittest
 from mailproxy.db import db_open, db_account_add, db_mailbox_add, db_message_add, db_message_delete_by_uid, \
+    db_message_delete_except, \
     db_message_list, db_message_get_by_uid, db_message_update_flags, db_message_count, db_messages_clear, \
     db_messages_for_account, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_count_deleted, \
     db_mailbox_size, db_mailbox_max_uid, db_mailbox_delete, db_mailbox_list, db_mailbox_by_name, \
@@ -115,12 +116,21 @@ class TestMessageSoftDelete(unittest.TestCase):
     self.assertIsNotNone(msg)
     self.assertEqual(msg.data, b"new data")
 
-  def test_update_flags_skips_deleted(self):
+  def test_update_flags_skips_client_expunged(self):
     self._add_message(1, "\\Seen\\")
     db_message_delete_by_uid(self.db, self.mailbox_id, 1)
     db_message_update_flags(self.db, self.mailbox_id, 1, "\\Flagged\\")
-    row = self.db.execute("SELECT flags_s FROM messages WHERE mailbox_id=? AND uid=?", (self.mailbox_id, 1)).fetchone()
-    self.assertEqual(row["flags_s"], "\\Seen\\")
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    self.assertIsNone(msg)
+
+  def test_update_flags_restores_remote_deleted(self):
+    self._add_message(1, "\\Seen\\")
+    db_message_delete_except(self.db, self.mailbox_id, set(), 1)
+    db_message_update_flags(self.db, self.mailbox_id, 1, "\\Flagged\\")
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    self.assertIsNotNone(msg)
+    self.assertEqual(msg.flags_s, "\\Flagged\\")
+    self.assertFalse(msg.is_deleted)
 
 
 class TestMailboxSoftDelete(unittest.TestCase):

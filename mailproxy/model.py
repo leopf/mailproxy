@@ -76,7 +76,7 @@ class Message:
   flags_s: str
   size: int
   data: bytes
-  remote_uid: str
+  remote_uid: str | None
   is_deleted: bool = False
 
 @dataclasses.dataclass(frozen=True)

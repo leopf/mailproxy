@@ -687,7 +687,7 @@ class IMAPServerConnection:
     else:
       with db_open(self._config.db_path) as db:
         uid = db_mailbox_max_uid(db, mailbox.id) + 1
-        db_message_add(db, uid, mailbox.id, int(datetime.datetime.now().timestamp()), flags_s, len(data), data, str(uid))
+        db_message_add(db, uid, mailbox.id, int(datetime.datetime.now().timestamp()), flags_s, len(data), data, None)
         db_mailbox_update_sync(db, mailbox.id, uid_next=uid + 1, last_synced_uid=uid)
 
     self._write_response(b"OK", b"APPEND completed")

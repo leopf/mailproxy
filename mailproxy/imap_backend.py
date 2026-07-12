@@ -67,6 +67,10 @@ class IMAPRemoteConnection:
         if parsed is None: continue
         uid = parsed.get(b"UID")
         if uid is None: continue
+        uid_int = int(uid)
+        if uid_int <= last_synced:
+          logging.debug("sync_mailbox: '%s' skipping uid %d (<= last_synced %d)", mailbox_name, uid_int, last_synced)
+          continue
         flags = parsed.get(b"FLAGS", b"")
         internal_date = parsed.get(b"INTERNALDATE", b"")
         size = parsed.get(b"RFC822.SIZE", 0)
@@ -104,8 +108,7 @@ class IMAPRemoteConnection:
           for uid, flags_s in flag_updates:
             db_message_update_flags(db, mailbox_id, uid, flags_s)
           logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, len(flag_updates))
-        db_message_delete_except(db, mailbox_id, seen_uids)
-        deleted_count = last_synced - len(seen_uids)
+        deleted_count = db_message_delete_except(db, mailbox_id, seen_uids, last_synced)
         if deleted_count > 0:
           logging.debug("sync_mailbox: '%s' soft-deleted %d messages (removed on remote)", mailbox_name, deleted_count)
 

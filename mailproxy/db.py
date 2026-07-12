@@ -284,7 +284,7 @@ def db_mailbox_update_sync(db: sqlite3.Connection, mailbox_id: int, *, uid_next:
 def db_messages_clear(db: sqlite3.Connection, mailbox_id: int):
   _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
 
-def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, size: int, data: bytes, remote_uid: str):
+def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, size: int, data: bytes, remote_uid: str | None):
   _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, data, remote_uid) VALUES (?,?,?,?,?,?,?) " +
     "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, data=excluded.data, remote_uid=excluded.remote_uid, is_deleted=0",
     (uid, mailbox_id, received_date, flags_s, size, data, remote_uid))
@@ -297,7 +297,7 @@ def _message_from_row(row: sqlite3.Row) -> Message:
     flags_s=row_field(row, "flags_s", str),
     size=row_field(row, "size", int),
     data=row_field(row, "data", bytes),
-    remote_uid=row_field(row, "remote_uid", str),
+    remote_uid=row_optional(row, "remote_uid", str),
     is_deleted=bool(row_field(row, "is_deleted", int)),
   )
 
@@ -315,18 +315,19 @@ def db_mailbox_max_uid(db: sqlite3.Connection, mailbox_id: int) -> int:
   return value if value is not None else 0
 
 def db_message_update_flags(db: sqlite3.Connection, mailbox_id: int, uid: int, flags_s: str):
-  _ = db.execute("UPDATE messages SET flags_s=? WHERE mailbox_id=? AND uid=? AND is_deleted=0", (flags_s, mailbox_id, uid))
+  _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=? AND remote_uid IS NOT NULL", (flags_s, mailbox_id, uid))
 
 def db_message_delete_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int):
-  _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
+  _ = db.execute("UPDATE messages SET is_deleted=1, remote_uid=NULL WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
 
-def db_message_delete_except(db: sqlite3.Connection, mailbox_id: int, uids: set[int]):
+def db_message_delete_except(db: sqlite3.Connection, mailbox_id: int, uids: set[int], max_uid: int) -> int:
   if not uids:
-    _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,))
-    return
+    cursor = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid<=? AND remote_uid IS NOT NULL", (mailbox_id, max_uid))
+    return cursor.rowcount
   placeholders = ",".join("?" for _ in uids)
-  params = [mailbox_id] + list(uids)
-  _ = db.execute(f"UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid NOT IN ({placeholders})", params)
+  params = [mailbox_id, max_uid] + list(uids)
+  cursor = db.execute(f"UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid<=? AND remote_uid IS NOT NULL AND uid NOT IN ({placeholders})", params)
+  return cursor.rowcount
 
 def db_mailbox_delete(db: sqlite3.Connection, mailbox_id: int):
   with db:
