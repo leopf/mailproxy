@@ -268,7 +268,7 @@ class IMAPRemoteConnection:
     self._writer.write(b"A%d %s\r\n" % (self._command_counter, command))
 
   def _encode_mailbox(self, s: str) -> bytes:
-    if self._use_ascii_mailbox_encoding:
+    if self._use_ascii_mailbox_encoding and not s.isascii():
       return imap_to_quoted_string(encode_7bit_mailbox_name(s).encode("ascii"))
     return imap_to_quoted_string(s.encode("utf-8"))
 
