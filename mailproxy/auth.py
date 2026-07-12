@@ -1,76 +1,92 @@
-import urllib.parse, urllib.request, json, datetime, base64, sqlite3
-from mailproxy.config import Account, AuthenticationOAUTH2, Config
-from mailproxy.model import OAUTHAccessTokenResult
+import http.client, urllib.parse, datetime, base64, sqlite3, hmac
+from mailproxy.config import oauth_token_response_from_dict
+from mailproxy.db import db_account_get_by_address, row_field, row_optional, fetchone
+from mailproxy.model import Account, AuthenticationOAUTH2, Config, OAUTHAccessTokenResult
+from mailproxy.utils import json_loads_object
 
 class AuthenticationError(Exception):
   pass
 
-def _fetch_access_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]):
+def _fetch_access_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]) -> OAUTHAccessTokenResult:
   data = { "client_id": auth.client_id, "scope": auth.scope } | extra_data
   if auth.client_secret is not None:
     data["client_secret"] = auth.client_secret
 
-  token_request = urllib.request.Request(
-    auth.token_url,
-    data=urllib.parse.urlencode(data).encode(),
-    method="POST",
-    headers={ "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" }
-  )
+  parsed = urllib.parse.urlparse(auth.token_url)
+  if parsed.hostname is None:
+    raise AuthenticationError(f"invalid token_url: {auth.token_url}")
+
+  headers = { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" }
+  body = urllib.parse.urlencode(data).encode()
+  path = parsed.path or "/"
+
+  if parsed.scheme == "https":
+    conn: http.client.HTTPConnection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443)
+  else:
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80)
 
   try:
-    with urllib.request.urlopen(token_request) as resp:
-      response_json = json.loads(resp.read())
-      if response_json["token_type"] != "Bearer":
-        raise AuthenticationError(f"wrong token response token_type: '{response_json["token_type"]}'") # sanity check
+    conn.request("POST", path, body=body, headers=headers)
+    response = conn.getresponse()
+    response_body: bytes = response.read()
+    if response.status != 200:
+      raise AuthenticationError("failed to get refresh token: " + response_body.decode())
+    token_response = oauth_token_response_from_dict(json_loads_object(response_body.decode()))
+    return OAUTHAccessTokenResult(
+      expires_at=datetime.datetime.now() + datetime.timedelta(seconds=token_response.expires_in),
+      access_token=token_response.access_token,
+      refresh_token=token_response.refresh_token,
+    )
+  finally:
+    conn.close()
 
-      return OAUTHAccessTokenResult(
-        expires_at = datetime.datetime.now() + datetime.timedelta(seconds=response_json["expires_in"]),
-        access_token = response_json["access_token"],
-        refresh_token = response_json.get("refresh_token")
-      )
-
-  except urllib.request.HTTPError as e:
-    raise AuthenticationError("failed to get refresh token: " + e.read().decode())
-
-def oauth_fetch_access_token_with_refresh_token(auth: AuthenticationOAUTH2, refresh_token: str):
+def oauth_fetch_access_token_with_refresh_token(auth: AuthenticationOAUTH2, refresh_token: str) -> OAUTHAccessTokenResult:
   return _fetch_access_token(auth, { "grant_type": "refresh_token", "refresh_token": refresh_token })
 
-def oauth_fetch_access_token_with_authorization_code(auth: AuthenticationOAUTH2, authorization_code: str):
-  return _fetch_access_token(auth, { "grant_type": "authorization_code", "code": authorization_code })
+def oauth_fetch_access_token_with_authorization_code(auth: AuthenticationOAUTH2, authorization_code: str) -> OAUTHAccessTokenResult:
+  return _fetch_access_token(auth, { "grant_type": "authorization_code", "code": authorization_code, "redirect_uri": auth.redirect_url })
 
-def oauth_get_authorization_url(auth: AuthenticationOAUTH2):
+def oauth_get_authorization_url(auth: AuthenticationOAUTH2) -> str:
   data = { "client_id": auth.client_id, "scope": auth.scope, "redirect_uri": auth.redirect_url, "response_type": "code", "response_mode": "query" }
   return f"{auth.authorization_base_url}?{urllib.parse.urlencode(data)}"
 
-def authenticate_sasl(config: Config, sasl_b64: bytes):
-  data = base64.b64decode(sasl_b64).split(b"\0")
-  return authenticate(config, data[1], data[1])
-
-def authenticate(config: Config, username: bytes, password: bytes) -> Account | None:
-  print("try auth", username, password)
+def authenticate_sasl(config: Config, db: sqlite3.Connection, sasl_b64: bytes) -> Account | None:
   try:
-    return next(account for account in config.accounts if username in account.addresses)
-  except:
+    decoded = base64.b64decode(sasl_b64)
+  except Exception:
     return None
+  parts = decoded.split(b"\0", maxsplit=2)
+  if len(parts) != 3:
+    return None
+  _authzid, authcid, passwd = parts
+  return authenticate(config, db, authcid, passwd)
+
+def authenticate(config: Config, db: sqlite3.Connection, username: bytes, password: bytes) -> Account | None:
+  if not config.proxy_password:
+    return None
+  account = db_account_get_by_address(db, username.decode())
+  if account is None:
+    return None
+  if not hmac.compare_digest(password, config.proxy_password.encode()):
+    return None
+  return account
 
 def account_get_oauth_access_token(db: sqlite3.Connection, account: Account) -> str:
   assert isinstance(account.auth, AuthenticationOAUTH2)
-  cur = db.cursor()
-  cur.execute("SELECT access_token, refresh_token, expires_at FROM oauth2_data WHERE account_key=? LIMIT 1", (account.key,))
-  db_oauth_data_item = cur.fetchone()
-  if db_oauth_data_item is not None:
-    access_token, refresh_token, expires_at_str = db_oauth_data_item
-    assert isinstance(access_token, str) and isinstance(refresh_token, str) and isinstance(expires_at_str, str)
+  row = fetchone(db, "SELECT access_token, refresh_token, expires_at FROM oauth2_data WHERE account_key=?", (account.key,))
+  if row is None:
+    raise AuthenticationError(f"no oauth2 data for account '{account.key}'")
+
+  access_token = row_optional(row, "access_token", str)
+  refresh_token = row_field(row, "refresh_token", str)
+  expires_at_str = row_optional(row, "expires_at", str)
+  if access_token is not None and expires_at_str is not None:
     expires_at = datetime.datetime.fromisoformat(expires_at_str)
     if datetime.datetime.now() < expires_at:
       return access_token
-  else:
-    refresh_token = account.auth.initial_refresh_token
 
   new_auth_result = oauth_fetch_access_token_with_refresh_token(account.auth, refresh_token)
-  cur.execute("""
-  INSERT INTO oauth2_data (account_key, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?)
-  ON CONFLICT(account_key) DO UPDATE SET access_token=excluded.access_token, refresh_token=excluded.refresh_token, expires_at=excluded.expires_at;
-  """, (account.key, new_auth_result.access_token, new_auth_result.refresh_token or refresh_token, new_auth_result.expires_at.isoformat()))
+  _ = db.execute("""UPDATE oauth2_data SET access_token=?, refresh_token=?, expires_at=? WHERE account_key=?""",
+    (new_auth_result.access_token, new_auth_result.refresh_token or refresh_token, new_auth_result.expires_at.isoformat(), account.key))
   db.commit()
   return new_auth_result.access_token

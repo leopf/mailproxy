@@ -19,7 +19,6 @@ class AuthenticationOAUTH2:
   authorization_base_url: str
   token_url: str
   redirect_url: str
-  initial_refresh_token: str
 
 @dataclasses.dataclass(frozen=True)
 class AuthenticationPLAIN:
@@ -27,30 +26,29 @@ class AuthenticationPLAIN:
 
 @dataclasses.dataclass(frozen=True)
 class Account:
-  addresses: list[str]
-
+  addresses: tuple[str, ...]
   imap_host: str
   imap_port: int
   imap_tlsmode: TLSMode
   smtp_host: str
   smtp_port: int
   smtp_tlsmode: TLSMode
-
   auth: AuthenticationOAUTH2 | AuthenticationPLAIN
+  created_at: datetime.datetime | None = None
 
   @property
-  def key(self):
+  def key(self) -> str:
     return self.addresses[0]
 
 @dataclasses.dataclass(frozen=True)
 class Config:
-  accounts: list[Account]
   domain: str
   log_level: int
   host: str
   imap_port: int
   smtp_port: int
   db_path: pathlib.Path
+  proxy_password: str = ""
 
 @dataclasses.dataclass(frozen=True)
 class Mailbox:
@@ -59,11 +57,44 @@ class Mailbox:
   uid_next: int
   uid_validity: int
   name: str
-  hierachry_delimiter: str
+  hierarchy_delimiter: str
   flags_s: str
   is_virtual: bool
   is_remote: bool
+  last_synced_uid: int
 
   @property
-  def flags(self):
-    return tuple("\\" + flag for flag in self.flags_s.rstrip("\\").split("\\"))
+  def flags(self) -> tuple[str, ...]:
+    return tuple("\\" + flag for flag in self.flags_s.strip("\\").split("\\") if flag)
+
+@dataclasses.dataclass(frozen=True)
+class Message:
+  uid: int
+  mailbox_id: int
+  received_date: int
+  flags_s: str
+  size: int
+  data: bytes
+  remote_uid: str
+
+@dataclasses.dataclass(frozen=True)
+class OAuthProviderConfig:
+  imap_host: str
+  imap_port: int
+  imap_tlsmode: TLSMode
+  smtp_host: str
+  smtp_port: int
+  smtp_tlsmode: TLSMode
+  scope: str
+  client_id: str
+  client_secret: str | None
+  authorization_base_url: str
+  token_url: str
+  redirect_url: str
+
+@dataclasses.dataclass(frozen=True)
+class OAuthTokenResponse:
+  token_type: str
+  expires_in: int
+  access_token: str
+  refresh_token: str | None

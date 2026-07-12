@@ -1,0 +1,14 @@
+{
+  "imap_host": "imap.gmail.com",
+  "imap_port": 993,
+  "imap_tlsmode": "DIRECT",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_tlsmode": "STARTTLS",
+  "scope": "https://mail.google.com/",
+  "client_id": "406964657835-aq8lmia8j95dhl1a2bvharmfk3t1hgqj.apps.googleusercontent.com",
+  "client_secret": "kSmqreRr0qwBWJgbf5Y-PjSU",
+  "authorization_base_url": "https://accounts.google.com/o/oauth2/auth",
+  "token_url": "https://www.googleapis.com/oauth2/v3/token",
+  "redirect_url": "https://localhost:8081"
+}

@@ -1,4 +1,18 @@
-import re, asyncio, base64
+import re, asyncio, base64, json
+from typing import TypeGuard
+
+
+def json_loads_object(s: str) -> object:
+  result: object = json.loads(s)
+  return result
+
+def is_str_object_dict(d: object) -> TypeGuard[dict[str, object]]:
+  if not isinstance(d, dict):
+    return False
+  return all(isinstance(key, str) for key in d)
+
+def is_object_list(value: object) -> TypeGuard[list[object]]:
+  return isinstance(value, list)
 
 def match_line(pattern: str, line: str, flags: int = re.I) -> dict[str, str] | None:
   m = re.fullmatch(pattern, line, flags)
@@ -17,7 +31,7 @@ def encode_7bit_mailbox_name(s: str):
         s.replace('&', '&-')
     )
 
-def decode_7bit_mailbox_name(s):
+def decode_7bit_mailbox_name(s: str):
     return re.sub(
         r'&([^&-]+)-',
         lambda m: base64.b64decode(m.group(1).replace(',', '/') + '==='[:len(m.group(1)) % 4]).decode('utf-16be'),
@@ -29,11 +43,11 @@ class ReadValidationError(Exception):
 
 class ScopedStreamReader:
   def __init__(self, reader: asyncio.StreamReader, pre_read: int = 64) -> None:
-    self._reader = reader
-    self._pre_read = pre_read
-    self._buf = bytearray()
+    self._reader: asyncio.StreamReader = reader
+    self._pre_read: int = pre_read
+    self._buf: bytearray = bytearray()
     self._pos_scope: list[int] = [0]
-    self._at_eof = False
+    self._at_eof: bool = False
 
   @property
   def at_eof(self):
@@ -43,16 +57,13 @@ class ScopedStreamReader:
   def position(self):
     return self._pos_scope[-1]
 
-  async def peek_const(self):
-    pass
-
   async def read_crlf(self):
     await self.read_const(b"\r\n")
 
   async def read_line(self):
     return await self.readuntil(b"\r\n")
 
-  async def readuntil_re(self, until: bytes | tuple[bytes, ...], pattern: bytes, exclude_delimiter = False, flags = 0):
+  async def readuntil_re(self, until: bytes | tuple[bytes, ...], pattern: bytes, exclude_delimiter: bool = False, flags: int = 0):
     result = await self.readuntil(until, exclude_delimiter=exclude_delimiter)
     if (m:=re.fullmatch(pattern, result, flags)) is None:
       raise ReadValidationError(f"Failed to match pattern '{pattern}' against '{result}'.")

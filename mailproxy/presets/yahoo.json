@@ -1,0 +1,14 @@
+{
+  "imap_host": "imap.mail.yahoo.com",
+  "imap_port": 993,
+  "imap_tlsmode": "DIRECT",
+  "smtp_host": "smtp.mail.yahoo.com",
+  "smtp_port": 587,
+  "smtp_tlsmode": "STARTTLS",
+  "scope": "mail-w ycal-w sdct-w",
+  "client_id": "dj0yJmk9WVZUaWRNUUZSQTBNJmQ9WVdrOVNqbHJUMGhtTkU4bWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PTgz",
+  "client_secret": null,
+  "authorization_base_url": "https://api.login.yahoo.com/oauth2/request_auth",
+  "token_url": "https://api.login.yahoo.com/oauth2/get_token",
+  "redirect_url": "https://localhost:8081"
+}
