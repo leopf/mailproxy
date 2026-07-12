@@ -26,6 +26,8 @@ _FETCH_ITEM_EXPANSION = {
   b"FULL": (b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE", b"BODY[]"),
 }
 
+_REMOTE_SYSTEM_FLAGS = frozenset({"Seen", "Answered", "Flagged", "Deleted", "Draft", "Recent"})
+
 class IMAPServerConnection:
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._config: Config = config
@@ -310,17 +312,18 @@ class IMAPServerConnection:
     for i, msg in enumerate(messages):
       self._virtual_uid_map[i + 1] = (msg.mailbox_id, msg.uid)
 
-  async def _command_list(self):
+  async def _command_list(self, is_lsub: bool = False):
     reference_name_raw = await self._read_astring(b" ")
     pattern_raw = await self._read_astring(b"\r\n")
     remote = self._require_remote()
 
     reference_name = reference_name_raw.decode()
     pattern = pattern_raw.decode()
+    tag = b"LSUB" if is_lsub else b"LIST"
 
     if pattern == "":
-      self._write_line(b"* LIST (\\Noselect) \"/\" \"\"")
-      self._write_response(b"OK", b"list completed")
+      self._write_line(b"* %s (\\Noselect) \"/\" \"\"" % (tag,))
+      self._write_response(b"OK", b"%s completed" % (tag,))
       return
 
     await remote.sync_mailbox_list()
@@ -329,9 +332,12 @@ class IMAPServerConnection:
       for mailbox in db_mailbox_list(db, remote.account.key):
         full_name = reference_name + mailbox.name if reference_name else mailbox.name
         if list_match(full_name, pattern):
-          self._write_mailbox_list_response(mailbox)
+          flags = " ".join(mailbox.flags).encode("ascii")
+          hierarchy_delimiter_s = imap_to_quoted_string(mailbox.hierarchy_delimiter.encode("ascii"))
+          name_s = imap_to_quoted_string(mailbox.name.encode())
+          self._write_line(b"* %s (%s) %s %s" % (tag, flags, hierarchy_delimiter_s, name_s))
 
-    self._write_response(b"OK", b"list completed")
+    self._write_response(b"OK", b"%s completed" % (tag,))
 
   async def _command_examine(self):
     await self._command_select(read_only=True)
@@ -599,11 +605,15 @@ class IMAPServerConnection:
     mailbox = self._require_mailbox()
     remote = self._require_remote()
 
-    new_flags = set(f.decode("ascii") for f in flags_s_raw.strip().split(b" ") if f)
+    new_flags = set(f.decode("ascii").lstrip("\\") for f in flags_s_raw.strip().split(b" ") if f)
     silent = op_s.endswith(b".SILENT")
     if silent: op_s = op_s[:-len(b".SILENT")]
 
     op_mode = op_s[0:1] if op_s[:1] in (b"+", b"-") else b"="
+    remote_new_flags = {f for f in new_flags if f in _REMOTE_SYSTEM_FLAGS}
+    remote_flags_s = flags_set_to_s(remote_new_flags)
+
+    logging.debug("STORE: seq_set=%s op=%s flags=%s uid_mode=%s remote_flags=%s", seq_set_s.decode(), op_s.decode(), sorted(new_flags), uid_mode, remote_flags_s)
 
     if mailbox.is_virtual:
       messages = self._virtual_messages if self._virtual_messages is not None else []
@@ -620,14 +630,17 @@ class IMAPServerConnection:
         case _: result_flags = new_flags
       flags_s = flags_set_to_s(result_flags)
 
-      if mailbox.is_remote:
-        await remote.uid_store(msg.uid, op_s if not silent else op_s + b".SILENT", flags_s)
+      if mailbox.is_remote and remote_flags_s != "\\":
+        await remote.uid_store(msg.uid, op_s if not silent else op_s + b".SILENT", remote_flags_s)
+        logging.debug("STORE: remote uid_store ok uid=%d op=%s flags=%s", msg.uid, op_s, remote_flags_s)
 
       with db_open(self._config.db_path) as db:
         db_message_update_flags(db, msg.mailbox_id, msg.uid, flags_s)
 
       if not silent:
-        self._write_line(b"* %d FETCH (FLAGS (%s))" % (seq, b" ".join(b"\\" + f.encode("ascii") for f in sorted(result_flags)),))
+        flags_b = b" ".join(b"\\" + f.encode("ascii") for f in sorted(result_flags))
+        fetch_data = b"UID %d FLAGS (%s)" % (msg.uid, flags_b) if uid_mode else b"FLAGS (%s)" % (flags_b,)
+        self._write_line(b"* %d FETCH (%s)" % (seq, fetch_data))
 
     self._write_response(b"OK", b"STORE completed")
 
@@ -657,11 +670,14 @@ class IMAPServerConnection:
     _ = await self._reader.read_const(b"{")
     count_s = await self._reader.readuntil(b"}")
     _ = await self._reader.read_crlf()
+    self._write_line(b"+ Ready for literal data")
+    await self._writer.drain()
     data = await self._reader.readexactly(int(count_s))
     _ = await self._reader.read_crlf()
 
     remote = self._require_remote()
     account = remote.account
+    logging.debug("APPEND: mailbox=%s flags=%s size=%d", mailbox_name, flags_s, len(data))
     with db_open(self._config.db_path) as db:
       mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
     if mailbox is None or mailbox.is_remote:
@@ -679,7 +695,11 @@ class IMAPServerConnection:
   async def _command_create(self):
     mailbox_name = (await self._read_astring(b"\r\n")).decode()
     remote = self._require_remote()
-    await remote.create_mailbox(mailbox_name)
+    try:
+      await remote.create_mailbox(mailbox_name)
+    except IMAPCommandFailedError as e:
+      if "ALREADYEXISTS" not in str(e):
+        raise
     self._write_response(b"OK", b"CREATE completed")
 
   async def _command_delete(self):
@@ -795,7 +815,9 @@ class IMAPServerConnection:
       case b"SELECT": await self._command_select(read_only=False)
       case b"EXAMINE": await self._command_select(read_only=True)
       case b"CLOSE": await self._command_close()
+      case b"CHECK": self._write_response(b"OK", b"CHECK completed")
       case b"LIST": await self._command_list()
+      case b"LSUB": await self._command_list(is_lsub=True)
       case b"FETCH": await self._command_fetch(uid_mode=False)
       case b"SEARCH": await self._command_search(uid_mode=False)
       case b"STORE": await self._command_store(uid_mode=False)
@@ -816,7 +838,9 @@ class IMAPServerConnection:
           case b"EXPUNGE": await self._command_expunge(uid_mode=True)
           case _: self._write_response(b"BAD", b"unknown UID command")
       case b"STARTTLS": await self._command_starttls()
-      case _: self._write_response(b"BAD", b"unknown command")
+      case _:
+        _ = await self._reader.read_line()
+        self._write_response(b"BAD", b"unknown command")
 
   async def run(self):
     self._write_line(b"* OK %s IMAP4rev1 proxy ready" % (self._config.domain.encode("ascii"),))
