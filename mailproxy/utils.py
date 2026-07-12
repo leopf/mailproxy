@@ -34,7 +34,7 @@ def encode_7bit_mailbox_name(s: str):
 def decode_7bit_mailbox_name(s: str):
     return re.sub(
         r'&([^&-]+)-',
-        lambda m: base64.b64decode(m.group(1).replace(',', '/') + '==='[:len(m.group(1)) % 4]).decode('utf-16be'),
+        lambda m: base64.b64decode(m.group(1).replace(',', '/') + '=' * ((4 - len(m.group(1)) % 4) % 4)).decode('utf-16be'),
         s.replace('&-', '&')
     )
 

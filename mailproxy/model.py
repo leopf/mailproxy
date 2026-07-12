@@ -62,6 +62,7 @@ class Mailbox:
   is_virtual: bool
   is_remote: bool
   last_synced_uid: int
+  is_deleted: bool = False
 
   @property
   def flags(self) -> tuple[str, ...]:
@@ -76,6 +77,7 @@ class Message:
   size: int
   data: bytes
   remote_uid: str
+  is_deleted: bool = False
 
 @dataclasses.dataclass(frozen=True)
 class OAuthProviderConfig:

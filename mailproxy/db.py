@@ -83,6 +83,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages(mailbox_id);
 CREATE INDEX IF NOT EXISTS idx_messages_remote_uid ON messages(remote_uid);
 """
 
+def _migrate(db: sqlite3.Connection):
+  msg_cols = [r[1] for r in db.execute("PRAGMA table_info(messages)").fetchall()]
+  if "is_deleted" not in msg_cols:
+    _ = db.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+  mb_cols = [r[1] for r in db.execute("PRAGMA table_info(mailboxes)").fetchall()]
+  if "is_deleted" not in mb_cols:
+    _ = db.execute("ALTER TABLE mailboxes ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+
 def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
   conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
   conn.row_factory = sqlite3.Row
@@ -90,6 +98,7 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
 
   with conn:
     _ = conn.executescript(_DB_INIT_SCRIPT)
+    _migrate(conn)
 
   return conn
 
@@ -219,18 +228,19 @@ def _mailbox_from_row(row: sqlite3.Row) -> Mailbox:
     is_virtual=bool(row_field(row, "is_virtual", int)),
     is_remote=bool(row_field(row, "is_remote", int)),
     last_synced_uid=row_field(row, "last_synced_uid", int),
+    is_deleted=bool(row_field(row, "is_deleted", int)),
   )
 
 def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: str) -> Mailbox | None:
-  result = fetchone(db, "SELECT * FROM mailboxes WHERE account_key=? AND name=?", (account_key, name))
+  result = fetchone(db, "SELECT * FROM mailboxes WHERE account_key=? AND name=? AND is_deleted=0", (account_key, name))
   return None if result is None else _mailbox_from_row(result)
 
 def db_mailbox_list(db: sqlite3.Connection, account_key: str):
-  for item in iter_rows(db, "SELECT * FROM mailboxes WHERE account_key=? ORDER BY name", (account_key,)):
+  for item in iter_rows(db, "SELECT * FROM mailboxes WHERE account_key=? AND is_deleted=0 ORDER BY name", (account_key,)):
     yield _mailbox_from_row(item)
 
 def db_mailbox_count_messages(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=?", (mailbox_id,)), "COUNT(*)", int)
+  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COUNT(*)", int)
 
 def db_mailbox_uid_next(db: sqlite3.Connection, account_key: str, mailbox_id: int) -> int:
   return row_field(fetchone_required(db, "SELECT uid_next FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)), "uid_next", int)
@@ -239,20 +249,25 @@ def db_mailbox_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id
   return row_field(fetchone_required(db, "SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)), "uid_validity", int)
 
 def db_mailbox_count_unseen(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags_s LIKE '%\\Unseen\\%'", (mailbox_id,)), "COUNT(*)", int)
+  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s LIKE '%\\Unseen\\%'", (mailbox_id,)), "COUNT(*)", int)
 
 def db_mailbox_count_deleted(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND flags_s LIKE '%\\Deleted\\%'", (mailbox_id,)), "COUNT(*)", int)
+  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s LIKE '%\\Deleted\\%'", (mailbox_id,)), "COUNT(*)", int)
 
 def db_mailbox_size(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COALESCE(SUM(length(data)), 0) FROM messages WHERE mailbox_id=?", (mailbox_id,)), "COALESCE(SUM(length(data)), 0)", int)
+  return row_field(fetchone_required(db, "SELECT COALESCE(SUM(length(data)), 0) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COALESCE(SUM(length(data)), 0)", int)
 
 def db_mailbox_add(db: sqlite3.Connection, account_key: str, name: str, uid_validity: int, uid_next: int = 1, \
     flags_s: str = "\\\\", hierarchy_delimiter: str = "/", is_remote: bool = True, is_virtual: bool = False) -> int:
   cur = db.execute("INSERT INTO mailboxes (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, is_virtual, is_remote, last_synced_uid) " +
-    "VALUES (?,?,?,?,?,?,?,?,0)", (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, 1 if is_virtual else 0, 1 if is_remote else 0))
-  assert cur.lastrowid is not None
-  return cur.lastrowid
+    "VALUES (?,?,?,?,?,?,?,?,0) " +
+    "ON CONFLICT(account_key, name) DO UPDATE SET is_deleted=0, uid_validity=excluded.uid_validity, uid_next=excluded.uid_next, " +
+    "flags_s=excluded.flags_s, hierarchy_delimiter=excluded.hierarchy_delimiter, is_virtual=excluded.is_virtual, is_remote=excluded.is_remote " +
+    "RETURNING id", (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, 1 if is_virtual else 0, 1 if is_remote else 0))
+  row = cur.fetchone()
+  assert row is not None
+  _ = db.execute("UPDATE messages SET is_deleted=0 WHERE mailbox_id=?", (row["id"],))
+  return row["id"]
 
 def db_mailbox_update_sync(db: sqlite3.Connection, mailbox_id: int, *, uid_next: int | None = None, \
     uid_validity: int | None = None, last_synced_uid: int | None = None, flags_s: str | None = None):
@@ -267,10 +282,11 @@ def db_mailbox_update_sync(db: sqlite3.Connection, mailbox_id: int, *, uid_next:
     _ = db.execute("UPDATE mailboxes SET %s WHERE id=?" % (", ".join(sets),), params)
 
 def db_messages_clear(db: sqlite3.Connection, mailbox_id: int):
-  _ = db.execute("DELETE FROM messages WHERE mailbox_id=?", (mailbox_id,))
+  _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
 
 def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, size: int, data: bytes, remote_uid: str):
-  _ = db.execute("INSERT OR IGNORE INTO messages (uid, mailbox_id, received_date, flags_s, size, data, remote_uid) VALUES (?,?,?,?,?,?,?)",
+  _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, data, remote_uid) VALUES (?,?,?,?,?,?,?) " +
+    "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, data=excluded.data, remote_uid=excluded.remote_uid, is_deleted=0",
     (uid, mailbox_id, received_date, flags_s, size, data, remote_uid))
 
 def _message_from_row(row: sqlite3.Row) -> Message:
@@ -282,14 +298,15 @@ def _message_from_row(row: sqlite3.Row) -> Message:
     size=row_field(row, "size", int),
     data=row_field(row, "data", bytes),
     remote_uid=row_field(row, "remote_uid", str),
+    is_deleted=bool(row_field(row, "is_deleted", int)),
   )
 
 def db_message_list(db: sqlite3.Connection, mailbox_id: int):
-  for row in iter_rows(db, "SELECT * FROM messages WHERE mailbox_id=? ORDER BY uid", (mailbox_id,)):
+  for row in iter_rows(db, "SELECT * FROM messages WHERE mailbox_id=? AND is_deleted=0 ORDER BY uid", (mailbox_id,)):
     yield _message_from_row(row)
 
 def db_message_get_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int) -> Message | None:
-  result = fetchone(db, "SELECT * FROM messages WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
+  result = fetchone(db, "SELECT * FROM messages WHERE mailbox_id=? AND uid=? AND is_deleted=0", (mailbox_id, uid))
   return None if result is None else _message_from_row(result)
 
 def db_mailbox_max_uid(db: sqlite3.Connection, mailbox_id: int) -> int:
@@ -298,28 +315,28 @@ def db_mailbox_max_uid(db: sqlite3.Connection, mailbox_id: int) -> int:
   return value if value is not None else 0
 
 def db_message_update_flags(db: sqlite3.Connection, mailbox_id: int, uid: int, flags_s: str):
-  _ = db.execute("UPDATE messages SET flags_s=? WHERE mailbox_id=? AND uid=?", (flags_s, mailbox_id, uid))
+  _ = db.execute("UPDATE messages SET flags_s=? WHERE mailbox_id=? AND uid=? AND is_deleted=0", (flags_s, mailbox_id, uid))
 
 def db_message_delete_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int):
-  _ = db.execute("DELETE FROM messages WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
+  _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
 
 def db_mailbox_delete(db: sqlite3.Connection, mailbox_id: int):
   with db:
-    _ = db.execute("DELETE FROM messages WHERE mailbox_id=?", (mailbox_id,))
-    _ = db.execute("DELETE FROM mailboxes WHERE id=?", (mailbox_id,))
+    _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
+    _ = db.execute("UPDATE mailboxes SET is_deleted=1 WHERE id=?", (mailbox_id,))
 
 def db_mailbox_rename(db: sqlite3.Connection, mailbox_id: int, new_name: str):
   _ = db.execute("UPDATE mailboxes SET name=? WHERE id=?", (new_name, mailbox_id))
 
 def db_mailbox_get_by_id(db: sqlite3.Connection, mailbox_id: int) -> Mailbox | None:
-  result = fetchone(db, "SELECT * FROM mailboxes WHERE id=?", (mailbox_id,))
+  result = fetchone(db, "SELECT * FROM mailboxes WHERE id=? AND is_deleted=0", (mailbox_id,))
   return None if result is None else _mailbox_from_row(result)
 
 def db_message_count(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=?", (mailbox_id,)), "COUNT(*)", int)
+  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COUNT(*)", int)
 
 def db_messages_for_account(db: sqlite3.Connection, account_key: str, flags_filter: str | None = None) -> list[Message]:
-  query = "SELECT messages.* FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND mailboxes.is_virtual=0"
+  query = "SELECT messages.* FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND mailboxes.is_virtual=0 AND messages.is_deleted=0"
   params: list[object] = [account_key]
   if flags_filter is not None:
     query += " AND messages.flags_s LIKE ?"

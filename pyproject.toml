@@ -14,6 +14,9 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["ruff"]
 
+[project.scripts]
+mailproxy = "mailproxy.bin:main"
+
 [project.urls]
 Repository = "https://github.com/leopf/mailproxy"
 

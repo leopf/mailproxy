@@ -232,7 +232,7 @@ def exec_login(provider: OAuthProviderConfig):
   else:
     print("refresh token: (none returned, server may not grant offline_access)")
 
-if __name__ == "__main__":
+def main():
   parser = argparse.ArgumentParser()
   subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -300,3 +300,6 @@ if __name__ == "__main__":
     asyncio.run(exec_dev(config, _ns_get(args, "address", str), _ns_get(args, "token", str)))
   else:
     raise RuntimeError("unknown command!")
+
+if __name__ == "__main__":
+  main()
