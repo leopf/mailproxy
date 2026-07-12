@@ -1,6 +1,6 @@
 import logging, pathlib, re
 from typing import TypeVar
-from mailproxy.model import Config, OAuthProviderConfig, OAuthTokenResponse, TLSMode
+from mailproxy.model import Config, OAuthProviderConfig, OAuthTokenResponse, ProviderConfig, TLSMode
 from mailproxy.utils import is_str_object_dict
 
 T = TypeVar("T")
@@ -74,6 +74,22 @@ def oauth_provider_config_from_dict(d: object) -> OAuthProviderConfig:
     authorization_base_url=_field(d, "authorization_base_url", str),
     token_url=_field(d, "token_url", str),
     redirect_url=_field(d, "redirect_url", str),
+  )
+
+def provider_config_from_dict(d: object) -> ProviderConfig:
+  return ProviderConfig(
+    imap_host=_field(d, "imap_host", str),
+    imap_port=_validate_port("imap_port", _field(d, "imap_port", int)),
+    imap_tlsmode=TLSMode(_field(d, "imap_tlsmode", str).upper()),
+    smtp_host=_field(d, "smtp_host", str),
+    smtp_port=_validate_port("smtp_port", _field(d, "smtp_port", int)),
+    smtp_tlsmode=TLSMode(_field(d, "smtp_tlsmode", str).upper()),
+    scope=_optional_field(d, "scope", str),
+    client_id=_optional_field(d, "client_id", str),
+    client_secret=_optional_field(d, "client_secret", str),
+    authorization_base_url=_optional_field(d, "authorization_base_url", str),
+    token_url=_optional_field(d, "token_url", str),
+    redirect_url=_optional_field(d, "redirect_url", str),
   )
 
 def oauth_token_response_from_dict(d: object) -> OAuthTokenResponse:

@@ -95,6 +95,25 @@ class OAuthProviderConfig:
   redirect_url: str
 
 @dataclasses.dataclass(frozen=True)
+class ProviderConfig:
+  imap_host: str
+  imap_port: int
+  imap_tlsmode: TLSMode
+  smtp_host: str
+  smtp_port: int
+  smtp_tlsmode: TLSMode
+  scope: str | None = None
+  client_id: str | None = None
+  client_secret: str | None = None
+  authorization_base_url: str | None = None
+  token_url: str | None = None
+  redirect_url: str | None = None
+
+  @property
+  def is_oauth2(self) -> bool:
+    return self.scope is not None and self.client_id is not None
+
+@dataclasses.dataclass(frozen=True)
 class OAuthTokenResponse:
   token_type: str
   expires_in: int

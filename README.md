@@ -108,7 +108,29 @@ mailproxy dev -C config.json -A you@...                 # Debug a remote connect
 mailproxy account add -C config.json -A you@gmail.com --preset gmail --refresh-token "1//0g..."
 ```
 
-**Plain password (any IMAP/SMTP provider):**
+**Plain password with a preset:**
+
+Create a preset file (e.g. `myprovider.json`) with just the connection
+details — no OAuth2 fields needed:
+
+```json
+{
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "imap_tlsmode": "DIRECT",
+  "smtp_host": "smtp.example.com",
+  "smtp_port": 587,
+  "smtp_tlsmode": "STARTTLS"
+}
+```
+
+Then add the account:
+
+```
+mailproxy account add -C config.json -A you@example.com --provider-config myprovider.json --password yourpassword
+```
+
+**Plain password with inline args:**
 
 ```
 mailproxy account add -C config.json -A you@example.com \

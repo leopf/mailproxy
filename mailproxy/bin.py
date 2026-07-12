@@ -1,12 +1,12 @@
 import functools, asyncio, logging, argparse, pathlib, os, dataclasses, webbrowser, urllib.parse, http.server, ssl, importlib.resources
 from typing import TypeVar
-from mailproxy.config import config_from_dict, oauth_provider_config_from_dict
+from mailproxy.config import config_from_dict, provider_config_from_dict
 from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_open
 from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_frontend import handle_imap
 from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
 from mailproxy.smtp_frontend import smtp_server_handle_client
-from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, OAuthProviderConfig, TLSMode
+from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, OAuthProviderConfig, ProviderConfig, TLSMode
 from mailproxy.utils import json_loads_object, is_object_list
 
 T = TypeVar("T")
@@ -21,36 +21,27 @@ def _load_config(config_path: pathlib.Path) -> Config:
   logging.basicConfig(level=config.log_level)
   return config
 
-def _load_oauth_config(preset: str | None, oauth_config: pathlib.Path | None) -> OAuthProviderConfig:
+def _load_provider_config(preset: str | None, provider_config_path: pathlib.Path | None) -> ProviderConfig:
   if preset is not None:
     with importlib.resources.path("mailproxy.presets", f"{preset}.json") as p:
       raw: object = json_loads_object(pathlib.Path(p).read_text())
-  elif oauth_config is not None:
-    raw = json_loads_object(oauth_config.read_text())
+  elif provider_config_path is not None:
+    raw = json_loads_object(provider_config_path.read_text())
   else:
-    raise ValueError("either --preset or --oauth-config must be specified")
-  return oauth_provider_config_from_dict(raw)
+    raise ValueError("either --preset or --provider-config must be specified")
+  return provider_config_from_dict(raw)
 
-def _account_from_oauth_config(addresses: tuple[str, ...], provider: OAuthProviderConfig, refresh_token: str) -> tuple[Account, str]:
-  auth = AuthenticationOAUTH2(
-    scope=provider.scope,
-    client_id=provider.client_id,
-    client_secret=provider.client_secret,
-    authorization_base_url=provider.authorization_base_url,
-    token_url=provider.token_url,
-    redirect_url=provider.redirect_url,
+def _load_oauth_config(preset: str | None, provider_config_path: pathlib.Path | None) -> OAuthProviderConfig:
+  provider = _load_provider_config(preset, provider_config_path)
+  if not provider.is_oauth2:
+    raise ValueError("provider config is missing OAuth2 fields (scope, client_id, ...)")
+  assert provider.scope is not None and provider.client_id is not None and provider.authorization_base_url is not None and provider.token_url is not None and provider.redirect_url is not None
+  return OAuthProviderConfig(
+    imap_host=provider.imap_host, imap_port=provider.imap_port, imap_tlsmode=provider.imap_tlsmode,
+    smtp_host=provider.smtp_host, smtp_port=provider.smtp_port, smtp_tlsmode=provider.smtp_tlsmode,
+    scope=provider.scope, client_id=provider.client_id, client_secret=provider.client_secret,
+    authorization_base_url=provider.authorization_base_url, token_url=provider.token_url, redirect_url=provider.redirect_url,
   )
-  account = Account(
-    addresses=addresses,
-    imap_host=provider.imap_host,
-    imap_port=provider.imap_port,
-    imap_tlsmode=provider.imap_tlsmode,
-    smtp_host=provider.smtp_host,
-    smtp_port=provider.smtp_port,
-    smtp_tlsmode=provider.smtp_tlsmode,
-    auth=auth,
-  )
-  return account, refresh_token
 
 def _add_imap_args(p: argparse.ArgumentParser) -> None:
   _ = p.add_argument("--imap-host")
@@ -62,9 +53,9 @@ def _add_smtp_args(p: argparse.ArgumentParser) -> None:
   _ = p.add_argument("--smtp-port", type=int)
   _ = p.add_argument("--smtp-tlsmode", type=str.upper, choices=[m.value for m in TLSMode])
 
-def _add_oauth_config_args(p: argparse.ArgumentParser) -> None:
-  _ = p.add_argument("--preset", help="preset name (gmail, microsoft, yahoo)")
-  _ = p.add_argument("--oauth-config", type=pathlib.Path, help="path to oauth config json")
+def _add_provider_config_args(p: argparse.ArgumentParser) -> None:
+  _ = p.add_argument("--preset", help="preset name (gmail, microsoft, yahoo, fastmail)")
+  _ = p.add_argument("--provider-config", type=pathlib.Path, help="path to provider config json")
 
 def _ns_get(args: argparse.Namespace, name: str, expected: type[T]) -> T:
   value: object = getattr(args, name)
@@ -112,31 +103,43 @@ async def exec_dev(config: Config, address: str, _token: str):
     raise RuntimeError(f"no account for address '{address}'")
   _ = await IMAPRemoteConnection.open(config, account)
 
-def exec_account_add(config: Config, addresses: list[str], preset: str | None, oauth_config_path: pathlib.Path | None,
+def exec_account_add(config: Config, addresses: list[str], preset: str | None, provider_config_path: pathlib.Path | None,
     refresh_token: str | None, imap_host: str | None, imap_port: int | None, imap_tlsmode: str | None,
     smtp_host: str | None, smtp_port: int | None, smtp_tlsmode: str | None, password: str | None):
-  if refresh_token is not None:
-    provider = _load_oauth_config(preset, oauth_config_path)
-    account, initial_refresh_token = _account_from_oauth_config(tuple(addresses), provider, refresh_token)
-    with db_open(config.db_path) as db:
-      db_account_add(db, account, initial_refresh_token)
-  elif password is not None and imap_host is not None and imap_port is not None and imap_tlsmode is not None \
-       and smtp_host is not None and smtp_port is not None and smtp_tlsmode is not None:
-    auth: AuthenticationOAUTH2 | AuthenticationPLAIN = AuthenticationPLAIN(password=password)
-    account = Account(
-      addresses=tuple(addresses),
-      imap_host=imap_host,
-      imap_port=imap_port,
-      imap_tlsmode=_tlsmode(imap_tlsmode),
-      smtp_host=smtp_host,
-      smtp_port=smtp_port,
-      smtp_tlsmode=_tlsmode(smtp_tlsmode),
-      auth=auth,
-    )
-    with db_open(config.db_path) as db:
-      db_account_add(db, account)
+  provider = _load_provider_config(preset, provider_config_path) if preset is not None or provider_config_path is not None else None
+
+  # Resolve IMAP/SMTP connection params from provider or CLI args
+  if provider is not None:
+    im_host, im_port, im_tls = provider.imap_host, provider.imap_port, provider.imap_tlsmode
+    sm_host, sm_port, sm_tls = provider.smtp_host, provider.smtp_port, provider.smtp_tlsmode
+  elif imap_host is None or imap_port is None or imap_tlsmode is None or smtp_host is None or smtp_port is None or smtp_tlsmode is None:
+    raise ValueError("provide --preset/--provider-config or all --imap-*/--smtp-* args")
   else:
-    raise ValueError("either --refresh-token (with --preset/--oauth-config) or --password (with --imap-*/--smtp-* args) must be specified")
+    im_host, im_port, im_tls = imap_host, imap_port, _tlsmode(imap_tlsmode)
+    sm_host, sm_port, sm_tls = smtp_host, smtp_port, _tlsmode(smtp_tlsmode)
+
+  # Build auth
+  if refresh_token is not None:
+    if provider is None or not provider.is_oauth2:
+      raise ValueError("--refresh-token requires an OAuth2 provider config (--preset or --provider-config)")
+    assert provider.scope is not None and provider.client_id is not None and provider.authorization_base_url is not None and provider.token_url is not None and provider.redirect_url is not None
+    auth: AuthenticationOAUTH2 | AuthenticationPLAIN = AuthenticationOAUTH2(
+      scope=provider.scope, client_id=provider.client_id, client_secret=provider.client_secret,
+      authorization_base_url=provider.authorization_base_url, token_url=provider.token_url, redirect_url=provider.redirect_url,
+    )
+  elif password is not None:
+    auth = AuthenticationPLAIN(password=password)
+  else:
+    raise ValueError("either --refresh-token (with OAuth2 provider) or --password must be specified")
+
+  account = Account(
+    addresses=tuple(addresses),
+    imap_host=im_host, imap_port=im_port, imap_tlsmode=im_tls,
+    smtp_host=sm_host, smtp_port=sm_port, smtp_tlsmode=sm_tls,
+    auth=auth,
+  )
+  with db_open(config.db_path) as db:
+    db_account_add(db, account, refresh_token)
 
   print(f"added account '{account.key}' ({', '.join(account.addresses)})")
 
@@ -244,7 +247,7 @@ def main():
   account_add_parser = account_sub.add_parser("add")
   _ = account_add_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
   _ = account_add_parser.add_argument("--address", "-A", help="email address (repeatable, first is primary)", action="append", required=True)
-  _add_oauth_config_args(account_add_parser)
+  _add_provider_config_args(account_add_parser)
   _ = account_add_parser.add_argument("--refresh-token", help="oauth2 refresh token (for OAUTH2 auth)")
   _add_imap_args(account_add_parser)
   _add_smtp_args(account_add_parser)
@@ -257,7 +260,7 @@ def main():
   _ = account_remove_parser.add_argument("--address", "-A", help="email address", required=True)
 
   login_parser = subparsers.add_parser("login")
-  _add_oauth_config_args(login_parser)
+  _add_provider_config_args(login_parser)
 
   get_access_token_parser = subparsers.add_parser("get-access-token")
   _ = get_access_token_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
@@ -279,7 +282,7 @@ def main():
     account_command = _ns_get(args, "account_command", str)
     if account_command == "add":
       exec_account_add(config, _ns_str_list(args, "address"),
-        _ns_optional(args, "preset", str), _ns_optional(args, "oauth_config", pathlib.Path),
+        _ns_optional(args, "preset", str), _ns_optional(args, "provider_config", pathlib.Path),
         _ns_optional(args, "refresh_token", str),
         _ns_optional(args, "imap_host", str), _ns_optional(args, "imap_port", int), _ns_optional(args, "imap_tlsmode", str),
         _ns_optional(args, "smtp_host", str), _ns_optional(args, "smtp_port", int), _ns_optional(args, "smtp_tlsmode", str),
