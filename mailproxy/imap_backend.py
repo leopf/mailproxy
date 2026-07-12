@@ -1,7 +1,7 @@
 import asyncio, base64, datetime, logging, re, ssl
 from dataclasses import dataclass
 from mailproxy.auth import account_get_oauth_access_token
-from mailproxy.db import db_message_add, db_message_update_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
+from mailproxy.db import db_message_add, db_message_delete_except, db_message_update_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
 from mailproxy.imap_parsing import IMAPCommandFailedError, flags_to_s, imap_to_quoted_string, parse_fetch_line, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
 from mailproxy.utils import match_lineb, encode_7bit_mailbox_name
@@ -88,20 +88,26 @@ class IMAPRemoteConnection:
     if last_synced > 0:
       self._start_command(b"UID FETCH 1:%d (UID FLAGS)" % (last_synced,))
       flag_updates: list[tuple[int, str]] = []
+      seen_uids: set[int] = set()
       async for line in self._read_response_lines():
         parsed = parse_fetch_line(line)
         if parsed is None: continue
         uid = parsed.get(b"UID")
         if uid is None: continue
+        seen_uids.add(int(uid))
         flags = parsed.get(b"FLAGS", b"")
         msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
         flag_updates.append((int(uid), msg_flags_s))
 
-      if flag_updates:
-        with db_open(self.config.db_path) as db:
+      with db_open(self.config.db_path) as db:
+        if flag_updates:
           for uid, flags_s in flag_updates:
             db_message_update_flags(db, mailbox_id, uid, flags_s)
-        logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, len(flag_updates))
+          logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, len(flag_updates))
+        db_message_delete_except(db, mailbox_id, seen_uids)
+        deleted_count = last_synced - len(seen_uids)
+        if deleted_count > 0:
+          logging.debug("sync_mailbox: '%s' soft-deleted %d messages (removed on remote)", mailbox_name, deleted_count)
 
   async def sync_mailbox_list(self):
     logging.debug("sync_mailbox_list: listing remote mailboxes")

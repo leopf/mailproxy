@@ -320,6 +320,14 @@ def db_message_update_flags(db: sqlite3.Connection, mailbox_id: int, uid: int, f
 def db_message_delete_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int):
   _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
 
+def db_message_delete_except(db: sqlite3.Connection, mailbox_id: int, uids: set[int]):
+  if not uids:
+    _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,))
+    return
+  placeholders = ",".join("?" for _ in uids)
+  params = [mailbox_id] + list(uids)
+  _ = db.execute(f"UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid NOT IN ({placeholders})", params)
+
 def db_mailbox_delete(db: sqlite3.Connection, mailbox_id: int):
   with db:
     _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
