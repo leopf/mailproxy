@@ -1,4 +1,4 @@
-import sqlite3, pathlib, datetime, json
+import sqlite3, pathlib, datetime, json, typing
 from collections.abc import Iterator
 from typing import TypeVar
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Mailbox, Message, TLSMode
@@ -7,13 +7,13 @@ from mailproxy.utils import json_loads_object, is_object_list
 T = TypeVar("T")
 
 def row_field(row: sqlite3.Row, name: str, expected: type[T]) -> T:
-  value: object = row[name]
+  value: object = typing.cast(object, row[name])
   if not isinstance(value, expected):
     raise ValueError(f"field '{name}' must be {expected.__name__}, got {type(value).__name__}")
   return value
 
 def row_optional(row: sqlite3.Row, name: str, expected: type[T]) -> T | None:
-  value: object = row[name]
+  value: object = typing.cast(object, row[name])
   if value is None:
     return None
   if not isinstance(value, expected):
@@ -84,10 +84,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_remote_uid ON messages(remote_uid);
 """
 
 def _migrate(db: sqlite3.Connection):
-  msg_cols = [r[1] for r in db.execute("PRAGMA table_info(messages)").fetchall()]
+  msg_cols = [typing.cast(str, r[1]) for r in typing.cast(list[sqlite3.Row], db.execute("PRAGMA table_info(messages)").fetchall())]
   if "is_deleted" not in msg_cols:
     _ = db.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
-  mb_cols = [r[1] for r in db.execute("PRAGMA table_info(mailboxes)").fetchall()]
+  mb_cols = [typing.cast(str, r[1]) for r in typing.cast(list[sqlite3.Row], db.execute("PRAGMA table_info(mailboxes)").fetchall())]
   if "is_deleted" not in mb_cols:
     _ = db.execute("ALTER TABLE mailboxes ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
 
@@ -104,7 +104,7 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
 
 def fetchone(db: sqlite3.Connection, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row | None:
   cursor: sqlite3.Cursor = db.execute(query, params)
-  result: sqlite3.Row | None = cursor.fetchone()
+  result: sqlite3.Row | None = typing.cast(sqlite3.Row | None, cursor.fetchone())
   return result
 
 def fetchone_required(db: sqlite3.Connection, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row:
@@ -116,7 +116,7 @@ def fetchone_required(db: sqlite3.Connection, query: str, params: tuple[object, 
 def iter_rows(db: sqlite3.Connection, query: str, params: tuple[object, ...] = ()) -> Iterator[sqlite3.Row]:
   cursor: sqlite3.Cursor = db.execute(query, params)
   while True:
-    row: sqlite3.Row | None = cursor.fetchone()
+    row: sqlite3.Row | None = typing.cast(sqlite3.Row | None, cursor.fetchone())
     if row is None:
       break
     yield row
@@ -249,7 +249,7 @@ def db_mailbox_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id
   return row_field(fetchone_required(db, "SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)), "uid_validity", int)
 
 def db_mailbox_count_unseen(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s LIKE '%\\Unseen\\%'", (mailbox_id,)), "COUNT(*)", int)
+  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s NOT LIKE '%\\Seen\\%'", (mailbox_id,)), "COUNT(*)", int)
 
 def db_mailbox_count_deleted(db: sqlite3.Connection, mailbox_id: int) -> int:
   return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s LIKE '%\\Deleted\\%'", (mailbox_id,)), "COUNT(*)", int)
@@ -264,10 +264,11 @@ def db_mailbox_add(db: sqlite3.Connection, account_key: str, name: str, uid_vali
     "ON CONFLICT(account_key, name) DO UPDATE SET is_deleted=0, uid_validity=excluded.uid_validity, uid_next=excluded.uid_next, " +
     "flags_s=excluded.flags_s, hierarchy_delimiter=excluded.hierarchy_delimiter, is_virtual=excluded.is_virtual, is_remote=excluded.is_remote " +
     "RETURNING id", (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, 1 if is_virtual else 0, 1 if is_remote else 0))
-  row = cur.fetchone()
+  row = typing.cast(sqlite3.Row | None, cur.fetchone())
   assert row is not None
-  _ = db.execute("UPDATE messages SET is_deleted=0 WHERE mailbox_id=?", (row["id"],))
-  return row["id"]
+  row_id = row_field(row, "id", int)
+  _ = db.execute("UPDATE messages SET is_deleted=0 WHERE mailbox_id=?", (row_id,))
+  return row_id
 
 def db_mailbox_update_sync(db: sqlite3.Connection, mailbox_id: int, *, uid_next: int | None = None, \
     uid_validity: int | None = None, last_synced_uid: int | None = None, flags_s: str | None = None):
@@ -344,11 +345,14 @@ def db_mailbox_get_by_id(db: sqlite3.Connection, mailbox_id: int) -> Mailbox | N
 def db_message_count(db: sqlite3.Connection, mailbox_id: int) -> int:
   return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COUNT(*)", int)
 
-def db_messages_for_account(db: sqlite3.Connection, account_key: str, flags_filter: str | None = None) -> list[Message]:
+def db_messages_for_account(db: sqlite3.Connection, account_key: str, flags_filter: str | None = None, flags_exclude: str | None = None) -> list[Message]:
   query = "SELECT messages.* FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND mailboxes.is_virtual=0 AND messages.is_deleted=0"
   params: list[object] = [account_key]
   if flags_filter is not None:
     query += " AND messages.flags_s LIKE ?"
     params.append(f"%{flags_filter}%")
+  if flags_exclude is not None:
+    query += " AND messages.flags_s NOT LIKE ?"
+    params.append(f"%{flags_exclude}%")
   query += " ORDER BY messages.received_date DESC"
   return [_message_from_row(row) for row in iter_rows(db, query, tuple(params))]

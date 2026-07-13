@@ -1,4 +1,4 @@
-import functools, asyncio, logging, argparse, pathlib, os, dataclasses, webbrowser, urllib.parse, http.server, ssl, importlib.resources
+import functools, asyncio, logging, argparse, pathlib, os, dataclasses, webbrowser, urllib.parse, http.server, ssl, importlib.resources, typing
 from typing import TypeVar
 from mailproxy.config import config_from_dict, provider_config_from_dict
 from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_open
@@ -58,13 +58,13 @@ def _add_provider_config_args(p: argparse.ArgumentParser) -> None:
   _ = p.add_argument("--provider-config", type=pathlib.Path, help="path to provider config json")
 
 def _ns_get(args: argparse.Namespace, name: str, expected: type[T]) -> T:
-  value: object = getattr(args, name)
+  value: object = typing.cast(object, getattr(args, name))
   if not isinstance(value, expected):
     raise TypeError(f"expected {expected.__name__} for --{name}")
   return value
 
 def _ns_optional(args: argparse.Namespace, name: str, expected: type[T]) -> T | None:
-  value: object = getattr(args, name)
+  value: object = typing.cast(object, getattr(args, name))
   if value is None:
     return None
   if not isinstance(value, expected):
@@ -72,7 +72,7 @@ def _ns_optional(args: argparse.Namespace, name: str, expected: type[T]) -> T | 
   return value
 
 def _ns_str_list(args: argparse.Namespace, name: str) -> list[str]:
-  value: object = getattr(args, name)
+  value: object = typing.cast(object, getattr(args, name))
   if not is_object_list(value):
     raise TypeError(f"expected list for --{name}")
   result: list[str] = []

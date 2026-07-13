@@ -1,10 +1,11 @@
-import pathlib, tempfile, unittest
+import pathlib, sqlite3, tempfile, unittest
+from typing import override
 from mailproxy.db import db_open, db_account_add, db_mailbox_add, db_message_add, db_message_delete_by_uid, \
     db_message_delete_except, \
     db_message_list, db_message_get_by_uid, db_message_update_flags, db_message_count, db_messages_clear, \
     db_messages_for_account, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_count_deleted, \
     db_mailbox_size, db_mailbox_max_uid, db_mailbox_delete, db_mailbox_list, db_mailbox_by_name, \
-    db_mailbox_get_by_id, db_mailbox_rename
+    db_mailbox_get_by_id, db_mailbox_rename, fetchone, iter_rows, row_field
 from mailproxy.model import Account, AuthenticationPLAIN, TLSMode
 
 
@@ -22,14 +23,16 @@ def _make_account() -> Account:
 
 
 class TestMessageSoftDelete(unittest.TestCase):
+  @override
   def setUp(self):
-    self._tmpdir = tempfile.TemporaryDirectory()
-    self.db_path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
-    self.db = db_open(self.db_path)
-    self.account = _make_account()
+    self._tmpdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory()
+    self.db_path: pathlib.Path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
+    self.db: sqlite3.Connection = db_open(self.db_path)
+    self.account: Account = _make_account()
     db_account_add(self.db, self.account)
-    self.mailbox_id = db_mailbox_add(self.db, self.account.key, "INBOX", 12345, 1)
+    self.mailbox_id: int = db_mailbox_add(self.db, self.account.key, "INBOX", 12345, 1)
 
+  @override
   def tearDown(self):
     self.db.close()
     self._tmpdir.cleanup()
@@ -40,9 +43,9 @@ class TestMessageSoftDelete(unittest.TestCase):
   def test_delete_marks_soft_not_hard(self):
     self._add_message(1)
     db_message_delete_by_uid(self.db, self.mailbox_id, 1)
-    row = self.db.execute("SELECT is_deleted FROM messages WHERE mailbox_id=? AND uid=?", (self.mailbox_id, 1)).fetchone()
-    self.assertIsNotNone(row)
-    self.assertEqual(row["is_deleted"], 1)
+    row = fetchone(self.db, "SELECT is_deleted FROM messages WHERE mailbox_id=? AND uid=?", (self.mailbox_id, 1))
+    assert row is not None
+    self.assertEqual(row_field(row, "is_deleted", int), 1)
 
   def test_deleted_not_in_message_list(self):
     self._add_message(1)
@@ -59,8 +62,9 @@ class TestMessageSoftDelete(unittest.TestCase):
     self.assertEqual(db_mailbox_count_messages(self.db, self.mailbox_id), 1)
 
   def test_deleted_not_in_unseen_count(self):
-    self._add_message(1, "\\Unseen\\")
-    self._add_message(2, "\\Unseen\\")
+    self._add_message(1, "\\\\")      # no flags = unseen
+    self._add_message(2, "\\\\")      # no flags = unseen
+    self._add_message(3, "\\Seen\\")  # seen, must not be counted as unseen
     db_message_delete_by_uid(self.db, self.mailbox_id, 1)
     self.assertEqual(db_mailbox_count_unseen(self.db, self.mailbox_id), 1)
 
@@ -91,6 +95,22 @@ class TestMessageSoftDelete(unittest.TestCase):
     self.assertEqual(len(msgs), 1)
     self.assertEqual(msgs[0].uid, 2)
 
+  def test_for_account_flags_exclude_unseen(self):
+    self._add_message(1, "\\Seen\\")
+    self._add_message(2, "\\\\")
+    self._add_message(3, "\\Flagged\\")
+    msgs = db_messages_for_account(self.db, self.account.key, flags_exclude="\\Seen")
+    uids = sorted(m.uid for m in msgs)
+    self.assertEqual(uids, [2, 3])
+
+  def test_for_account_flags_filter_flagged(self):
+    self._add_message(1, "\\Seen\\")
+    self._add_message(2, "\\Flagged\\")
+    self._add_message(3, "\\Seen\\Flagged\\")
+    msgs = db_messages_for_account(self.db, self.account.key, flags_filter="\\Flagged")
+    uids = sorted(m.uid for m in msgs)
+    self.assertEqual(uids, [2, 3])
+
   def test_max_uid_includes_deleted(self):
     self._add_message(1)
     self._add_message(5)
@@ -102,10 +122,12 @@ class TestMessageSoftDelete(unittest.TestCase):
     self._add_message(1)
     self._add_message(2)
     db_messages_clear(self.db, self.mailbox_id)
-    count = self.db.execute("SELECT COUNT(*) as c FROM messages WHERE mailbox_id=? AND is_deleted=0", (self.mailbox_id,)).fetchone()
-    self.assertEqual(count["c"], 0)
-    total = self.db.execute("SELECT COUNT(*) as c FROM messages WHERE mailbox_id=?", (self.mailbox_id,)).fetchone()
-    self.assertEqual(total["c"], 2)
+    count = fetchone(self.db, "SELECT COUNT(*) as c FROM messages WHERE mailbox_id=? AND is_deleted=0", (self.mailbox_id,))
+    assert count is not None
+    self.assertEqual(row_field(count, "c", int), 0)
+    total = fetchone(self.db, "SELECT COUNT(*) as c FROM messages WHERE mailbox_id=?", (self.mailbox_id,))
+    assert total is not None
+    self.assertEqual(row_field(total, "c", int), 2)
 
   def test_add_upsert_restores_deleted(self):
     self._add_message(1, "\\Seen\\", b"old data")
@@ -113,7 +135,7 @@ class TestMessageSoftDelete(unittest.TestCase):
     self.assertIsNone(db_message_get_by_uid(self.db, self.mailbox_id, 1))
     db_message_add(self.db, 1, self.mailbox_id, 1700000001, "\\Seen\\", 8, b"new data", "1")
     msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
-    self.assertIsNotNone(msg)
+    assert msg is not None
     self.assertEqual(msg.data, b"new data")
 
   def test_update_flags_skips_client_expunged(self):
@@ -125,44 +147,48 @@ class TestMessageSoftDelete(unittest.TestCase):
 
   def test_update_flags_restores_remote_deleted(self):
     self._add_message(1, "\\Seen\\")
-    db_message_delete_except(self.db, self.mailbox_id, set(), 1)
+    _ = db_message_delete_except(self.db, self.mailbox_id, set(), 1)
     db_message_update_flags(self.db, self.mailbox_id, 1, "\\Flagged\\")
     msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
-    self.assertIsNotNone(msg)
+    assert msg is not None
     self.assertEqual(msg.flags_s, "\\Flagged\\")
     self.assertFalse(msg.is_deleted)
 
 
 class TestMailboxSoftDelete(unittest.TestCase):
+  @override
   def setUp(self):
-    self._tmpdir = tempfile.TemporaryDirectory()
-    self.db_path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
-    self.db = db_open(self.db_path)
-    self.account = _make_account()
+    self._tmpdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory()
+    self.db_path: pathlib.Path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
+    self.db: sqlite3.Connection = db_open(self.db_path)
+    self.account: Account = _make_account()
     db_account_add(self.db, self.account)
-    self.mailbox_id = db_mailbox_add(self.db, self.account.key, "INBOX", 12345, 1)
+    self.mailbox_id: int = db_mailbox_add(self.db, self.account.key, "INBOX", 12345, 1)
 
+  @override
   def tearDown(self):
     self.db.close()
     self._tmpdir.cleanup()
 
   def test_delete_marks_soft_not_hard(self):
     db_mailbox_delete(self.db, self.mailbox_id)
-    row = self.db.execute("SELECT is_deleted FROM mailboxes WHERE id=?", (self.mailbox_id,)).fetchone()
-    self.assertIsNotNone(row)
-    self.assertEqual(row["is_deleted"], 1)
+    row = fetchone(self.db, "SELECT is_deleted FROM mailboxes WHERE id=?", (self.mailbox_id,))
+    assert row is not None
+    self.assertEqual(row_field(row, "is_deleted", int), 1)
 
   def test_delete_soft_deletes_messages(self):
     db_message_add(self.db, 1, self.mailbox_id, 1700000000, "\\Seen\\", 4, b"data", "1")
     db_message_add(self.db, 2, self.mailbox_id, 1700000001, "\\Seen\\", 4, b"data", "2")
     db_mailbox_delete(self.db, self.mailbox_id)
-    count = self.db.execute("SELECT COUNT(*) as c FROM messages WHERE mailbox_id=? AND is_deleted=0", (self.mailbox_id,)).fetchone()
-    self.assertEqual(count["c"], 0)
-    total = self.db.execute("SELECT COUNT(*) as c FROM messages WHERE mailbox_id=?", (self.mailbox_id,)).fetchone()
-    self.assertEqual(total["c"], 2)
+    count = fetchone(self.db, "SELECT COUNT(*) as c FROM messages WHERE mailbox_id=? AND is_deleted=0", (self.mailbox_id,))
+    assert count is not None
+    self.assertEqual(row_field(count, "c", int), 0)
+    total = fetchone(self.db, "SELECT COUNT(*) as c FROM messages WHERE mailbox_id=?", (self.mailbox_id,))
+    assert total is not None
+    self.assertEqual(row_field(total, "c", int), 2)
 
   def test_deleted_not_in_mailbox_list(self):
-    db_mailbox_add(self.db, self.account.key, "Sent", 12345, 1)
+    _ = db_mailbox_add(self.db, self.account.key, "Sent", 12345, 1)
     db_mailbox_delete(self.db, self.mailbox_id)
     names = [m.name for m in db_mailbox_list(self.db, self.account.key)]
     self.assertEqual(names, ["Sent"])
@@ -178,7 +204,7 @@ class TestMailboxSoftDelete(unittest.TestCase):
   def test_rename_still_works_on_non_deleted(self):
     db_mailbox_rename(self.db, self.mailbox_id, "Renamed")
     mb = db_mailbox_get_by_id(self.db, self.mailbox_id)
-    self.assertIsNotNone(mb)
+    assert mb is not None
     self.assertEqual(mb.name, "Renamed")
 
 
@@ -187,9 +213,9 @@ class TestSchemaMigration(unittest.TestCase):
     tmpdir = tempfile.TemporaryDirectory()
     db_path = pathlib.Path(tmpdir.name) / "test.sqlite"
     db = db_open(db_path)
-    msg_cols = [r["name"] for r in db.execute("PRAGMA table_info(messages)").fetchall()]
+    msg_cols = [row_field(r, "name", str) for r in iter_rows(db, "PRAGMA table_info(messages)")]
     self.assertIn("is_deleted", msg_cols)
-    mb_cols = [r["name"] for r in db.execute("PRAGMA table_info(mailboxes)").fetchall()]
+    mb_cols = [row_field(r, "name", str) for r in iter_rows(db, "PRAGMA table_info(mailboxes)")]
     self.assertIn("is_deleted", mb_cols)
     db.close()
     tmpdir.cleanup()
@@ -200,13 +226,13 @@ class TestSchemaMigration(unittest.TestCase):
     db = db_open(db_path)
     db.close()
     db = db_open(db_path)
-    msg_cols = [r["name"] for r in db.execute("PRAGMA table_info(messages)").fetchall()]
+    msg_cols = [row_field(r, "name", str) for r in iter_rows(db, "PRAGMA table_info(messages)")]
     self.assertIn("is_deleted", msg_cols)
-    mb_cols = [r["name"] for r in db.execute("PRAGMA table_info(mailboxes)").fetchall()]
+    mb_cols = [row_field(r, "name", str) for r in iter_rows(db, "PRAGMA table_info(mailboxes)")]
     self.assertIn("is_deleted", mb_cols)
     db.close()
     tmpdir.cleanup()
 
 
 if __name__ == "__main__":
-  unittest.main()
+  _ = unittest.main()

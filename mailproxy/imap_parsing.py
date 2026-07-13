@@ -1,9 +1,9 @@
-import datetime, re
+import asyncio, datetime, re
+from collections.abc import Callable
+from typing import Protocol
 
-_QUOTED_RE = re.compile(rb'"(?:[^"\\]|\\.)*"')
-_LITERAL_RE = re.compile(rb'\{(\d+)\}')
-_SEARCH_TOKEN_RE = re.compile(rb'"(?:[^"\\]|\\.)*"|[^\s]+')
-_FETCH_LINE_RE = re.compile(rb'\* \d+ FETCH \((?P<items>.*)\)', re.DOTALL)
+class IMAPReadError(Exception):
+  pass
 
 def imap_to_quoted_string(value: bytes) -> bytes:
   return b"\"%s\"" % (value.replace(b"\"", b"\\\""),)
@@ -35,81 +35,6 @@ def split_message(data: bytes) -> tuple[bytes, bytes]:
     if (idx := data.find(sep)) != -1:
       return data[:idx], data[idx + len(sep):]
   return data, b""
-
-def _skip_quoted(data: bytes, pos: int) -> int:
-  """Return the position after a quoted string starting at data[pos]."""
-  m = _QUOTED_RE.match(data, pos)
-  return m.end() if m else pos + 1
-
-def _skip_literal(data: bytes, pos: int) -> int:
-  """Return the position after a {n} literal starting at data[pos]."""
-  m = _LITERAL_RE.match(data, pos)
-  return m.end() + int(m.group(1)) if m else pos + 1
-
-def split_fetch_items(items_s: bytes) -> list[bytes]:
-  """Split FETCH items into top-level tokens, splitting on spaces at bracket
-  depth 0 while keeping quoted strings, {n} literals, and bracketed groups intact."""
-  tokens: list[bytes] = []
-  pos = 0
-  n = len(items_s)
-  while pos < n:
-    while pos < n and items_s[pos] == ord(" "):
-      pos += 1
-    if pos >= n:
-      break
-    start = pos
-    depth = 0
-    while pos < n:
-      char = items_s[pos]
-      if char == ord('"'):
-        pos = _skip_quoted(items_s, pos)
-      elif char == ord("{"):
-        pos = _skip_literal(items_s, pos)
-      elif char in (ord("("), ord("[")):
-        depth += 1
-        pos += 1
-      elif char in (ord(")"), ord("]")):
-        depth -= 1
-        pos += 1
-      elif char == ord(" ") and depth == 0:
-        break
-      else:
-        pos += 1
-    tokens.append(items_s[start:pos])
-  return tokens
-
-def _strip_pair(val: bytes, open_ch: bytes, close_ch: bytes) -> bytes:
-  """Strip a matching pair of surrounding delimiter bytes, if present."""
-  if len(val) >= 2 and val[:1] == open_ch and val[-1:] == close_ch:
-    return val[1:-1]
-  return val
-
-def _literal_body(val: bytes) -> bytes:
-  """Extract the body from a {n}... literal, or return val unchanged."""
-  m = re.fullmatch(rb'\{(\d+)\}(.*)', val, re.DOTALL)
-  return m.group(2)[:int(m.group(1))] if m else val
-
-def parse_fetch_line(line: bytes) -> dict[bytes, bytes | int] | None:
-  m = _FETCH_LINE_RE.match(line)
-  if m is None:
-    return None
-  result: dict[bytes, bytes | int] = {}
-  tokens = split_fetch_items(m.group("items"))
-  i = 0
-  while i + 1 < len(tokens):
-    key, val = tokens[i].upper(), tokens[i + 1]
-    if key == b"UID":
-      if val.isdigit(): result[b"UID"] = int(val)
-    elif key == b"FLAGS":
-      result[b"FLAGS"] = _strip_pair(val, b"(", b")")
-    elif key == b"INTERNALDATE":
-      result[b"INTERNALDATE"] = _strip_pair(val, b'"', b'"')
-    elif key == b"RFC822.SIZE":
-      if val.isdigit(): result[b"RFC822.SIZE"] = int(val)
-    elif key in (b"BODY[]", b"RFC822"):
-      result[b"BODY[]"] = _literal_body(val)
-    i += 2
-  return result
 
 def parse_sequence_set(set_s: bytes, max_val: int) -> list[int]:
   result: list[int] = []
@@ -144,16 +69,6 @@ def flags_to_list_b(flags_s: str) -> list[bytes]:
 
 def flags_to_b(flags_s: str) -> bytes:
   return b" ".join(flags_to_list_b(flags_s))
-
-def tokenize_search_criteria(criteria_s: bytes) -> list[bytes]:
-  tokens: list[bytes] = []
-  for m in _SEARCH_TOKEN_RE.finditer(criteria_s):
-    token = m.group()
-    if token[:1] == b'"':
-      tokens.append(re.sub(rb'\\(.)', rb'\1', token[1:-1]))
-    else:
-      tokens.append(token)
-  return tokens
 
 def get_header(data: bytes, name: str) -> bytes:
   header, _ = split_message(data)
@@ -210,3 +125,234 @@ def parse_search_date(date_s: bytes) -> int:
 
 class IMAPCommandFailedError(Exception):
   pass
+
+# RFC 9051 §9 formal syntax — byte sets for atom/astring termination.
+# atom-specials = "(" / ")" / "{" / SP / CTL / list-wildcards / quoted-specials / resp-specials
+# list-wildcards = "*" / "%"   quoted-specials = DQUOTE / "\"   resp-specials = "]" / "^"
+_ATOM_TERM = frozenset(b'(){} \t\r\n*%"\\]^')
+# astring-char = atom-char / resp-specials  (includes "]" and "^")
+_ASTRING_TERM = frozenset(b'(){} \t\r\n*%"\\')
+
+class _StreamReaderLike(Protocol):
+  """Protocol for the underlying reader IMAPReader wraps."""
+  async def read(self, n: int) -> bytes: ...
+  def at_eof(self) -> bool: ...
+
+class IMAPReader:
+  """Grammar-aware streaming reader for IMAP (RFC 9051 §9).
+
+  Wraps an asyncio.StreamReader and provides primitives that consume exactly
+  the bytes a grammar production requires — atoms, quoted strings, literals,
+  numbers, nstrings, astrings — plus low-level helpers (peek, read_const,
+  read_until, read_text_line).  No IMAP-level concept (envelope, bodystructure,
+  flag list, FETCH item) lives here; callers compose primitives."""
+
+  def __init__(self, reader: _StreamReaderLike, pre_read: int = 64) -> None:
+    self._reader: _StreamReaderLike = reader
+    self._pre_read: int = pre_read
+    self._buf: bytearray = bytearray()
+    self._at_eof: bool = False
+
+  @property
+  def at_eof(self) -> bool:
+    return not self._buf and (self._at_eof or self._reader.at_eof())
+
+  async def _ensure(self, n: int) -> None:
+    while len(self._buf) < n:
+      if self._at_eof:
+        raise asyncio.IncompleteReadError(bytes(self._buf), n)
+      data = await self._reader.read(max(n - len(self._buf), self._pre_read))
+      if not data:
+        self._at_eof = True
+        raise asyncio.IncompleteReadError(bytes(self._buf), n)
+      self._buf.extend(data)
+
+  async def peek(self, n: int = 1) -> bytes:
+    try:
+      await self._ensure(n)
+    except asyncio.IncompleteReadError:
+      pass
+    return bytes(self._buf[:n])
+
+  async def readexactly(self, n: int) -> bytes:
+    await self._ensure(n)
+    result = bytes(self._buf[:n])
+    del self._buf[:n]
+    return result
+
+  async def read_until(self, delim: bytes) -> bytes:
+    while True:
+      idx = self._buf.find(delim)
+      if idx != -1:
+        result = bytes(self._buf[:idx])
+        del self._buf[:idx + len(delim)]
+        return result
+      if self._at_eof:
+        raise asyncio.IncompleteReadError(bytes(self._buf), None)
+      data = await self._reader.read(self._pre_read)
+      if not data:
+        self._at_eof = True
+        if not self._buf:
+          raise asyncio.IncompleteReadError(b"", None)
+      else:
+        self._buf.extend(data)
+
+  async def _gather_while(self, keep: Callable[[int], bool]) -> bytes:
+    result = bytearray()
+    while True:
+      if not self._buf:
+        try:
+          await self._ensure(1)
+        except asyncio.IncompleteReadError:
+          break
+      i = 0
+      n = len(self._buf)
+      while i < n and keep(self._buf[i]):
+        i += 1
+      if i:
+        result.extend(self._buf[:i])
+        del self._buf[:i]
+      if i < n:
+        break
+    return bytes(result)
+
+  async def skip_sp(self) -> None:
+    c = await self.readexactly(1)
+    if c != b' ':
+      raise IMAPReadError(f"expected SP, got {c!r}")
+
+  async def skip_wsp(self) -> None:
+    _ = await self._gather_while(lambda b: b == 0x20)
+
+  async def read_crlf(self) -> None:
+    await self.read_const(b'\r\n')
+
+  async def read_const(self, expected: bytes) -> None:
+    result = await self.readexactly(len(expected))
+    if result != expected:
+      raise IMAPReadError(f"expected {expected!r}, got {result!r}")
+
+  async def read_atom(self) -> bytes:
+    result = await self._gather_while(lambda b: b not in _ATOM_TERM)
+    if not result:
+      raise IMAPReadError("expected atom")
+    return result
+
+  async def read_tag(self) -> bytes:
+    """Read an untagged marker `*` or a tagged atom (e.g. A1)."""
+    c = await self.peek(1)
+    if c == b'*':
+      _ = await self.readexactly(1)
+      return b'*'
+    return await self.read_atom()
+
+  async def read_number(self) -> int:
+    result = await self._gather_while(lambda b: 0x30 <= b <= 0x39)
+    if not result:
+      raise IMAPReadError("expected number")
+    return int(result)
+
+  async def read_quoted(self) -> bytes:
+    await self.read_const(b'"')
+    result = bytearray()
+    while True:
+      c = await self.readexactly(1)
+      if c == b'\\':
+        result.extend(await self.readexactly(1))
+      elif c == b'"':
+        break
+      else:
+        result.extend(c)
+    return bytes(result)
+
+  async def read_literal(self) -> bytes:
+    await self.read_const(b'{')
+    count_s = await self.read_until(b'}')
+    if count_s.endswith(b'+'):
+      count_s = count_s[:-1]
+    await self.read_crlf()
+    return await self.readexactly(int(count_s))
+
+  async def read_astring(self) -> bytes:
+    c = await self.peek(1)
+    if c == b'"':
+      return await self.read_quoted()
+    if c == b'{':
+      return await self.read_literal()
+    result = await self._gather_while(lambda b: b not in _ASTRING_TERM)
+    if not result:
+      raise IMAPReadError("expected astring")
+    return result
+
+  async def read_nstring(self) -> bytes | None:
+    c = await self.peek(1)
+    if c == b'"':
+      return await self.read_quoted()
+    if c == b'{':
+      return await self.read_literal()
+    result = await self.read_atom()
+    if result.upper() == b'NIL':
+      return None
+    return result
+
+  async def read_token(self) -> bytes:
+    """Read one raw token respecting () [] nesting, quoted strings, and literals.
+    Stops at SP or ) at depth 0, or CRLF.  Returns the raw token bytes
+    (including delimiters for quoted/literal/group tokens)."""
+    c = await self.peek(1)
+    if not c:
+      raise IMAPReadError("expected token, got EOF")
+    if c == b'"':
+      return await self._read_quoted_raw()
+    if c == b'{':
+      return await self._read_literal_raw()
+    return await self._read_token_run()
+
+  async def _read_quoted_raw(self) -> bytes:
+    result = bytearray(await self.readexactly(1))  # consume opening "
+    while True:
+      c = await self.readexactly(1)
+      result.extend(c)
+      if c == b'\\':
+        result.extend(await self.readexactly(1))
+      elif c == b'"':
+        break
+    return bytes(result)
+
+  async def _read_literal_raw(self) -> bytes:
+    header = bytearray()
+    while True:
+      c = await self.readexactly(1)
+      header.extend(c)
+      if c == b'}':
+        break
+    await self.read_crlf()
+    count = int(header[1:-1].rstrip(b'+'))
+    data = await self.readexactly(count)
+    return bytes(header) + b'\r\n' + data
+
+  async def _read_token_run(self) -> bytes:
+    result = bytearray()
+    depth = 0
+    while True:
+      c = await self.peek(1)
+      if not c:
+        break
+      b = c[0]
+      if b in (0x28, 0x5B):  # ( [
+        depth += 1
+      elif b in (0x29, 0x5D):  # ) ]
+        if depth == 0:
+          break
+        depth -= 1
+      elif b == 0x20 and depth == 0:  # SP
+        break
+      elif b in (0x0D, 0x0A):  # CR LF
+        break
+      result.extend(await self.readexactly(1))
+    if not result:
+      raise IMAPReadError("expected token")
+    return bytes(result)
+
+  async def read_text_line(self) -> bytes:
+    return await self.read_until(b'\r\n')

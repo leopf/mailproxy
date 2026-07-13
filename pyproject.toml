@@ -42,3 +42,7 @@ include = [
 
 [tool.setuptools.package-data]
 "mailproxy" = ["py.typed", "assets/*"]
+
+[tool.basedpyright]
+reportUninitializedInstanceVariable = false
+exclude = ["temp", ".venv"]

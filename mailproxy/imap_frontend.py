@@ -1,15 +1,14 @@
-import asyncio, dataclasses, datetime, logging, re, ssl, importlib.resources
+import asyncio, dataclasses, datetime, logging, ssl, importlib.resources
 from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import db_mailbox_by_name, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_delete, \
     db_mailbox_list, db_mailbox_max_uid, db_mailbox_rename, db_mailbox_size, db_mailbox_uid_next, db_mailbox_uid_validity, db_mailbox_update_sync, \
     db_message_add, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_messages_for_account, db_open
 from mailproxy.imap_backend import IMAPRemoteConnection
-from mailproxy.imap_parsing import IMAPCommandFailedError, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
+from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
     filter_headers, flags_to_s, format_internal_date, header_contains, body_contains, text_contains, parse_search_date, \
-    imap_to_quoted_string, parse_internal_date, parse_sequence_set, split_message, split_fetch_items, tokenize_search_criteria
+    imap_to_quoted_string, parse_internal_date, parse_sequence_set, split_message
 from mailproxy.model import Account, Config, Mailbox, Message
-from mailproxy.utils import ScopedStreamReader, ReadValidationError
 
 _SEARCH_FLAGS = {
   b"SEEN": b"\\Seen", b"UNSEEN": b"\\Seen",
@@ -31,7 +30,7 @@ _REMOTE_SYSTEM_FLAGS = frozenset({"Seen", "Answered", "Flagged", "Deleted", "Dra
 class IMAPServerConnection:
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._config: Config = config
-    self._reader: ScopedStreamReader = ScopedStreamReader(reader)
+    self._reader: IMAPReader = IMAPReader(reader)
     self._writer: asyncio.StreamWriter = writer
     self._last_tag: bytes | None = None
     self._remote_connection: IMAPRemoteConnection | None = None
@@ -61,45 +60,6 @@ class IMAPServerConnection:
       raise IMAPCommandFailedError("No mailbox selected!")
     return self._mailbox
 
-  async def _read_nstring(self, until: bytes) -> bytes | None:
-    self._reader.open_scope()
-    first = await self._reader.readexactly(1)
-    self._reader.close_scope(False)
-
-    if first == b'"' or first == b'{':
-      return await self._read_astring(until)
-
-    atom = await self._reader.readuntil(until)
-    return None if atom.upper() == b"NIL" else atom
-
-  async def _read_astring(self, until: bytes) -> bytes:
-    self._reader.open_scope()
-    first = await self._reader.readexactly(1)
-    self._reader.close_scope(False)
-
-    if first == b'"':
-      _ = await self._reader.readexactly(1)
-      result = bytearray()
-      while True:
-        ch = await self._reader.readexactly(1)
-        if ch == b'\\':
-          result.extend(await self._reader.readexactly(1))
-        elif ch == b'"':
-          break
-        else:
-          result.extend(ch)
-      _ = await self._reader.read_const(until)
-      return bytes(result)
-    elif first == b'{':
-      _ = await self._reader.readexactly(1)
-      count_s = await self._reader.readuntil(b"}")
-      _ = await self._reader.read_crlf()
-      data = await self._reader.readexactly(int(count_s))
-      _ = await self._reader.read_const(until)
-      return data
-    else:
-      return await self._reader.readuntil(until)
-
   def _write_mailbox_update(self):
     if self._mailbox is None:
       return
@@ -123,10 +83,12 @@ class IMAPServerConnection:
       await remote.sync_mailbox(mailbox.name)
 
   async def _command_capability(self):
+    await self._reader.read_crlf()
     self._write_line(b"* CAPABILITY %s" % (b" ".join(self._capabilities),))
     self._write_response(b"OK", b"CAPABILITY completed")
 
   async def _command_noop(self):
+    await self._reader.read_crlf()
     if self._mailbox is not None:
       mailbox = self._mailbox
       remote = self._require_remote()
@@ -138,7 +100,8 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"NOOP completed")
 
   async def _command_enable(self):
-    caps_str = await self._reader.read_line()
+    await self._reader.skip_sp()
+    caps_str = await self._reader.read_text_line()
     caps = caps_str.split(b" ")
     if all(c in self._capabilities for c in caps):
       self._write_response(b"OK", b"ENABLE completed")
@@ -159,12 +122,16 @@ class IMAPServerConnection:
     logging.debug("STARTTLS: TLS upgrade complete")
 
   async def _command_logout(self):
+    await self._reader.read_crlf()
     self._write_line(b"* BYE Server logging out")
     self._write_response(b"OK", b"LOGOUT completed")
 
   async def _command_login(self):
-    userid = await self._read_astring(b" ")
-    password = await self._read_astring(b"\r\n")
+    await self._reader.skip_sp()
+    userid = await self._reader.read_astring()
+    await self._reader.skip_sp()
+    password = await self._reader.read_astring()
+    await self._reader.read_crlf()
     with db_open(self._config.db_path) as db:
       login_account = authenticate(self._config, db, userid, password)
     if login_account is None:
@@ -177,11 +144,14 @@ class IMAPServerConnection:
         self._write_response(b"NO", b"login failed")
 
   async def _command_authenticate(self):
-    try: _ = await self._reader.read_const(b"PLAIN", case_sensitive=False)
-    except ReadValidationError: raise IMAPCommandFailedError("Only PLAIN auth supported!")
-    _ = await self._reader.read_crlf()
+    await self._reader.skip_sp()
+    auth_type = (await self._reader.read_atom()).upper()
+    await self._reader.read_crlf()
+    if auth_type != b"PLAIN":
+      self._write_response(b"NO", b"only PLAIN auth supported")
+      return
     self._write_line(b"+ ")
-    auth_line = await self._reader.read_line()
+    auth_line = await self._reader.read_text_line()
     with db_open(self._config.db_path) as db:
       login_account = authenticate_sasl(self._config, db, auth_line)
     if login_account is None:
@@ -194,14 +164,15 @@ class IMAPServerConnection:
         self._write_response(b"NO", b"auth failed")
 
   async def _command_subscribe(self):
-    _ = await self._reader.read_line()
+    _ = await self._reader.read_text_line()
     self._write_response(b"OK", b"SUBSCRIBE completed")
 
   async def _command_unsubscribe(self):
-    _ = await self._reader.read_line()
+    _ = await self._reader.read_text_line()
     self._write_response(b"NO", b"UNSUBSCRIBE not allowed")
 
   async def _command_idle(self):
+    await self._reader.read_crlf()
     self._write_line(b"+ idling")
     tasks: list[asyncio.Task[None]] = []
     if self._mailbox is not None:
@@ -217,19 +188,24 @@ class IMAPServerConnection:
           update_event.clear()
       tasks.extend((asyncio.Task(remote.wait_for_update(mailbox.name, update_event)), asyncio.Task(_update_on_event())))
     try:
-      _ = await self._reader.read_const(b"DONE\r\n", case_sensitive=False)
+      done = await self._reader.read_atom()
+      await self._reader.read_crlf()
+      if done.upper() != b"DONE":
+        raise IMAPReadError(f"expected DONE, got {done!r}")
       self._write_response(b"OK", b"IDLE completed")
     finally:
       for task in tasks: _ = task.cancel()
       _ = await asyncio.wait(tasks)
 
   async def _command_status(self):
-    mailbox_name_raw = await self._read_nstring(b" ")
+    await self._reader.skip_sp()
+    mailbox_name_raw = await self._reader.read_nstring()
     mailbox_name = None if mailbox_name_raw is None else mailbox_name_raw.decode()
-    _ = await self._reader.read_const(b"(")
-    attrs_res = await self._reader.readuntil_re(b")", rb"(?P<attrs>[A-Z ]+)\)")
-    attrs = attrs_res["attrs"].split(b" ")
-    _ = await self._reader.read_crlf()
+    await self._reader.skip_sp()
+    await self._reader.read_const(b"(")
+    attrs_raw = await self._reader.read_until(b")")
+    await self._reader.read_crlf()
+    attrs = attrs_raw.strip().split(b" ")
 
     remote = self._require_remote()
     account = remote.account
@@ -259,7 +235,9 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"status completed")
 
   async def _command_select(self, read_only: bool = False):
-    mailbox_name = (await self._read_astring(b"\r\n")).decode()
+    await self._reader.skip_sp()
+    mailbox_name = (await self._reader.read_astring()).decode()
+    await self._reader.read_crlf()
     remote = self._require_remote()
     account = remote.account
 
@@ -301,20 +279,24 @@ class IMAPServerConnection:
 
   def _build_virtual_mailbox(self, account_key: str, mailbox_name: str):
     flags_filter: str | None = None
+    flags_exclude: str | None = None
     if mailbox_name == "Virtual/Unseen":
-      flags_filter = "\\Unseen"
+      flags_exclude = "\\Seen"
     elif mailbox_name == "Virtual/Flagged":
       flags_filter = "\\Flagged"
     with db_open(self._config.db_path) as db:
-      messages = db_messages_for_account(db, account_key, flags_filter)
+      messages = db_messages_for_account(db, account_key, flags_filter, flags_exclude)
     self._virtual_messages = messages
     self._virtual_uid_map = {}
     for i, msg in enumerate(messages):
       self._virtual_uid_map[i + 1] = (msg.mailbox_id, msg.uid)
 
   async def _command_list(self, is_lsub: bool = False):
-    reference_name_raw = await self._read_astring(b" ")
-    pattern_raw = await self._read_astring(b"\r\n")
+    await self._reader.skip_sp()
+    reference_name_raw = await self._reader.read_astring()
+    await self._reader.skip_sp()
+    pattern_raw = await self._reader.read_astring()
+    await self._reader.read_crlf()
     remote = self._require_remote()
 
     reference_name = reference_name_raw.decode()
@@ -372,16 +354,31 @@ class IMAPServerConnection:
     logging.debug("_match_messages: seq_mode seq_set=%s n=%d matched=%d", seq_set_s.decode(), n, len(result))
     return result
 
+  async def _read_fetch_item_list(self) -> list[bytes]:
+    """Read FETCH item list: either (item *(SP item)) or a single macro/item."""
+    c = await self._reader.peek(1)
+    if c == b"(":
+      await self._reader.read_const(b"(")
+      items: list[bytes] = []
+      while True:
+        await self._reader.skip_wsp()
+        c = await self._reader.peek(1)
+        if c == b")" or not c:
+          break
+        items.append(await self._reader.read_token())
+      await self._reader.read_const(b")")
+      return items
+    return [await self._reader.read_token()]
+
   async def _command_fetch(self, uid_mode: bool):
-    seq_set_s = await self._reader.readuntil(b" ")
-    items_s = (await self._reader.read_line()).strip()
-    if items_s.startswith(b"(") and items_s.endswith(b")"):
-      items_s = items_s[1:-1]
+    await self._reader.skip_sp()
+    seq_set_s = await self._reader.read_until(b" ")
+    raw_items = await self._read_fetch_item_list()
+    await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
     _ = self._require_remote()
 
-    raw_items = split_fetch_items(items_s)
     items: list[bytes] = []
     for item in raw_items:
       items.extend(_FETCH_ITEM_EXPANSION.get(item.upper(), (item,)))
@@ -498,15 +495,37 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"FETCH completed")
 
   def _parse_header_fields(self, item: bytes) -> list[bytes]:
+    import re
     m = re.search(rb'\((?P<fields>[^)]*)\)', item)
     if m is None:
       return []
     return [f.strip() for f in m.group("fields").split(b" ") if f.strip()]
 
+  async def _read_search_tokens(self) -> list[bytes]:
+    """Read SEARCH criteria tokens until CRLF, respecting quoted strings and literals."""
+    tokens: list[bytes] = []
+    while True:
+      await self._reader.skip_wsp()
+      c = await self._reader.peek(1)
+      if not c or c == b"\r":
+        break
+      if c == b'"':
+        tokens.append(await self._reader.read_quoted())
+      elif c == b"{":
+        tokens.append(await self._reader.read_literal())
+      else:
+        tokens.append(await self._reader.read_token())
+    await self._reader.read_crlf()
+    return tokens
+
   async def _command_search(self, uid_mode: bool):
-    criteria_s = await self._reader.read_line()
+    await self._reader.skip_sp()
     mailbox = self._require_mailbox()
     _ = self._require_remote()
+
+    tokens = await self._read_search_tokens()
+    if tokens:
+      tokens[0] = tokens[0].upper()
 
     if mailbox.is_virtual:
       messages = self._virtual_messages if self._virtual_messages is not None else []
@@ -514,9 +533,6 @@ class IMAPServerConnection:
       with db_open(self._config.db_path) as db:
         messages = list(db_message_list(db, mailbox.id))
 
-    tokens = tokenize_search_criteria(criteria_s.strip())
-    if tokens:
-      tokens[0] = tokens[0].upper()
     results: list[int] = []
 
     for i, msg in enumerate(messages):
@@ -596,11 +612,12 @@ class IMAPServerConnection:
     return matched
 
   async def _command_store(self, uid_mode: bool):
-    seq_set_s = await self._reader.readuntil(b" ")
-    op_s = (await self._reader.readuntil(b" ")).upper()
-    _ = await self._reader.read_const(b"(")
-    flags_s_raw = await self._reader.readuntil(b")")
-    _ = await self._reader.read_crlf()
+    await self._reader.skip_sp()
+    seq_set_s = await self._reader.read_until(b" ")
+    op_s = (await self._reader.read_until(b" ")).upper()
+    await self._reader.read_const(b"(")
+    flags_s_raw = await self._reader.read_until(b")")
+    await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
     remote = self._require_remote()
@@ -645,35 +662,33 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"STORE completed")
 
   async def _command_append(self):
-    mailbox_name_raw = await self._read_astring(b" ")
-    mailbox_name = mailbox_name_raw.decode()
+    await self._reader.skip_sp()
+    mailbox_name = (await self._reader.read_astring()).decode()
+    await self._reader.skip_sp()
     flags_s = "\\"
     internal_date: int | None = None
 
-    self._reader.open_scope()
-    peek = await self._reader.readexactly(1)
-    self._reader.close_scope(False)
-
+    peek = await self._reader.peek(1)
     if peek == b"(":
-      _ = await self._reader.read_const(b"(")
-      flags_raw = await self._reader.readuntil(b")")
-      _ = await self._reader.read_const(b" ")
+      await self._reader.read_const(b"(")
+      flags_raw = await self._reader.read_until(b")")
+      await self._reader.skip_sp()
       flags_s = flags_to_s(flags_raw.strip().split(b" "))
-      self._reader.open_scope()
-      peek = await self._reader.readexactly(1)
-      self._reader.close_scope(False)
+      peek = await self._reader.peek(1)
 
     if peek == b'"':
-      date_raw = await self._read_astring(b" ")
+      date_raw = await self._reader.read_quoted()
       internal_date = parse_internal_date(date_raw)
+      await self._reader.skip_sp()
 
-    _ = await self._reader.read_const(b"{")
-    count_s = await self._reader.readuntil(b"}")
-    _ = await self._reader.read_crlf()
+    await self._reader.read_const(b"{")
+    count_s = await self._reader.read_until(b"}")
+    await self._reader.read_crlf()
     self._write_line(b"+ Ready for literal data")
     await self._writer.drain()
-    data = await self._reader.readexactly(int(count_s))
-    _ = await self._reader.read_crlf()
+    n = int(count_s.rstrip(b"+"))
+    data = await self._reader.readexactly(n)
+    await self._reader.read_crlf()
 
     remote = self._require_remote()
     account = remote.account
@@ -693,7 +708,9 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"APPEND completed")
 
   async def _command_create(self):
-    mailbox_name = (await self._read_astring(b"\r\n")).decode()
+    await self._reader.skip_sp()
+    mailbox_name = (await self._reader.read_astring()).decode()
+    await self._reader.read_crlf()
     remote = self._require_remote()
     try:
       await remote.create_mailbox(mailbox_name)
@@ -703,7 +720,9 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"CREATE completed")
 
   async def _command_delete(self):
-    mailbox_name = (await self._read_astring(b"\r\n")).decode()
+    await self._reader.skip_sp()
+    mailbox_name = (await self._reader.read_astring()).decode()
+    await self._reader.read_crlf()
     remote = self._require_remote()
     account = remote.account
     with db_open(self._config.db_path) as db:
@@ -719,8 +738,11 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"DELETE completed")
 
   async def _command_rename(self):
-    old_name = (await self._read_astring(b" ")).decode()
-    new_name = (await self._read_astring(b"\r\n")).decode()
+    await self._reader.skip_sp()
+    old_name = (await self._reader.read_astring()).decode()
+    await self._reader.skip_sp()
+    new_name = (await self._reader.read_astring()).decode()
+    await self._reader.read_crlf()
     remote = self._require_remote()
     account = remote.account
     with db_open(self._config.db_path) as db:
@@ -734,8 +756,10 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"RENAME completed")
 
   async def _command_copy(self, uid_mode: bool):
-    seq_set_s = await self._reader.readuntil(b" ")
-    dest_name = (await self._read_astring(b"\r\n")).decode()
+    await self._reader.skip_sp()
+    seq_set_s = await self._reader.read_until(b" ")
+    dest_name = (await self._reader.read_astring()).decode()
+    await self._reader.read_crlf()
     mailbox = self._require_mailbox()
     remote = self._require_remote()
 
@@ -747,11 +771,19 @@ class IMAPServerConnection:
     matching = self._match_messages(seq_set_s, uid_mode, messages)
 
     if matching and mailbox.is_remote:
-      await remote.uid_copy([msg.uid for _, msg in matching], dest_name)
+      with db_open(self._config.db_path) as db:
+        dest_mailbox = db_mailbox_by_name(db, remote.account.key, dest_name)
+      if dest_mailbox is None or dest_mailbox.is_remote:
+        await remote.uid_copy([msg.uid for _, msg in matching], dest_name)
     self._write_response(b"OK", b"COPY completed")
 
   async def _command_expunge(self, uid_mode: bool):
-    seq_set_s = await self._reader.readuntil(b"\r\n") if uid_mode else b""
+    if uid_mode:
+      await self._reader.skip_sp()
+      seq_set_s = await self._reader.read_text_line()
+    else:
+      seq_set_s = b""
+      await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
     remote = self._require_remote()
@@ -795,9 +827,9 @@ class IMAPServerConnection:
     self._remote_connection = await IMAPRemoteConnection.open(self._config, account)
 
   async def _handle_command(self):
-    self._last_tag = await self._reader.readuntil(b" ") # TODO better validation
-    command_raw = await self._reader.readuntil((b" ", b"\r\n")) # TODO better validation
-    command = command_raw.upper()
+    self._last_tag = await self._reader.read_atom()
+    await self._reader.skip_sp()
+    command = (await self._reader.read_atom()).upper()
     full_cmd = b"%s %s" % (self._last_tag, command)
     logging.debug("Client: %s", full_cmd.decode(errors="replace"))
 
@@ -815,7 +847,7 @@ class IMAPServerConnection:
       case b"SELECT": await self._command_select(read_only=False)
       case b"EXAMINE": await self._command_select(read_only=True)
       case b"CLOSE": await self._command_close()
-      case b"CHECK": self._write_response(b"OK", b"CHECK completed")
+      case b"CHECK": await self._reader.read_crlf(); self._write_response(b"OK", b"CHECK completed")
       case b"LIST": await self._command_list()
       case b"LSUB": await self._command_list(is_lsub=True)
       case b"FETCH": await self._command_fetch(uid_mode=False)
@@ -828,8 +860,8 @@ class IMAPServerConnection:
       case b"COPY": await self._command_copy(uid_mode=False)
       case b"EXPUNGE": await self._command_expunge(uid_mode=False)
       case b"UID":
-        sub_raw = await self._reader.readuntil((b" ", b"\r\n"))
-        sub = sub_raw.upper()
+        await self._reader.skip_sp()
+        sub = (await self._reader.read_atom()).upper()
         match sub:
           case b"FETCH": await self._command_fetch(uid_mode=True)
           case b"SEARCH": await self._command_search(uid_mode=True)
@@ -837,9 +869,9 @@ class IMAPServerConnection:
           case b"COPY": await self._command_copy(uid_mode=True)
           case b"EXPUNGE": await self._command_expunge(uid_mode=True)
           case _: self._write_response(b"BAD", b"unknown UID command")
-      case b"STARTTLS": await self._command_starttls()
+      case b"STARTTLS": await self._reader.read_crlf(); await self._command_starttls()
       case _:
-        _ = await self._reader.read_line()
+        _ = await self._reader.read_text_line()
         self._write_response(b"BAD", b"unknown command")
 
   async def run(self):
@@ -848,14 +880,11 @@ class IMAPServerConnection:
     try:
       while not self._reader.at_eof:
         try:
-          self._reader.open_scope()
           await self._handle_command()
         except IMAPCommandFailedError as e:
           logging.debug("command failed: %s", e)
           if self._last_tag is not None:
             self._write_response(b"NO", b"command failed with internal error")
-        finally:
-          self._reader.close_scope(True)
     except Exception as e:
       logging.error("connection closing because of an error: %s", e)
     finally:

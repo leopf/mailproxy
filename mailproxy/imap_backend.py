@@ -1,10 +1,20 @@
-import asyncio, base64, datetime, logging, re, ssl
+import asyncio, base64, datetime, logging, ssl
 from dataclasses import dataclass
+from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
 from mailproxy.db import db_message_add, db_message_delete_except, db_message_update_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
-from mailproxy.imap_parsing import IMAPCommandFailedError, flags_to_s, imap_to_quoted_string, parse_fetch_line, parse_internal_date
+from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, imap_to_quoted_string, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
-from mailproxy.utils import match_lineb, encode_7bit_mailbox_name
+from mailproxy.utils import encode_7bit_mailbox_name
+
+
+def _is_fetch_items(value: object) -> TypeGuard[dict[bytes, object]]:
+  return isinstance(value, dict)
+
+def _is_bytes_list(value: object) -> TypeGuard[list[bytes]]:
+  if not isinstance(value, list):
+    return False
+  return all(isinstance(v, bytes) for v in cast(list[object], value))
 
 @dataclass(frozen=True)
 class SelectResult:
@@ -14,13 +24,18 @@ class SelectResult:
   flags_s: str
   read_only: bool
 
+@dataclass
+class ImapResponse:
+  kind: bytes
+  args: list[object]
+
 class IMAPRemoteConnection:
   _tls_context: ssl.SSLContext = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
   def __init__(self, config: Config, account: Account, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self.account: Account = account
     self.config: Config = config
-    self._reader: asyncio.StreamReader = reader
+    self._imap: IMAPReader = IMAPReader(reader)
     self._writer: asyncio.StreamWriter = writer
     self._command_counter: int = 0
     self._use_ascii_mailbox_encoding: bool = True
@@ -62,22 +77,23 @@ class IMAPRemoteConnection:
     if uid_next > last_synced + 1:
       self._start_command(b"UID FETCH %d:* (UID FLAGS INTERNALDATE RFC822.SIZE BODY[])" % (last_synced + 1,))
       new_messages: list[tuple[int, int, int, str, int, bytes, str]] = []
-      async for line in self._read_response_lines():
-        parsed = parse_fetch_line(line)
-        if parsed is None: continue
-        uid = parsed.get(b"UID")
-        if uid is None: continue
-        uid_int = int(uid)
+      async for resp in self._read_responses():
+        if resp.kind != b"FETCH": continue
+        items = resp.args[1]
+        if not _is_fetch_items(items): continue
+        uid = items.get(b"UID")
+        if not isinstance(uid, int): continue
+        uid_int = uid
         if uid_int <= last_synced:
           logging.debug("sync_mailbox: '%s' skipping uid %d (<= last_synced %d)", mailbox_name, uid_int, last_synced)
           continue
-        flags = parsed.get(b"FLAGS", b"")
-        internal_date = parsed.get(b"INTERNALDATE", b"")
-        size = parsed.get(b"RFC822.SIZE", 0)
-        body = parsed.get(b"BODY[]", b"")
+        flags = items.get(b"FLAGS", b"")
+        internal_date = items.get(b"INTERNALDATE", b"")
+        size = items.get(b"RFC822.SIZE", 0)
+        body = items.get(b"BODY[]", b"")
         msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
         received_date = parse_internal_date(internal_date) if isinstance(internal_date, bytes) and internal_date else int(datetime.datetime.now().timestamp())
-        new_messages.append((int(uid), mailbox_id, received_date, msg_flags_s, int(size), bytes(body), str(uid)))
+        new_messages.append((uid_int, mailbox_id, received_date, msg_flags_s, int(size) if isinstance(size, int) else 0, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int)))
 
       if new_messages:
         with db_open(self.config.db_path) as db:
@@ -93,20 +109,22 @@ class IMAPRemoteConnection:
       self._start_command(b"UID FETCH 1:%d (UID FLAGS)" % (last_synced,))
       flag_updates: list[tuple[int, str]] = []
       seen_uids: set[int] = set()
-      async for line in self._read_response_lines():
-        parsed = parse_fetch_line(line)
-        if parsed is None: continue
-        uid = parsed.get(b"UID")
-        if uid is None: continue
-        seen_uids.add(int(uid))
-        flags = parsed.get(b"FLAGS", b"")
+      async for resp in self._read_responses():
+        if resp.kind != b"FETCH": continue
+        items = resp.args[1]
+        if not _is_fetch_items(items): continue
+        uid = items.get(b"UID")
+        if not isinstance(uid, int): continue
+        uid_int = uid
+        seen_uids.add(uid_int)
+        flags = items.get(b"FLAGS", b"")
         msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
-        flag_updates.append((int(uid), msg_flags_s))
+        flag_updates.append((uid_int, msg_flags_s))
 
       with db_open(self.config.db_path) as db:
         if flag_updates:
-          for uid, flags_s in flag_updates:
-            db_message_update_flags(db, mailbox_id, uid, flags_s)
+          for uid, f_s in flag_updates:
+            db_message_update_flags(db, mailbox_id, uid, f_s)
           logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, len(flag_updates))
         deleted_count = db_message_delete_except(db, mailbox_id, seen_uids, last_synced)
         if deleted_count > 0:
@@ -116,18 +134,13 @@ class IMAPRemoteConnection:
     logging.debug("sync_mailbox_list: listing remote mailboxes")
     self._start_command(b"LIST \"\" \"*\"")
     remote_mailboxes: list[tuple[bytes, bytes, bytes]] = []
-    async for line in self._read_response_lines():
-      m = re.fullmatch(rb'\* LIST \((?P<flags>.*)\) (?P<delim>\S+) (?P<name>.*)', line, re.DOTALL)
-      if m is None: continue
-      name = m.group("name")
-      if name.startswith(b'"') and name.endswith(b'"'): name = name[1:-1]
-      lit_m = re.fullmatch(rb'\{(\d+)\}(.*)', name, re.DOTALL)
-      if lit_m is not None:
-        n = int(lit_m.group(1))
-        name = lit_m.group(2)[:n]
-      delim = m.group("delim")
-      if delim.startswith(b'"') and delim.endswith(b'"'): delim = delim[1:-1]
-      remote_mailboxes.append((m.group("flags"), delim, name))
+    async for resp in self._read_responses():
+      if resp.kind != b"LIST": continue
+      flags_raw = resp.args[0]
+      delim = resp.args[1]
+      name = resp.args[2]
+      if isinstance(flags_raw, bytes) and isinstance(delim, bytes) and isinstance(name, bytes):
+        remote_mailboxes.append((flags_raw, delim, name))
 
     with db_open(self.config.db_path) as db:
       added = 0
@@ -151,8 +164,11 @@ class IMAPRemoteConnection:
     flags_b = b"" if flags_s == "\\" else b" (" + b" ".join(b"\\" + f.encode("ascii") for f in flags_s.strip("\\").split("\\") if f) + b")"
     date_b = b" \"" + datetime.datetime.fromtimestamp(internal_date, tz=datetime.timezone.utc).strftime("%d-%b-%Y %H:%M:%S %z").encode("ascii") + b"\"" if internal_date is not None else b""
     self._start_command(b"APPEND %s%s%s {%d}" % (self._encode_mailbox(mailbox_name), flags_b, date_b, len(data)))
-    if not (await self._read_line()).startswith(b"+"):
+    if await self._imap.peek(1) != b"+":
+      await self._read_until_response()
       raise IMAPCommandFailedError("remote did not accept APPEND literal")
+    await self._imap.read_const(b"+")
+    _ = await self._imap.read_text_line()
     self._writer.write(data)
     self._writer.write(b"\r\n")
     await self._read_until_response()
@@ -185,12 +201,18 @@ class IMAPRemoteConnection:
     try:
       _ = await self._command_select(mailbox_name)
       self._start_command(b"IDLE")
-      if not (await self._read_line()).startswith(b"+"):
+      if await self._imap.peek(1) != b"+":
         raise RuntimeError("server didnt respond with + in idle!")
+      await self._imap.read_const(b"+")
+      _ = await self._imap.read_text_line()
       while True:
-        line = await self._read_line()
-        if match_lineb(br"\* \d+ (EXISTS|EXPUNGE|FETCH).*", line):
-          logging.debug("wait_for_update: '%s' got update: %s", mailbox_name, line.decode(errors="replace"))
+        tag = await self._imap.read_tag()
+        await self._imap.skip_sp()
+        if tag != b"*":
+          raise IMAPReadError(f"unexpected tag during IDLE: {tag!r}")
+        resp = await self._read_untagged()
+        if resp.kind in (b"EXISTS", b"EXPUNGE", b"FETCH"):
+          logging.debug("wait_for_update: '%s' got %s", mailbox_name, resp.kind)
           update_event.set()
     finally:
       self._writer.write(b"DONE\r\n")
@@ -198,7 +220,7 @@ class IMAPRemoteConnection:
       logging.debug("wait_for_update: '%s' IDLE done", mailbox_name)
 
   async def _init(self):
-    logging.debug("IMAP init: " + (await self._read_line()).decode())
+    logging.debug("IMAP init: " + (await self._imap.read_text_line()).decode())
     self._capabilities = await self._command_capabilities()
     logging.debug("IMAP capabilities: %s", b" ".join(self._capabilities).decode(errors="replace"))
     if self.account.imap_tlsmode == TLSMode.STARTTLS:
@@ -231,26 +253,33 @@ class IMAPRemoteConnection:
   async def _command_select(self, mailbox_name: str) -> SelectResult:
     self._start_command(b"SELECT %s" % (self._encode_mailbox(mailbox_name),))
     uid_validity, uid_next, exists, flags_s, read_only = 0, 0, 0, "\\", False
-    async for line in self._read_response_lines():
-      if (m := match_lineb(rb'\* OK \[UIDVALIDITY (?P<v>\d+)\].*', line)) is not None:
-        uid_validity = int(m["v"])
-      elif (m := match_lineb(rb'\* OK \[UIDNEXT (?P<v>\d+)\].*', line)) is not None:
-        uid_next = int(m["v"])
-      elif (m := match_lineb(rb'\* (?P<v>\d+) EXISTS', line)) is not None:
-        exists = int(m["v"])
-      elif (m := match_lineb(rb'\* FLAGS \((?P<v>.*)\)', line)) is not None:
-        flags_s = flags_to_s(m["v"])
-      elif (m := match_lineb(rb'\* OK \[READ-ONLY\].*', line)) is not None:
-        read_only = True
+    async for resp in self._read_responses():
+      if resp.kind == b"OK":
+        code = resp.args[0]
+        if code is not None and isinstance(code, bytes):
+          if code.startswith(b"UIDVALIDITY"):
+            uid_validity = int(code.split(b" ")[1])
+          elif code.startswith(b"UIDNEXT"):
+            uid_next = int(code.split(b" ")[1])
+          elif code == b"READ-ONLY":
+            read_only = True
+      elif resp.kind == b"EXISTS":
+        n = resp.args[0]
+        if isinstance(n, int): exists = n
+      elif resp.kind == b"FLAGS":
+        flags_raw = resp.args[0]
+        if isinstance(flags_raw, bytes): flags_s = flags_to_s(flags_raw)
     return SelectResult(uid_validity=uid_validity, uid_next=uid_next, exists=exists, flags_s=flags_s, read_only=read_only)
 
   async def _command_authenticate(self, auth_type: bytes, auth_data: bytes):
     if (b"AUTH=%s" % (auth_type,)) not in self._capabilities:
       raise IMAPCommandFailedError(f"Auth type '{auth_type.decode()}' not supported!")
     self._start_command(b"AUTHENTICATE %s" % (auth_type,))
-    if not (await self._read_line()).startswith(b"+"):
+    if await self._imap.peek(1) != b"+":
       await self._read_until_response()
       raise IMAPCommandFailedError("Invalid response from server!")
+    await self._imap.read_const(b"+")
+    _ = await self._imap.read_text_line()
     self._writer.write(base64.b64encode(auth_data))
     self._writer.write(b"\r\n")
     await self._read_until_response()
@@ -262,9 +291,11 @@ class IMAPRemoteConnection:
   async def _command_capabilities(self):
     self._start_command(b"CAPABILITY")
     capabilities: list[bytes] = []
-    async for line in self._read_response_lines():
-      if (capdict := match_lineb(rb"\* CAPABILITY (?P<caps>.*)", line)) is not None:
-        capabilities.extend(capdict["caps"].split(b" "))
+    async for resp in self._read_responses():
+      if resp.kind == b"CAPABILITY":
+        caps = resp.args[0]
+        if _is_bytes_list(caps):
+          capabilities.extend(caps)
     return capabilities
 
   async def _command_starttls(self):
@@ -281,22 +312,117 @@ class IMAPRemoteConnection:
       return imap_to_quoted_string(encode_7bit_mailbox_name(s).encode("ascii"))
     return imap_to_quoted_string(s.encode("utf-8"))
 
-  async def _read_line(self):
-    return (await self._reader.readuntil(b"\r\n"))[:-2]
-
   async def _read_until_response(self):
-    async for _ in self._read_response_lines(): pass
+    async for _ in self._read_responses(): pass
 
-  async def _read_response_lines(self):
-    expected_tag = b"A%d " % (self._command_counter,)
-    while not (line := await self._read_line()).startswith(expected_tag):
-      while (m := re.search(rb'\{(\d+)\}$', line)) is not None:
-        n = int(m.group(1))
-        line = line + (await self._reader.readexactly(n)) + (await self._read_line())
-      yield line
-    code, message = line[len(expected_tag):].split(b" ", maxsplit=1)
-    if code.upper() != b"OK":
-      raise IMAPCommandFailedError(f"remote command failed: {code.decode()} {message.decode()}")
+  async def _read_responses(self):
+    """Yield ImapResponse for untagged responses until the tagged completion."""
+    expected = b"A%d" % (self._command_counter,)
+    while True:
+      tag = await self._imap.read_tag()
+      await self._imap.skip_sp()
+      if tag == b"*":
+        yield await self._read_untagged()
+      elif tag == expected:
+        state = (await self._imap.read_atom()).upper()
+        _code, text = await self._read_resp_text()
+        if state != b"OK":
+          raise IMAPCommandFailedError(f"remote command failed: {state.decode()} {text.decode()}")
+        return
+      else:
+        raise IMAPReadError(f"unexpected tag {tag!r}, expected {expected!r}")
+
+  async def _read_untagged(self) -> ImapResponse:
+    """Read one untagged response (after '* SP' consumed)."""
+    first = await self._imap.peek(1)
+    if first and first[0:1].isdigit():
+      n = await self._imap.read_number()
+      await self._imap.skip_sp()
+      kind = (await self._imap.read_atom()).upper()
+      if kind == b"FETCH":
+        await self._imap.skip_wsp()
+        items = await self._read_fetch_items()
+        await self._imap.read_crlf()
+        return ImapResponse(b"FETCH", [n, items])
+      await self._imap.read_crlf()
+      return ImapResponse(kind, [n])
+    kind = (await self._imap.read_atom()).upper()
+    if kind in (b"OK", b"BYE"):
+      code, text = await self._read_resp_text()
+      return ImapResponse(kind, [code, text])
+    if kind == b"FLAGS":
+      await self._imap.skip_wsp()
+      await self._imap.read_const(b"(")
+      flags_raw = await self._imap.read_until(b")")
+      await self._imap.read_crlf()
+      return ImapResponse(b"FLAGS", [flags_raw.strip()])
+    if kind == b"LIST":
+      await self._imap.skip_wsp()
+      await self._imap.read_const(b"(")
+      flags_raw = await self._imap.read_until(b")")
+      await self._imap.skip_wsp()
+      delim = await self._imap.read_nstring()
+      await self._imap.skip_wsp()
+      name = await self._imap.read_astring()
+      await self._imap.read_crlf()
+      return ImapResponse(b"LIST", [flags_raw.strip(), delim or b"/", name])
+    if kind == b"CAPABILITY":
+      await self._imap.skip_wsp()
+      caps_line = await self._imap.read_text_line()
+      return ImapResponse(b"CAPABILITY", [[c for c in caps_line.split(b" ") if c]])
+    text = await self._imap.read_text_line()
+    return ImapResponse(kind, [text])
+
+  async def _read_fetch_items(self) -> dict[bytes, object]:
+    await self._imap.read_const(b"(")
+    result: dict[bytes, object] = {}
+    while True:
+      c = await self._imap.peek(1)
+      if c == b")" or not c:
+        break
+      await self._imap.skip_wsp()
+      c = await self._imap.peek(1)
+      if c == b")" or not c:
+        break
+      key = (await self._imap.read_token()).upper()
+      await self._imap.skip_sp()
+      if key == b"UID":
+        result[b"UID"] = await self._imap.read_number()
+      elif key == b"FLAGS":
+        await self._imap.read_const(b"(")
+        flags_raw = await self._imap.read_until(b")")
+        result[b"FLAGS"] = flags_raw.strip()
+      elif key == b"INTERNALDATE":
+        result[b"INTERNALDATE"] = await self._imap.read_quoted()
+      elif key == b"RFC822.SIZE":
+        result[b"RFC822.SIZE"] = await self._imap.read_number()
+      elif key.startswith(b"BODY") or key.startswith(b"RFC822"):
+        c2 = await self._imap.peek(1)
+        if c2 == b"{":
+          result[b"BODY[]"] = await self._imap.read_literal()
+        elif c2 == b'"':
+          result[b"BODY[]"] = await self._imap.read_quoted()
+        elif c2[:1].upper() == b"N":
+          _ = await self._imap.read_atom()
+        else:
+          result[b"BODY[]"] = await self._imap.read_token()
+      else:
+        _ = await self._imap.read_token()
+    await self._imap.read_const(b")")
+    return result
+
+  async def _read_resp_text(self) -> tuple[bytes | None, bytes]:
+    """Read [code] text after OK/NO/BAD/BYE. Return (code, text)."""
+    if await self._imap.peek(1) == b" ":
+      await self._imap.skip_sp()
+    code = None
+    if await self._imap.peek(1) == b"[":
+      await self._imap.read_const(b"[")
+      code = await self._imap.read_until(b"]")
+      if await self._imap.peek(1) == b" ":
+        await self._imap.skip_sp()
+    text = await self._imap.read_text_line()
+    return code, text
 
   @staticmethod
   async def open(config: Config, account: Account):

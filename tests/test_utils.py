@@ -5,7 +5,7 @@ from mailproxy.utils import match_line, match_lineb, encode_7bit_mailbox_name, d
 class TestMatchLine(unittest.TestCase):
   def test_simple_match(self):
     result = match_line(r"OK \[(?P<code>[\w-]+)\]", "OK [READ-ONLY]")
-    self.assertIsNotNone(result)
+    assert result is not None
     self.assertEqual(result["code"], "READ-ONLY")
 
   def test_no_match(self):
@@ -19,13 +19,14 @@ class TestMatchLine(unittest.TestCase):
 
   def test_returns_empty_key(self):
     result = match_line(r"OK", "OK")
+    assert result is not None
     self.assertIn("", result)
 
 
 class TestMatchLineB(unittest.TestCase):
   def test_simple(self):
     result = match_lineb(rb"\* (?P<v>\d+) EXISTS", b"* 5 EXISTS")
-    self.assertIsNotNone(result)
+    assert result is not None
     self.assertEqual(result["v"], b"5")
 
   def test_no_match(self):
@@ -94,4 +95,4 @@ class TestTypeGuards(unittest.TestCase):
 
 
 if __name__ == "__main__":
-  unittest.main()
+  _ = unittest.main()

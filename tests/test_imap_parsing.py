@@ -1,14 +1,487 @@
-import unittest
+import asyncio, datetime, unittest
+from typing import override
 from mailproxy.imap_parsing import (
+  IMAPReader, IMAPReadError,
   flags_to_s, flags_s_to_set, flags_set_to_s, flags_to_list_b, flags_to_b,
-  parse_sequence_set, split_fetch_items, parse_fetch_line, tokenize_search_criteria,
+  parse_sequence_set,
   split_message, get_header, filter_headers, header_contains, body_contains, text_contains,
   parse_internal_date, format_internal_date, parse_search_date, list_match,
   imap_to_quoted_string,
 )
 
 
-class TestFlagsToS(unittest.TestCase):
+class _MockStreamReader:
+  _data: bytes
+  _pos: int
+
+  def __init__(self, data: bytes) -> None:
+    self._data = data
+    self._pos = 0
+
+  def at_eof(self) -> bool:
+    return self._pos >= len(self._data)
+
+  async def read(self, n: int = -1) -> bytes:
+    if self._pos >= len(self._data):
+      return b""
+    if n == -1:
+      result = self._data[self._pos:]
+    else:
+      result = self._data[self._pos:self._pos + n]
+    self._pos += len(result)
+    return result
+
+
+def _make_reader(data: bytes) -> IMAPReader:
+  return IMAPReader(_MockStreamReader(data), pre_read=4)
+
+
+class TestIMAPReaderPeek(unittest.TestCase):
+  def test_peek_does_not_consume(self):
+    r = _make_reader(b"ABC")
+    self.assertEqual(asyncio.run(r.peek(2)), b"AB")
+    self.assertEqual(asyncio.run(r.peek(2)), b"AB")
+
+  def test_peek_past_end(self):
+    r = _make_reader(b"A")
+    self.assertEqual(asyncio.run(r.peek(5)), b"A")
+
+  def test_peek_empty(self):
+    r = _make_reader(b"")
+    self.assertEqual(asyncio.run(r.peek(1)), b"")
+
+
+class TestIMAPReaderReadConst(unittest.TestCase):
+  def test_match(self):
+    r = _make_reader(b"OK\r\n")
+    asyncio.run(r.read_const(b"OK"))
+    asyncio.run(r.read_crlf())
+
+  def test_mismatch(self):
+    r = _make_reader(b"NO")
+    with self.assertRaises(IMAPReadError):
+      asyncio.run(r.read_const(b"OK"))
+
+
+class TestIMAPReaderReadAtom(unittest.TestCase):
+  def test_simple(self):
+    r = _make_reader(b"FETCH ")
+    self.assertEqual(asyncio.run(r.read_atom()), b"FETCH")
+
+  def test_stops_at_paren(self):
+    r = _make_reader(b"FLAGS(blah)")
+    self.assertEqual(asyncio.run(r.read_atom()), b"FLAGS")
+
+  def test_stops_at_crlf(self):
+    r = _make_reader(b"EXISTS\r\n")
+    self.assertEqual(asyncio.run(r.read_atom()), b"EXISTS")
+
+  def test_empty_raises(self):
+    r = _make_reader(b" ")
+    with self.assertRaises(IMAPReadError):
+      _ = asyncio.run(r.read_atom())
+
+
+class TestIMAPReaderReadNumber(unittest.TestCase):
+  def test_simple(self):
+    r = _make_reader(b"12345 ")
+    self.assertEqual(asyncio.run(r.read_number()), 12345)
+
+  def test_no_digits(self):
+    r = _make_reader(b"abc")
+    with self.assertRaises(IMAPReadError):
+      _ = asyncio.run(r.read_number())
+
+
+class TestIMAPReaderReadQuoted(unittest.TestCase):
+  def test_simple(self):
+    r = _make_reader(b'"hello world"')
+    self.assertEqual(asyncio.run(r.read_quoted()), b"hello world")
+
+  def test_escaped_quote(self):
+    r = _make_reader(b'"hello \\"world\\""')
+    self.assertEqual(asyncio.run(r.read_quoted()), b'hello "world"')
+
+  def test_escaped_backslash(self):
+    r = _make_reader(b'"a\\\\b"')
+    self.assertEqual(asyncio.run(r.read_quoted()), b"a\\b")
+
+  def test_empty(self):
+    r = _make_reader(b'""')
+    self.assertEqual(asyncio.run(r.read_quoted()), b"")
+
+
+class TestIMAPReaderReadLiteral(unittest.TestCase):
+  def test_simple(self):
+    r = _make_reader(b"{5}\r\nhello")
+    self.assertEqual(asyncio.run(r.read_literal()), b"hello")
+
+  def test_with_spaces(self):
+    r = _make_reader(b"{11}\r\nhello world")
+    self.assertEqual(asyncio.run(r.read_literal()), b"hello world")
+
+  def test_non_synchronizing(self):
+    r = _make_reader(b"{5+}\r\nhello")
+    self.assertEqual(asyncio.run(r.read_literal()), b"hello")
+
+  def test_empty(self):
+    r = _make_reader(b"{0}\r\n")
+    self.assertEqual(asyncio.run(r.read_literal()), b"")
+
+
+class TestIMAPReaderReadAstring(unittest.TestCase):
+  def test_atom(self):
+    r = _make_reader(b"INBOX ")
+    self.assertEqual(asyncio.run(r.read_astring()), b"INBOX")
+
+  def test_quoted(self):
+    r = _make_reader(b'"hello world" ')
+    self.assertEqual(asyncio.run(r.read_astring()), b"hello world")
+
+  def test_literal(self):
+    r = _make_reader(b"{5}\r\nhello ")
+    self.assertEqual(asyncio.run(r.read_astring()), b"hello")
+
+  def test_stops_at_paren(self):
+    r = _make_reader(b"INBOX)")
+    self.assertEqual(asyncio.run(r.read_astring()), b"INBOX")
+
+
+class TestIMAPReaderReadNstring(unittest.TestCase):
+  def test_nil(self):
+    r = _make_reader(b"NIL ")
+    self.assertIsNone(asyncio.run(r.read_nstring()))
+
+  def test_nil_case_insensitive(self):
+    r = _make_reader(b"nil ")
+    self.assertIsNone(asyncio.run(r.read_nstring()))
+
+  def test_quoted(self):
+    r = _make_reader(b'"hello" ')
+    self.assertEqual(asyncio.run(r.read_nstring()), b"hello")
+
+  def test_literal(self):
+    r = _make_reader(b"{5}\r\nworld ")
+    self.assertEqual(asyncio.run(r.read_nstring()), b"world")
+
+  def test_atom(self):
+    r = _make_reader(b"INBOX ")
+    self.assertEqual(asyncio.run(r.read_nstring()), b"INBOX")
+
+
+class TestIMAPReaderReadToken(unittest.TestCase):
+  def test_atom(self):
+    r = _make_reader(b"UID ")
+    self.assertEqual(asyncio.run(r.read_token()), b"UID")
+
+  def test_quoted(self):
+    r = _make_reader(b'"hello world" ')
+    self.assertEqual(asyncio.run(r.read_token()), b'"hello world"')
+
+  def test_literal(self):
+    r = _make_reader(b"{5}\r\nhello ")
+    result = asyncio.run(r.read_token())
+    self.assertEqual(result, b"{5}\r\nhello")
+
+  def test_paren_group(self):
+    r = _make_reader(b"(\\Seen \\Flagged) ")
+    self.assertEqual(asyncio.run(r.read_token()), b"(\\Seen \\Flagged)")
+
+  def test_bracket_group(self):
+    r = _make_reader(b"BODY[HEADER] ")
+    self.assertEqual(asyncio.run(r.read_token()), b"BODY[HEADER]")
+
+  def test_nested_groups(self):
+    r = _make_reader(b"BODY[HEADER.FIELDS (From Subject)] ")
+    self.assertEqual(asyncio.run(r.read_token()), b"BODY[HEADER.FIELDS (From Subject)]")
+
+  def test_stops_at_close_paren_depth0(self):
+    r = _make_reader(b"UID)")
+    self.assertEqual(asyncio.run(r.read_token()), b"UID")
+
+
+class TestIMAPReaderReadTextLine(unittest.TestCase):
+  def test_simple(self):
+    r = _make_reader(b"hello world\r\nnext")
+    self.assertEqual(asyncio.run(r.read_text_line()), b"hello world")
+
+  def test_empty(self):
+    r = _make_reader(b"\r\n")
+    self.assertEqual(asyncio.run(r.read_text_line()), b"")
+
+
+class TestIMAPReaderReadUntil(unittest.TestCase):
+  def test_simple(self):
+    r = _make_reader(b"hello world")
+    self.assertEqual(asyncio.run(r.read_until(b" ")), b"hello")
+
+  def test_consumes_delimiter(self):
+    r = _make_reader(b"a)b")
+    self.assertEqual(asyncio.run(r.read_until(b")")), b"a")
+    self.assertEqual(asyncio.run(r.peek(1)), b"b")
+
+  def test_close_paren_consumed_then_crlf(self):
+    r = _make_reader(b"UIDNEXT MESSAGES)\r\n")
+    _ = asyncio.run(r.read_until(b")"))
+    self.assertEqual(asyncio.run(r.peek(1)), b"\r")
+
+  def test_close_bracket_consumed_then_sp(self):
+    r = _make_reader(b"UIDVALIDITY 123] text\r\n")
+    _ = asyncio.run(r.read_until(b"]"))
+    self.assertEqual(asyncio.run(r.peek(1)), b" ")
+
+  def test_multiple_read_until_in_sequence(self):
+    r = _make_reader(b"1:5 +FLAGS (\\Seen)\r\n")
+    self.assertEqual(asyncio.run(r.read_until(b" ")), b"1:5")
+    self.assertEqual(asyncio.run(r.read_until(b" ")), b"+FLAGS")
+    asyncio.run(r.read_const(b"("))
+    self.assertEqual(asyncio.run(r.read_until(b")")), b"\\Seen")
+    asyncio.run(r.read_crlf())
+
+
+class TestIMAPReaderSkipSp(unittest.TestCase):
+  def test_consume_one_sp(self):
+    r = _make_reader(b"  hello")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.peek(1)), b" ")
+
+  def test_no_sp_raises(self):
+    r = _make_reader(b"hello")
+    with self.assertRaises(IMAPReadError):
+      asyncio.run(r.skip_sp())
+
+
+class TestIMAPReaderSkipWsp(unittest.TestCase):
+  def test_consume_run(self):
+    r = _make_reader(b"   hello")
+    asyncio.run(r.skip_wsp())
+    self.assertEqual(asyncio.run(r.peek(1)), b"h")
+
+  def test_none(self):
+    r = _make_reader(b"hello")
+    asyncio.run(r.skip_wsp())
+    self.assertEqual(asyncio.run(r.peek(1)), b"h")
+
+
+class TestIMAPReaderAtEof(unittest.TestCase):
+  def test_not_eof_with_data(self):
+    r = _make_reader(b"data")
+    self.assertFalse(r.at_eof)
+
+  def test_eof_empty(self):
+    r = _make_reader(b"")
+    self.assertTrue(r.at_eof)
+
+  def test_eof_after_consume(self):
+    r = _make_reader(b"AB")
+    _ = asyncio.run(r.readexactly(2))
+    self.assertTrue(r.at_eof)
+
+
+class TestIMAPReaderStreamingFetchResponse(unittest.TestCase):
+  """Verify IMAPReader can stream a complete FETCH response with a literal body."""
+
+  def test_fetch_with_literal_body(self):
+    body = b"From: x\r\nSubject: hello\r\n\r\nThis is the body"
+    data = b"* 1 FETCH (UID 123 FLAGS (\\Seen) RFC822.SIZE %d BODY[] {%d}\r\n%s)\r\nA1 OK FETCH completed\r\n" % (len(body), len(body), body)
+    r = _make_reader(data)
+
+    self.assertEqual(asyncio.run(r.read_tag()), b"*")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_number()), 1)
+    asyncio.run(r.skip_sp())
+    kind = asyncio.run(r.read_atom())
+    self.assertEqual(kind, b"FETCH")
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"("))
+    asyncio.run(r.skip_wsp())
+    key = asyncio.run(r.read_token())
+    self.assertEqual(key, b"UID")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_number()), 123)
+    asyncio.run(r.skip_wsp())
+    key = asyncio.run(r.read_token())
+    self.assertEqual(key, b"FLAGS")
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"("))
+    flags = asyncio.run(r.read_until(b")"))
+    self.assertEqual(flags, b"\\Seen")
+    asyncio.run(r.skip_wsp())
+    key = asyncio.run(r.read_token())
+    self.assertEqual(key, b"RFC822.SIZE")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_number()), len(body))
+    asyncio.run(r.skip_wsp())
+    key = asyncio.run(r.read_token())
+    self.assertEqual(key, b"BODY[]")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_literal()), body)
+    asyncio.run(r.read_const(b")"))
+    asyncio.run(r.read_crlf())
+
+    tag = asyncio.run(r.read_atom())
+    self.assertEqual(tag, b"A1")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_atom()), b"OK")
+    _ = asyncio.run(r.read_text_line())
+
+
+class TestIMAPReaderListResponse(unittest.TestCase):
+  def test_list_with_quoted_name(self):
+    data = b'* LIST (\\HasNoChildren) "/" "INBOX"\r\n'
+    r = _make_reader(data)
+    self.assertEqual(asyncio.run(r.read_tag()), b"*")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_atom()), b"LIST")
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"("))
+    flags = asyncio.run(r.read_until(b")"))
+    self.assertEqual(flags, b"\\HasNoChildren")
+    asyncio.run(r.skip_sp())
+    delim = asyncio.run(r.read_quoted())
+    self.assertEqual(delim, b"/")
+    asyncio.run(r.skip_sp())
+    name = asyncio.run(r.read_quoted())
+    self.assertEqual(name, b"INBOX")
+    asyncio.run(r.read_crlf())
+
+  def test_list_with_literal_name(self):
+    name = b"folder with spaces"
+    data = b'* LIST (\\Noselect) NIL {%d}\r\n%s\r\n' % (len(name), name)
+    r = _make_reader(data)
+    self.assertEqual(asyncio.run(r.read_tag()), b"*")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_atom()), b"LIST")
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"("))
+    _ = asyncio.run(r.read_until(b")"))
+    asyncio.run(r.skip_sp())
+    delim = asyncio.run(r.read_nstring())
+    self.assertIsNone(delim)
+    asyncio.run(r.skip_sp())
+    result = asyncio.run(r.read_astring())
+    self.assertEqual(result, name)
+    asyncio.run(r.read_crlf())
+
+
+class TestIMAPReaderRespTextCode(unittest.TestCase):
+  """Verify resp-text-code parsing: [code] text after OK/NO/BAD/BYE.
+
+  Regression: read_until(b']') consumes ']', so no read_const(b']') after.
+  """
+
+  def test_resp_text_code_with_value(self):
+    data = b"A1 OK [UIDVALIDITY 123] done\r\n"
+    r = _make_reader(data)
+    tag = asyncio.run(r.read_atom())
+    self.assertEqual(tag, b"A1")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_atom()), b"OK")
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"["))
+    code = asyncio.run(r.read_until(b"]"))
+    self.assertEqual(code, b"UIDVALIDITY 123")
+    asyncio.run(r.skip_sp())
+    text = asyncio.run(r.read_text_line())
+    self.assertEqual(text, b"done")
+
+  def test_resp_text_code_uidnext(self):
+    data = b"A1 OK [UIDNEXT 456] completed\r\n"
+    r = _make_reader(data)
+    _ = asyncio.run(r.read_atom())
+    asyncio.run(r.skip_sp())
+    _ = asyncio.run(r.read_atom())
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"["))
+    code = asyncio.run(r.read_until(b"]"))
+    self.assertEqual(code, b"UIDNEXT 456")
+
+  def test_resp_text_code_readonly(self):
+    data = b"A1 OK [READ-ONLY] Select completed\r\n"
+    r = _make_reader(data)
+    _ = asyncio.run(r.read_atom())
+    asyncio.run(r.skip_sp())
+    _ = asyncio.run(r.read_atom())
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"["))
+    code = asyncio.run(r.read_until(b"]"))
+    self.assertEqual(code, b"READ-ONLY")
+    asyncio.run(r.skip_sp())
+    text = asyncio.run(r.read_text_line())
+    self.assertEqual(text, b"Select completed")
+
+  def test_no_resp_text_code(self):
+    data = b"A1 OK done\r\n"
+    r = _make_reader(data)
+    _ = asyncio.run(r.read_atom())
+    asyncio.run(r.skip_sp())
+    _ = asyncio.run(r.read_atom())
+    asyncio.run(r.skip_sp())
+    text = asyncio.run(r.read_text_line())
+    self.assertEqual(text, b"done")
+
+
+class TestIMAPReaderStatusResponse(unittest.TestCase):
+  """Verify STATUS response parsing: * STATUS mailbox (items).
+
+  Regression: read_until(b')') consumes ')', so no read_const(b')') after.
+  """
+
+  def test_status_quoted_mailbox(self):
+    data = b'* STATUS "INBOX" (MESSAGES 5 UNSEEN 2)\r\n'
+    r = _make_reader(data)
+    self.assertEqual(asyncio.run(r.read_tag()), b"*")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_atom()), b"STATUS")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_astring()), b"INBOX")
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"("))
+    items = asyncio.run(r.read_until(b")"))
+    asyncio.run(r.read_crlf())
+    self.assertEqual(items.strip(), b"MESSAGES 5 UNSEEN 2")
+
+  def test_status_literal_mailbox(self):
+    name = b"folder with spaces"
+    data = b'* STATUS {%d}\r\n%s (MESSAGES 0)\r\n' % (len(name), name)
+    r = _make_reader(data)
+    self.assertEqual(asyncio.run(r.read_tag()), b"*")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_atom()), b"STATUS")
+    asyncio.run(r.skip_sp())
+    self.assertEqual(asyncio.run(r.read_astring()), name)
+    asyncio.run(r.skip_sp())
+    asyncio.run(r.read_const(b"("))
+    items = asyncio.run(r.read_until(b")"))
+    asyncio.run(r.read_crlf())
+    self.assertEqual(items.strip(), b"MESSAGES 0")
+
+
+class TestIMAPReaderStoreCommand(unittest.TestCase):
+  """Verify STORE command parsing: UID STORE seq +FLAGS (flags).
+
+  Regression: read_until(b')') consumes ')', so no read_const(b')') after.
+  """
+
+  def test_store_add_flags(self):
+    data = b"1:5 +FLAGS (\\Seen \\Flagged)\r\n"
+    r = _make_reader(data)
+    self.assertEqual(asyncio.run(r.read_until(b" ")), b"1:5")
+    self.assertEqual(asyncio.run(r.read_until(b" ")), b"+FLAGS")
+    asyncio.run(r.read_const(b"("))
+    flags = asyncio.run(r.read_until(b")"))
+    asyncio.run(r.read_crlf())
+    self.assertEqual(flags.strip(), b"\\Seen \\Flagged")
+
+  def test_store_silent_flags(self):
+    data = b"3:3 -FLAGS.SILENT (\\Seen)\r\n"
+    r = _make_reader(data)
+    self.assertEqual(asyncio.run(r.read_until(b" ")), b"3:3")
+    self.assertEqual(asyncio.run(r.read_until(b" ")), b"-FLAGS.SILENT")
+    asyncio.run(r.read_const(b"("))
+    flags = asyncio.run(r.read_until(b")"))
+    asyncio.run(r.read_crlf())
+    self.assertEqual(flags.strip(), b"\\Seen")
   def test_bytes_with_flags(self):
     self.assertEqual(flags_to_s(b"\\Seen \\Flagged"), "\\Seen\\Flagged\\")
 
@@ -93,88 +566,6 @@ class TestParseSequenceSet(unittest.TestCase):
     self.assertEqual(parse_sequence_set(b" 1 , 2 ", 10), [1, 2])
 
 
-class TestSplitFetchItems(unittest.TestCase):
-  def test_simple(self):
-    self.assertEqual(split_fetch_items(b"UID 123 FLAGS (\\Seen)"), [b"UID", b"123", b"FLAGS", b"(\\Seen)"])
-
-  def test_brackets(self):
-    self.assertEqual(split_fetch_items(b"BODY[HEADER] {5}"), [b"BODY[HEADER]", b"{5}"])
-
-  def test_literal_with_spaces(self):
-    items = split_fetch_items(b'BODY[] {13}hello world!) UID 5')
-    self.assertEqual(items, [b"BODY[]", b"{13}hello world!)", b"UID", b"5"])
-
-  def test_literal_in_parens(self):
-    items = split_fetch_items(b"FLAGS (\\Seen) BODY[] {5}abcde UID 1")
-    self.assertEqual(items, [b"FLAGS", b"(\\Seen)", b"BODY[]", b"{5}abcde", b"UID", b"1"])
-
-  def test_quoted_string(self):
-    items = split_fetch_items(b'INTERNALDATE "01-Jan-2024 00:00:00 +0000" UID 1')
-    self.assertEqual(items, [b'INTERNALDATE', b'"01-Jan-2024 00:00:00 +0000"', b"UID", b"1"])
-
-  def test_empty(self):
-    self.assertEqual(split_fetch_items(b""), [])
-
-
-class TestParseFetchLine(unittest.TestCase):
-  def test_full_with_body(self):
-    line = b'* 1 FETCH (UID 123 FLAGS (\\Seen \\Flagged) INTERNALDATE "01-Jan-2024 12:00:00 +0000" RFC822.SIZE 567 BODY[] {11}hello world)'
-    result = parse_fetch_line(line)
-    self.assertIsNotNone(result)
-    self.assertEqual(result[b"UID"], 123)
-    self.assertEqual(result[b"FLAGS"], b"\\Seen \\Flagged")
-    self.assertEqual(result[b"INTERNALDATE"], b"01-Jan-2024 12:00:00 +0000")
-    self.assertEqual(result[b"RFC822.SIZE"], 567)
-    self.assertEqual(result[b"BODY[]"], b"hello world")
-
-  def test_without_body(self):
-    line = b"* 1 FETCH (UID 456 FLAGS (\\Seen) RFC822.SIZE 100)"
-    result = parse_fetch_line(line)
-    self.assertIsNotNone(result)
-    self.assertEqual(result[b"UID"], 456)
-    self.assertEqual(result[b"FLAGS"], b"\\Seen")
-    self.assertEqual(result[b"RFC822.SIZE"], 100)
-    self.assertNotIn(b"BODY[]", result)
-
-  def test_body_containing_fetch_like_content(self):
-    line = b"* 2 FETCH (UID 456 BODY[] {21}FLAGS (\\Seen) UID 999)"
-    result = parse_fetch_line(line)
-    self.assertIsNotNone(result)
-    self.assertEqual(result[b"UID"], 456)
-    self.assertEqual(result[b"BODY[]"], b"FLAGS (\\Seen) UID 999")
-
-  def test_no_match(self):
-    self.assertIsNone(parse_fetch_line(b"* 1 EXISTS"))
-
-  def test_empty_flags(self):
-    line = b"* 1 FETCH (UID 1 FLAGS () RFC822.SIZE 0)"
-    result = parse_fetch_line(line)
-    self.assertIsNotNone(result)
-    self.assertEqual(result[b"UID"], 1)
-    self.assertEqual(result[b"FLAGS"], b"")
-
-
-class TestTokenizeSearchCriteria(unittest.TestCase):
-  def test_simple(self):
-    self.assertEqual(tokenize_search_criteria(b"SUBJECT hello"), [b"SUBJECT", b"hello"])
-
-  def test_quoted(self):
-    self.assertEqual(tokenize_search_criteria(b'SUBJECT "hello world"'), [b"SUBJECT", b"hello world"])
-
-  def test_multiple(self):
-    self.assertEqual(tokenize_search_criteria(b"UNSEEN FROM x"), [b"UNSEEN", b"FROM", b"x"])
-
-  def test_escaped_quote(self):
-    tokens = tokenize_search_criteria(b'SUBJECT "hello \\"world\\""')
-    self.assertEqual(tokens, [b"SUBJECT", b'hello "world"'])
-
-  def test_extra_whitespace(self):
-    self.assertEqual(tokenize_search_criteria(b"  ALL  "), [b"ALL"])
-
-  def test_empty(self):
-    self.assertEqual(tokenize_search_criteria(b""), [])
-
-
 class TestSplitMessage(unittest.TestCase):
   def test_crlf(self):
     header = b"From: x\r\nSubject: y"
@@ -239,8 +630,9 @@ class TestFilterHeaders(unittest.TestCase):
 
 
 class TestSearchHelpers(unittest.TestCase):
+  @override
   def setUp(self):
-    self.data = b"From: sender@test\r\nSubject: Hello World\r\n\r\nThis is the body text"
+    self.data: bytes = b"From: sender@test\r\nSubject: Hello World\r\n\r\nThis is the body text"
 
   def test_header_contains(self):
     self.assertTrue(header_contains(self.data, "Subject", b"hello"))
@@ -259,7 +651,7 @@ class TestSearchHelpers(unittest.TestCase):
 class TestDates(unittest.TestCase):
   def test_parse_internal_date(self):
     ts = parse_internal_date(b"01-Jan-2024 12:00:00 +0000")
-    dt = __import__("datetime").datetime.fromtimestamp(ts, tz=__import__("datetime").timezone.utc)
+    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
     self.assertEqual(dt.year, 2024)
     self.assertEqual(dt.month, 1)
     self.assertEqual(dt.day, 1)
@@ -271,7 +663,7 @@ class TestDates(unittest.TestCase):
 
   def test_parse_search_date(self):
     ts = parse_search_date(b"01-Jan-2024")
-    dt = __import__("datetime").datetime.fromtimestamp(ts, tz=__import__("datetime").timezone.utc)
+    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
     self.assertEqual(dt.year, 2024)
     self.assertEqual(dt.month, 1)
     self.assertEqual(dt.day, 1)
@@ -306,4 +698,4 @@ class TestImapToQuotedString(unittest.TestCase):
 
 
 if __name__ == "__main__":
-  unittest.main()
+  _ = unittest.main()
