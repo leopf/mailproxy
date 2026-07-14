@@ -76,32 +76,34 @@ class IMAPRemoteConnection:
 
     if uid_next > last_synced + 1:
       self._start_command(b"UID FETCH %d:* (UID FLAGS INTERNALDATE RFC822.SIZE BODY[])" % (last_synced + 1,))
-      new_messages: list[tuple[int, int, int, str, int, bytes, str]] = []
-      async for resp in self._read_responses():
-        if resp.kind != b"FETCH": continue
-        items = resp.args[1]
-        if not _is_fetch_items(items): continue
-        uid = items.get(b"UID")
-        if not isinstance(uid, int): continue
-        uid_int = uid
-        if uid_int <= last_synced:
-          logging.debug("sync_mailbox: '%s' skipping uid %d (<= last_synced %d)", mailbox_name, uid_int, last_synced)
-          continue
-        flags = items.get(b"FLAGS", b"")
-        internal_date = items.get(b"INTERNALDATE", b"")
-        size = items.get(b"RFC822.SIZE", 0)
-        body = items.get(b"BODY[]", b"")
-        msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
-        received_date = parse_internal_date(internal_date) if isinstance(internal_date, bytes) and internal_date else int(datetime.datetime.now().timestamp())
-        new_messages.append((uid_int, mailbox_id, received_date, msg_flags_s, int(size) if isinstance(size, int) else 0, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int)))
-
-      if new_messages:
-        with db_open(self.config.db_path) as db:
-          for msg in new_messages:
-            db_message_add(db, *msg)
-          max_uid = max(m[0] for m in new_messages)
+      max_uid = 0
+      count = 0
+      with db_open(self.config.db_path) as db:
+        async for resp in self._read_responses():
+          if resp.kind != b"FETCH": continue
+          items = resp.args[1]
+          if not _is_fetch_items(items): continue
+          uid = items.get(b"UID")
+          if not isinstance(uid, int): continue
+          uid_int = uid
+          if uid_int <= last_synced:
+            logging.debug("sync_mailbox: '%s' skipping uid %d (<= last_synced %d)", mailbox_name, uid_int, last_synced)
+            continue
+          flags = items.get(b"FLAGS", b"")
+          internal_date = items.get(b"INTERNALDATE", b"")
+          size = items.get(b"RFC822.SIZE", 0)
+          body = items.get(b"BODY[]", b"")
+          msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
+          received_date = parse_internal_date(internal_date) if isinstance(internal_date, bytes) and internal_date else int(datetime.datetime.now().timestamp())
+          db_message_add(db, uid_int, mailbox_id, received_date, msg_flags_s, int(size) if isinstance(size, int) else 0, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int))
+          db.commit()
+          if uid_int > max_uid: max_uid = uid_int
+          count += 1
+        if count > 0:
           db_mailbox_update_sync(db, mailbox_id, last_synced_uid=max_uid)
-        logging.debug("sync_mailbox: '%s' fetched %d new messages (up to uid %d)", mailbox_name, len(new_messages), max_uid)
+          db.commit()
+      if count > 0:
+        logging.debug("sync_mailbox: '%s' fetched %d new messages (up to uid %d)", mailbox_name, count, max_uid)
       else:
         logging.debug("sync_mailbox: '%s' no new messages", mailbox_name)
 
@@ -148,10 +150,6 @@ class IMAPRemoteConnection:
         name_s = name_b.decode("utf-8")
         if db_mailbox_by_name(db, self.account.key, name_s) is None:
           _ = db_mailbox_add(db, self.account.key, name_s, 0, 1, flags_to_s(flags), delim.decode("ascii") if delim else "/")
-          added += 1
-      for vname in ("Virtual/All", "Virtual/Unseen", "Virtual/Flagged"):
-        if db_mailbox_by_name(db, self.account.key, vname) is None:
-          _ = db_mailbox_add(db, self.account.key, vname, 0, 1, "\\\\", "/", is_remote=False, is_virtual=True)
           added += 1
     logging.debug("sync_mailbox_list: %d remote mailboxes, %d new", len(remote_mailboxes), added)
 

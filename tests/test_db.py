@@ -3,7 +3,7 @@ from typing import override
 from mailproxy.db import db_open, db_account_add, db_mailbox_add, db_message_add, db_message_delete_by_uid, \
     db_message_delete_except, \
     db_message_list, db_message_get_by_uid, db_message_update_flags, db_message_count, db_messages_clear, \
-    db_messages_for_account, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_count_deleted, \
+    db_message_body_get, db_universe_messages, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_count_deleted, \
     db_mailbox_size, db_mailbox_max_uid, db_mailbox_delete, db_mailbox_list, db_mailbox_by_name, \
     db_mailbox_get_by_id, db_mailbox_rename, fetchone, iter_rows, row_field
 from mailproxy.model import Account, AuthenticationPLAIN, TLSMode
@@ -87,29 +87,13 @@ class TestMessageSoftDelete(unittest.TestCase):
     db_message_delete_by_uid(self.db, self.mailbox_id, 1)
     self.assertIsNone(db_message_get_by_uid(self.db, self.mailbox_id, 1))
 
-  def test_deleted_not_in_for_account(self):
+  def test_all_messages_includes_deleted(self):
     self._add_message(1)
     self._add_message(2)
     db_message_delete_by_uid(self.db, self.mailbox_id, 1)
-    msgs = db_messages_for_account(self.db, self.account.key)
-    self.assertEqual(len(msgs), 1)
-    self.assertEqual(msgs[0].uid, 2)
-
-  def test_for_account_flags_exclude_unseen(self):
-    self._add_message(1, "\\Seen\\")
-    self._add_message(2, "\\\\")
-    self._add_message(3, "\\Flagged\\")
-    msgs = db_messages_for_account(self.db, self.account.key, flags_exclude="\\Seen")
-    uids = sorted(m.uid for m in msgs)
-    self.assertEqual(uids, [2, 3])
-
-  def test_for_account_flags_filter_flagged(self):
-    self._add_message(1, "\\Seen\\")
-    self._add_message(2, "\\Flagged\\")
-    self._add_message(3, "\\Seen\\Flagged\\")
-    msgs = db_messages_for_account(self.db, self.account.key, flags_filter="\\Flagged")
-    uids = sorted(m.uid for m in msgs)
-    self.assertEqual(uids, [2, 3])
+    msgs = db_universe_messages(self.db, self.account.key)
+    self.assertEqual(len(msgs), 2)
+    self.assertEqual(sorted(m.uid for m in msgs), [1, 2])
 
   def test_max_uid_includes_deleted(self):
     self._add_message(1)
@@ -136,7 +120,7 @@ class TestMessageSoftDelete(unittest.TestCase):
     db_message_add(self.db, 1, self.mailbox_id, 1700000001, "\\Seen\\", 8, b"new data", "1")
     msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
     assert msg is not None
-    self.assertEqual(msg.data, b"new data")
+    self.assertEqual(db_message_body_get(self.db, msg.body_hash), b"new data")
 
   def test_update_flags_skips_client_expunged(self):
     self._add_message(1, "\\Seen\\")

@@ -1,9 +1,10 @@
-import asyncio, dataclasses, datetime, logging, ssl, importlib.resources
+import asyncio, dataclasses, datetime, logging, ssl, sqlite3, importlib.resources
 from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import db_mailbox_by_name, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_delete, \
     db_mailbox_list, db_mailbox_max_uid, db_mailbox_rename, db_mailbox_size, db_mailbox_uid_next, db_mailbox_uid_validity, db_mailbox_update_sync, \
-    db_message_add, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_messages_for_account, db_open
+    db_message_add, db_message_body_get, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_open, \
+    db_universe_count, db_universe_count_deleted, db_universe_count_unseen, db_universe_max_uid, db_universe_messages, db_universe_size
 from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
     filter_headers, flags_to_s, format_internal_date, header_contains, body_contains, text_contains, parse_search_date, \
@@ -27,6 +28,8 @@ _FETCH_ITEM_EXPANSION = {
 
 _REMOTE_SYSTEM_FLAGS = frozenset({"Seen", "Answered", "Flagged", "Deleted", "Draft", "Recent"})
 
+_UNIVERSE_MAILBOX = "Universe"
+
 class IMAPServerConnection:
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self._config: Config = config
@@ -36,10 +39,9 @@ class IMAPServerConnection:
     self._remote_connection: IMAPRemoteConnection | None = None
     self._mailbox: Mailbox | None = None
     self._mailbox_read_only: bool = False
-    self._virtual_messages: list[Message] | None = None
-    self._virtual_uid_map: dict[int, tuple[int, int]] | None = None
     self._capabilities: list[bytes] = [b"IMAP4rev1", b"AUTH=PLAIN", b"STARTTLS"]
     self._tls_active: bool = False
+    self._is_universe_mailbox: bool = False
 
   def _write_response(self, code: Literal[b"OK"] | Literal[b"NO"] | Literal[b"BAD"], message: bytes):
     assert self._last_tag is not None
@@ -63,8 +65,9 @@ class IMAPServerConnection:
   def _write_mailbox_update(self):
     if self._mailbox is None:
       return
-    if self._mailbox.is_virtual:
-      n_messages = len(self._virtual_messages) if self._virtual_messages is not None else 0
+    if self._is_universe_mailbox:
+      with db_open(self._config.db_path) as db:
+        n_messages = db_universe_count(db, self._mailbox.account_key)
     else:
       with db_open(self._config.db_path) as db:
         n_messages = db_mailbox_count_messages(db, self._mailbox.id)
@@ -91,11 +94,10 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     if self._mailbox is not None:
       mailbox = self._mailbox
-      remote = self._require_remote()
-      if mailbox.is_remote:
-        await remote.sync_mailbox(mailbox.name)
-      elif mailbox.is_virtual:
-        self._build_virtual_mailbox(remote.account.key, mailbox.name)
+      if not self._is_universe_mailbox:
+        remote = self._require_remote()
+        if mailbox.is_remote:
+          await remote.sync_mailbox(mailbox.name)
       self._write_mailbox_update()
     self._write_response(b"OK", b"NOOP completed")
 
@@ -175,7 +177,7 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     self._write_line(b"+ idling")
     tasks: list[asyncio.Task[None]] = []
-    if self._mailbox is not None:
+    if self._mailbox is not None and not self._is_universe_mailbox:
       mailbox = self._mailbox
       remote = self._require_remote()
       update_event = asyncio.Event()
@@ -209,27 +211,32 @@ class IMAPServerConnection:
 
     remote = self._require_remote()
     account = remote.account
-    with db_open(self._config.db_path) as db:
-      mailbox = self._mailbox if mailbox_name is None else db_mailbox_by_name(db, account.key, mailbox_name)
-      needs_sync = mailbox is not None and mailbox.is_remote
 
-    if needs_sync and mailbox is not None:
-      await remote.sync_mailbox(mailbox.name)
+    is_universe = mailbox_name == _UNIVERSE_MAILBOX or (mailbox_name is None and self._is_universe_mailbox)
+    if is_universe:
+      response: dict[bytes, int] = {}
+      with db_open(self._config.db_path) as db:
+        if b"UNSEEN" in attrs: response[b"UNSEEN"] = db_universe_count_unseen(db, account.key)
+        if b"DELETED" in attrs: response[b"DELETED"] = db_universe_count_deleted(db, account.key)
+        if b"SIZE" in attrs: response[b"SIZE"] = db_universe_size(db, account.key)
+      status_str = b" ".join(b"%s %d" % (k, v) for k, v in response.items())
+      self._write_line(b"* STATUS %s (%s)" % (imap_to_quoted_string(_UNIVERSE_MAILBOX.encode()), status_str))
+      self._write_response(b"OK", b"status completed")
+      return
 
     with db_open(self._config.db_path) as db:
       mailbox = self._mailbox if mailbox_name is None else db_mailbox_by_name(db, account.key, mailbox_name)
       if mailbox is None:
         return self._write_response(b"NO", b"invalid mailbox name")
 
-      response: dict[bytes, int] = {}
-      if b"MESSAGES" in attrs: response[b"MESSAGES"] = db_mailbox_count_messages(db, mailbox.id)
-      if b"UIDNEXT" in attrs: response[b"UIDNEXT"] = db_mailbox_uid_next(db, account.key, mailbox.id)
-      if b"UIDVALIDITY" in attrs: response[b"UIDVALIDITY"] = db_mailbox_uid_validity(db, account.key, mailbox.id)
-      if b"UNSEEN" in attrs: response[b"UNSEEN"] = db_mailbox_count_unseen(db, mailbox.id)
-      if b"DELETED" in attrs: response[b"DELETED"] = db_mailbox_count_deleted(db, mailbox.id)
-      if b"SIZE" in attrs: response[b"SIZE"] = db_mailbox_size(db, mailbox.id)
-
-      status_str = b" ".join(b"%s %d" % (k, v) for k, v in response.items())
+      mb_response: dict[bytes, int] = {}
+      if b"MESSAGES" in attrs: mb_response[b"MESSAGES"] = db_mailbox_count_messages(db, mailbox.id)
+      if b"UIDNEXT" in attrs: mb_response[b"UIDNEXT"] = db_mailbox_uid_next(db, account.key, mailbox.id)
+      if b"UIDVALIDITY" in attrs: mb_response[b"UIDVALIDITY"] = db_mailbox_uid_validity(db, account.key, mailbox.id)
+      if b"UNSEEN" in attrs: mb_response[b"UNSEEN"] = db_mailbox_count_unseen(db, mailbox.id)
+      if b"DELETED" in attrs: mb_response[b"DELETED"] = db_mailbox_count_deleted(db, mailbox.id)
+      if b"SIZE" in attrs: mb_response[b"SIZE"] = db_mailbox_size(db, mailbox.id)
+      status_str = b" ".join(b"%s %d" % (k, v) for k, v in mb_response.items())
       mailbox_name_s = imap_to_quoted_string(mailbox.name.encode())
       self._write_line(b"* STATUS %s (%s)" % (mailbox_name_s, status_str))
     self._write_response(b"OK", b"status completed")
@@ -241,55 +248,51 @@ class IMAPServerConnection:
     remote = self._require_remote()
     account = remote.account
 
-    with db_open(self._config.db_path) as db:
-      mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
-      needs_sync = mailbox is None or mailbox.is_remote
-      logging.debug("SELECT: '%s' mailbox_in_db=%s needs_sync=%s is_virtual=%s", mailbox_name, mailbox is not None, needs_sync, mailbox.is_virtual if mailbox else False)
+    if mailbox_name == _UNIVERSE_MAILBOX:
+      self._is_universe_mailbox = True
+      with db_open(self._config.db_path) as db:
+        n_messages = db_universe_count(db, account.key)
+        max_uid = db_universe_max_uid(db, account.key)
+      logging.debug("SELECT Universe: n_messages=%d max_uid=%d uid_next=%d", n_messages, max_uid, max_uid + 1)
+      mailbox = Mailbox(id=0, account_key=account.key, uid_next=max_uid + 1, uid_validity=1,
+        name=_UNIVERSE_MAILBOX, hierarchy_delimiter="/", flags_s="\\\\",
+        is_remote=False, last_synced_uid=0)
+    else:
+      self._is_universe_mailbox = False
+      with db_open(self._config.db_path) as db:
+        mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
+        needs_sync = mailbox is None or mailbox.is_remote
+        logging.debug("SELECT: '%s' mailbox_in_db=%s needs_sync=%s", mailbox_name, mailbox is not None, needs_sync)
 
-    if mailbox is not None and mailbox.is_virtual:
-      self._build_virtual_mailbox(account.key, mailbox.name)
+      if needs_sync and (mailbox is None or mailbox.is_remote):
+        await remote.sync_mailbox(mailbox_name)
 
-    if needs_sync and (mailbox is None or mailbox.is_remote):
-      await remote.sync_mailbox(mailbox_name)
-
-    with db_open(self._config.db_path) as db:
-      mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
+      with db_open(self._config.db_path) as db:
+        mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
       if mailbox is None:
         raise IMAPCommandFailedError("mailbox unknown")
 
-      if self._mailbox is not None:
-        self._write_line(b"* OK [CLOSED] Previous mailbox is now closed")
+    if self._mailbox is not None:
+      self._write_line(b"* OK [CLOSED] Previous mailbox is now closed")
 
-      self._write_line(b"* FLAGS (%s)" % (" ".join(mailbox.flags).encode("ascii"),))
-      if mailbox.is_virtual:
-        n_messages = len(self._virtual_messages) if self._virtual_messages is not None else 0
-      else:
+    self._write_line(b"* FLAGS (%s)" % (" ".join(mailbox.flags).encode("ascii"),))
+    if self._is_universe_mailbox:
+      with db_open(self._config.db_path) as db:
+        n_messages = db_universe_count(db, account.key)
+    else:
+      with db_open(self._config.db_path) as db:
         n_messages = db_mailbox_count_messages(db, mailbox.id)
-      self._write_line(b"* %d EXISTS" % (n_messages,))
-      self._write_mailbox_list_response(mailbox)
-      self._write_line(b"* OK [PERMANENTFLAGS (\\Deleted \\Seen \\Answered \\Flagged \\Draft \\*)]")
-      self._write_line(b"* OK [UIDNEXT %d]" % (mailbox.uid_next,))
-      self._write_line(b"* OK [UIDVALIDITY %d]" % (mailbox.uid_validity,))
-      self._mailbox = mailbox
-      self._mailbox_read_only = read_only
-      logging.debug("SELECT: '%s' selected, %d messages read_only=%s", mailbox.name, n_messages, read_only)
+    self._write_line(b"* %d EXISTS" % (n_messages,))
+    self._write_mailbox_list_response(mailbox)
+    self._write_line(b"* OK [PERMANENTFLAGS (\\Deleted \\Seen \\Answered \\Flagged \\Draft \\*)]")
+    self._write_line(b"* OK [UIDNEXT %d]" % (mailbox.uid_next,))
+    self._write_line(b"* OK [UIDVALIDITY %d]" % (mailbox.uid_validity,))
+    self._mailbox = mailbox
+    self._mailbox_read_only = True if self._is_universe_mailbox else read_only
+    logging.debug("SELECT: '%s' selected, %d messages read_only=%s", mailbox.name, n_messages, self._mailbox_read_only)
 
-    access = b"[READ-ONLY]" if read_only else b"[READ-WRITE]"
+    access = b"[READ-ONLY]" if self._mailbox_read_only else b"[READ-WRITE]"
     self._write_response(b"OK", access + b" SELECT completed")
-
-  def _build_virtual_mailbox(self, account_key: str, mailbox_name: str):
-    flags_filter: str | None = None
-    flags_exclude: str | None = None
-    if mailbox_name == "Virtual/Unseen":
-      flags_exclude = "\\Seen"
-    elif mailbox_name == "Virtual/Flagged":
-      flags_filter = "\\Flagged"
-    with db_open(self._config.db_path) as db:
-      messages = db_messages_for_account(db, account_key, flags_filter, flags_exclude)
-    self._virtual_messages = messages
-    self._virtual_uid_map = {}
-    for i, msg in enumerate(messages):
-      self._virtual_uid_map[i + 1] = (msg.mailbox_id, msg.uid)
 
   async def _command_list(self, is_lsub: bool = False):
     await self._reader.skip_sp()
@@ -319,6 +322,12 @@ class IMAPServerConnection:
           name_s = imap_to_quoted_string(mailbox.name.encode())
           self._write_line(b"* %s (%s) %s %s" % (tag, flags, hierarchy_delimiter_s, name_s))
 
+    universe_full_name = reference_name + _UNIVERSE_MAILBOX if reference_name else _UNIVERSE_MAILBOX
+    if list_match(universe_full_name, pattern):
+      hierarchy_delimiter_s = imap_to_quoted_string(b"/")
+      name_s = imap_to_quoted_string(_UNIVERSE_MAILBOX.encode())
+      self._write_line(b"* %s () %s %s" % (tag, hierarchy_delimiter_s, name_s))
+
     self._write_response(b"OK", b"%s completed" % (tag,))
 
   async def _command_examine(self):
@@ -326,7 +335,7 @@ class IMAPServerConnection:
 
   async def _command_close(self):
     mailbox = self._mailbox
-    if mailbox is not None and not self._mailbox_read_only and not mailbox.is_virtual:
+    if mailbox is not None and not self._mailbox_read_only and not self._is_universe_mailbox:
       remote = self._require_remote()
       with db_open(self._config.db_path) as db:
         deleted = [m.uid for m in db_message_list(db, mailbox.id) if "\\Deleted" in m.flags_s]
@@ -337,8 +346,7 @@ class IMAPServerConnection:
           db_message_delete_by_uid(db, mailbox.id, uid)
     self._mailbox = None
     self._mailbox_read_only = False
-    self._virtual_messages = None
-    self._virtual_uid_map = None
+    self._is_universe_mailbox = False
     self._write_response(b"OK", b"CLOSE completed")
 
   def _match_messages(self, seq_set_s: bytes, uid_mode: bool, messages: list[Message]) -> list[tuple[int, Message]]:
@@ -388,10 +396,13 @@ class IMAPServerConnection:
 
     logging.debug("FETCH: seq_set=%s items=%s uid_mode=%s", seq_set_s.decode(), [i.decode(errors="replace") for i in items], uid_mode)
 
-    if mailbox.is_virtual:
-      messages = self._virtual_messages if self._virtual_messages is not None else []
-    else:
-      with db_open(self._config.db_path) as db:
+    with db_open(self._config.db_path) as db:
+      if self._is_universe_mailbox:
+        messages = db_universe_messages(db, mailbox.account_key)
+        messages = [dataclasses.replace(m, flags_s=flags_set_to_s(
+          flags_s_to_set(m.flags_s) - {"Deleted", "Recent"}
+        )) for m in messages]
+      else:
         messages = list(db_message_list(db, mailbox.id))
 
     if not messages:
@@ -404,84 +415,89 @@ class IMAPServerConnection:
 
     seen_uids_to_update: list[tuple[int, int]] = []
 
-    for seq, msg in matching:
-      parts: list[bytes] = []
-      body_data: bytes | None = None
-      body_tag = b"BODY[]"
-      should_set_seen = False
+    with db_open(self._config.db_path) as body_db:
+      for seq, msg in matching:
+        parts: list[bytes] = []
+        response_body: bytes | None = None
+        body_tag = b"BODY[]"
+        should_set_seen = False
 
-      for item in items:
-        item_u = item.upper()
-        if item_u == b"UID": parts.append(b"UID %d" % (msg.uid,))
-        elif item_u == b"FLAGS": parts.append(b"FLAGS (%s)" % (flags_to_b(msg.flags_s),))
-        elif item_u == b"INTERNALDATE": parts.append(b"INTERNALDATE \"%s\"" % (format_internal_date(msg.received_date),))
-        elif item_u == b"RFC822.SIZE": parts.append(b"RFC822.SIZE %d" % (msg.size,))
-        elif item_u in (b"BODY[]", b"RFC822"):
-          data = msg.data
-          body_data = data
-          body_tag = b"BODY[]"
-          parts.append(b"%s {%d}" % (body_tag, len(data),))
-          should_set_seen = True
-        elif item_u == b"BODY.PEEK[]":
-          data = msg.data
-          body_data = data
-          body_tag = b"BODY[]"
-          parts.append(b"%s {%d}" % (body_tag, len(data),))
-        elif item_u in (b"BODY[HEADER]", b"BODY.PEEK[HEADER]", b"RFC822.HEADER"):
-          header, _ = split_message(msg.data)
-          body_data = header
-          body_tag = b"BODY[HEADER]"
-          parts.append(b"%s {%d}" % (body_tag, len(header),))
-        elif item_u in (b"BODY[TEXT]", b"BODY.PEEK[TEXT]", b"RFC822.TEXT"):
-          _, text = split_message(msg.data)
-          body_data = text
-          body_tag = b"BODY[TEXT]"
-          parts.append(b"%s {%d}" % (body_tag, len(text),))
-          if not item_u.startswith(b"BODY.PEEK"):
-            should_set_seen = True
-        elif item_u.startswith(b"BODY") or item_u.startswith(b"RFC822"):
-          is_peek = item_u.startswith(b"BODY.PEEK")
-          if b"HEADER.FIELDS" in item_u:
-            field_list = self._parse_header_fields(item)
-            header, _ = split_message(msg.data)
-            filtered = filter_headers(msg.data, field_list)
-            body_data = filtered
-            body_tag = b"BODY[HEADER.FIELDS (%s)]" % (b" ".join(field_list),) if not is_peek else b"BODY[HEADER.FIELDS (%s)]" % (b" ".join(field_list),)
-            parts.append(b"%s {%d}" % (body_tag, len(filtered),))
-          elif b"HEADER" in item_u:
-            header, _ = split_message(msg.data)
-            body_data = header
-            body_tag = item.replace(b"PEEK", b"") if is_peek else item
-            parts.append(b"%s {%d}" % (body_tag, len(header),))
-          elif b"TEXT" in item_u:
-            _, text = split_message(msg.data)
-            body_data = text
-            body_tag = item.replace(b"PEEK", b"") if is_peek else item
-            parts.append(b"%s {%d}" % (body_tag, len(text),))
-            if not is_peek:
-              should_set_seen = True
-          else:
-            data = msg.data
-            body_data = data
-            body_tag = item.replace(b"PEEK", b"") if is_peek else item
+        for item in items:
+          item_u = item.upper()
+          if item_u == b"UID": parts.append(b"UID %d" % (msg.uid,))
+          elif item_u == b"FLAGS": parts.append(b"FLAGS (%s)" % (flags_to_b(msg.flags_s),))
+          elif item_u == b"INTERNALDATE": parts.append(b"INTERNALDATE \"%s\"" % (format_internal_date(msg.received_date),))
+          elif item_u == b"RFC822.SIZE": parts.append(b"RFC822.SIZE %d" % (msg.size,))
+          elif item_u in (b"BODY[]", b"RFC822"):
+            data = db_message_body_get(body_db, msg.body_hash) or b""
+            response_body = data
+            body_tag = b"BODY[]"
             parts.append(b"%s {%d}" % (body_tag, len(data),))
-            if not is_peek:
+            should_set_seen = True
+          elif item_u == b"BODY.PEEK[]":
+            data = db_message_body_get(body_db, msg.body_hash) or b""
+            response_body = data
+            body_tag = b"BODY[]"
+            parts.append(b"%s {%d}" % (body_tag, len(data),))
+          elif item_u in (b"BODY[HEADER]", b"BODY.PEEK[HEADER]", b"RFC822.HEADER"):
+            raw = db_message_body_get(body_db, msg.body_hash) or b""
+            header, _ = split_message(raw)
+            response_body = header
+            body_tag = b"BODY[HEADER]"
+            parts.append(b"%s {%d}" % (body_tag, len(header),))
+          elif item_u in (b"BODY[TEXT]", b"BODY.PEEK[TEXT]", b"RFC822.TEXT"):
+            raw = db_message_body_get(body_db, msg.body_hash) or b""
+            _, text = split_message(raw)
+            response_body = text
+            body_tag = b"BODY[TEXT]"
+            parts.append(b"%s {%d}" % (body_tag, len(text),))
+            if not item_u.startswith(b"BODY.PEEK"):
               should_set_seen = True
-        elif item_u in (b"BODYSTRUCTURE", b"BODY"):
-          parts.append(b"BODYSTRUCTURE NIL")
+          elif item_u.startswith(b"BODY") or item_u.startswith(b"RFC822"):
+            is_peek = item_u.startswith(b"BODY.PEEK")
+            if b"HEADER.FIELDS" in item_u:
+              field_list = self._parse_header_fields(item)
+              raw = db_message_body_get(body_db, msg.body_hash) or b""
+              filtered = filter_headers(raw, field_list)
+              response_body = filtered
+              body_tag = b"BODY[HEADER.FIELDS (%s)]" % (b" ".join(field_list),) if not is_peek else b"BODY[HEADER.FIELDS (%s)]" % (b" ".join(field_list),)
+              parts.append(b"%s {%d}" % (body_tag, len(filtered),))
+            elif b"HEADER" in item_u:
+              raw = db_message_body_get(body_db, msg.body_hash) or b""
+              header, _ = split_message(raw)
+              response_body = header
+              body_tag = item.replace(b"PEEK", b"") if is_peek else item
+              parts.append(b"%s {%d}" % (body_tag, len(header),))
+            elif b"TEXT" in item_u:
+              raw = db_message_body_get(body_db, msg.body_hash) or b""
+              _, text = split_message(raw)
+              response_body = text
+              body_tag = item.replace(b"PEEK", b"") if is_peek else item
+              parts.append(b"%s {%d}" % (body_tag, len(text),))
+              if not is_peek:
+                should_set_seen = True
+            else:
+              data = db_message_body_get(body_db, msg.body_hash) or b""
+              response_body = data
+              body_tag = item.replace(b"PEEK", b"") if is_peek else item
+              parts.append(b"%s {%d}" % (body_tag, len(data),))
+              if not is_peek:
+                should_set_seen = True
+          elif item_u in (b"BODYSTRUCTURE", b"BODY"):
+            parts.append(b"BODYSTRUCTURE NIL")
 
-      if should_set_seen and "\\Seen" not in msg.flags_s:
-        new_flags = msg.flags_s.rstrip("\\") + "\\Seen\\" if msg.flags_s != "\\\\" else "\\Seen\\"
-        msg = dataclasses.replace(msg, flags_s=new_flags)
-        seen_uids_to_update.append((msg.mailbox_id, msg.uid))
+        if should_set_seen and not self._is_universe_mailbox and "\\Seen" not in msg.flags_s:
+          new_flags = msg.flags_s.rstrip("\\") + "\\Seen\\" if msg.flags_s != "\\\\" else "\\Seen\\"
+          msg = dataclasses.replace(msg, flags_s=new_flags)
+          seen_uids_to_update.append((msg.mailbox_id, msg.uid))
 
-      items_str = b" ".join(parts)
-      if body_data is not None:
-        self._writer.write(b"* %d FETCH (%s\r\n" % (seq, items_str))
-        self._writer.write(body_data)
-        self._writer.write(b")\r\n")
-      else:
-        self._write_line(b"* %d FETCH (%s)" % (seq, items_str))
+        items_str = b" ".join(parts)
+        if response_body is not None:
+          self._writer.write(b"* %d FETCH (%s\r\n" % (seq, items_str))
+          self._writer.write(response_body)
+          self._writer.write(b")\r\n")
+        else:
+          self._write_line(b"* %d FETCH (%s)" % (seq, items_str))
 
     if seen_uids_to_update:
       remote = self._require_remote()
@@ -527,23 +543,27 @@ class IMAPServerConnection:
     if tokens:
       tokens[0] = tokens[0].upper()
 
-    if mailbox.is_virtual:
-      messages = self._virtual_messages if self._virtual_messages is not None else []
-    else:
-      with db_open(self._config.db_path) as db:
+    with db_open(self._config.db_path) as db:
+      if self._is_universe_mailbox:
+        messages = db_universe_messages(db, mailbox.account_key)
+        messages = [dataclasses.replace(m, flags_s=flags_set_to_s(
+          flags_s_to_set(m.flags_s) - {"Deleted", "Recent"}
+        )) for m in messages]
+      else:
         messages = list(db_message_list(db, mailbox.id))
 
     results: list[int] = []
 
-    for i, msg in enumerate(messages):
-      matched = self._evaluate_search_criteria(tokens, msg, messages)
-      if matched:
-        results.append(msg.uid if uid_mode else i + 1)
+    with db_open(self._config.db_path) as search_db:
+      for i, msg in enumerate(messages):
+        matched = self._evaluate_search_criteria(tokens, msg, messages, search_db)
+        if matched:
+          results.append(msg.uid if uid_mode else i + 1)
 
     self._write_line(b"* SEARCH %s" % (b" ".join(b"%d" % (r,) for r in results),))
     self._write_response(b"OK", b"SEARCH completed")
 
-  def _evaluate_search_criteria(self, tokens: list[bytes], msg: Message, all_messages: list[Message]) -> bool:
+  def _evaluate_search_criteria(self, tokens: list[bytes], msg: Message, all_messages: list[Message], db: sqlite3.Connection) -> bool:
     j = 0
     matched = True
     while j < len(tokens):
@@ -564,16 +584,20 @@ class IMAPServerConnection:
         j += 1
       elif c in (b"SUBJECT", b"FROM", b"TO", b"CC", b"BCC") and j + 1 < len(tokens):
         j += 1
-        matched = matched and header_contains(msg.data, c.decode("ascii"), tokens[j])
+        data = db_message_body_get(db, msg.body_hash) or b""
+        matched = matched and header_contains(data, c.decode("ascii"), tokens[j])
       elif c == b"HEADER" and j + 2 < len(tokens):
         j += 2
-        matched = matched and header_contains(msg.data, tokens[j-1].decode("ascii"), tokens[j])
+        data = db_message_body_get(db, msg.body_hash) or b""
+        matched = matched and header_contains(data, tokens[j-1].decode("ascii"), tokens[j])
       elif c == b"BODY" and j + 1 < len(tokens):
         j += 1
-        matched = matched and body_contains(msg.data, tokens[j])
+        data = db_message_body_get(db, msg.body_hash) or b""
+        matched = matched and body_contains(data, tokens[j])
       elif c == b"TEXT" and j + 1 < len(tokens):
         j += 1
-        matched = matched and text_contains(msg.data, tokens[j])
+        data = db_message_body_get(db, msg.body_hash) or b""
+        matched = matched and text_contains(data, tokens[j])
       elif c in (b"SINCE", b"BEFORE", b"ON") and j + 1 < len(tokens):
         j += 1
         try:
@@ -599,11 +623,11 @@ class IMAPServerConnection:
       elif c == b"NOT" and j + 1 < len(tokens):
         j += 1
         sub_tokens = [tokens[j]]
-        matched = matched and not self._evaluate_search_criteria(sub_tokens, msg, all_messages)
+        matched = matched and not self._evaluate_search_criteria(sub_tokens, msg, all_messages, db)
       elif c == b"OR" and j + 2 < len(tokens):
         j += 2
-        left = self._evaluate_search_criteria([tokens[j-1]], msg, all_messages)
-        right = self._evaluate_search_criteria([tokens[j]], msg, all_messages)
+        left = self._evaluate_search_criteria([tokens[j-1]], msg, all_messages, db)
+        right = self._evaluate_search_criteria([tokens[j]], msg, all_messages, db)
         matched = matched and (left or right)
       else:
         matched = False
@@ -620,6 +644,8 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
+    if self._is_universe_mailbox:
+      return self._write_response(b"NO", b"universe mailbox is read-only")
     remote = self._require_remote()
 
     new_flags = set(f.decode("ascii").lstrip("\\") for f in flags_s_raw.strip().split(b" ") if f)
@@ -632,11 +658,8 @@ class IMAPServerConnection:
 
     logging.debug("STORE: seq_set=%s op=%s flags=%s uid_mode=%s remote_flags=%s", seq_set_s.decode(), op_s.decode(), sorted(new_flags), uid_mode, remote_flags_s)
 
-    if mailbox.is_virtual:
-      messages = self._virtual_messages if self._virtual_messages is not None else []
-    else:
-      with db_open(self._config.db_path) as db:
-        messages = list(db_message_list(db, mailbox.id))
+    with db_open(self._config.db_path) as db:
+      messages = list(db_message_list(db, mailbox.id))
     matching = self._match_messages(seq_set_s, uid_mode, messages)
 
     for seq, msg in matching:
@@ -690,6 +713,8 @@ class IMAPServerConnection:
     data = await self._reader.readexactly(n)
     await self._reader.read_crlf()
 
+    if mailbox_name == _UNIVERSE_MAILBOX:
+      return self._write_response(b"NO", b"universe mailbox is read-only")
     remote = self._require_remote()
     account = remote.account
     logging.debug("APPEND: mailbox=%s flags=%s size=%d", mailbox_name, flags_s, len(data))
@@ -711,6 +736,8 @@ class IMAPServerConnection:
     await self._reader.skip_sp()
     mailbox_name = (await self._reader.read_astring()).decode()
     await self._reader.read_crlf()
+    if mailbox_name == _UNIVERSE_MAILBOX:
+      return self._write_response(b"NO", b"cannot create universe mailbox")
     remote = self._require_remote()
     try:
       await remote.create_mailbox(mailbox_name)
@@ -728,9 +755,11 @@ class IMAPServerConnection:
     with db_open(self._config.db_path) as db:
       mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
     if mailbox is None:
+      if mailbox_name == _UNIVERSE_MAILBOX:
+        return self._write_response(b"NO", b"cannot delete universe mailbox")
       return self._write_response(b"NO", b"mailbox not found")
-    if mailbox.is_virtual:
-      return self._write_response(b"NO", b"cannot delete virtual mailbox")
+    if not mailbox.is_remote:
+      return self._write_response(b"NO", b"cannot delete local mailbox via IMAP, use CLI")
     if mailbox.is_remote:
       await remote.delete_mailbox(mailbox_name)
     with db_open(self._config.db_path) as db:
@@ -748,7 +777,11 @@ class IMAPServerConnection:
     with db_open(self._config.db_path) as db:
       mailbox = db_mailbox_by_name(db, account.key, old_name)
     if mailbox is None:
+      if old_name == _UNIVERSE_MAILBOX:
+        return self._write_response(b"NO", b"cannot rename universe mailbox")
       return self._write_response(b"NO", b"mailbox not found")
+    if not mailbox.is_remote:
+      return self._write_response(b"NO", b"cannot rename local mailbox via IMAP, use CLI")
     if mailbox.is_remote:
       await remote.rename_mailbox(old_name, new_name)
     with db_open(self._config.db_path) as db:
@@ -761,13 +794,12 @@ class IMAPServerConnection:
     dest_name = (await self._reader.read_astring()).decode()
     await self._reader.read_crlf()
     mailbox = self._require_mailbox()
+    if self._is_universe_mailbox or dest_name == _UNIVERSE_MAILBOX:
+      return self._write_response(b"NO", b"universe mailbox is read-only")
     remote = self._require_remote()
 
-    if mailbox.is_virtual:
-      messages = self._virtual_messages if self._virtual_messages is not None else []
-    else:
-      with db_open(self._config.db_path) as db:
-        messages = list(db_message_list(db, mailbox.id))
+    with db_open(self._config.db_path) as db:
+      messages = list(db_message_list(db, mailbox.id))
     matching = self._match_messages(seq_set_s, uid_mode, messages)
 
     if matching and mailbox.is_remote:
@@ -786,25 +818,18 @@ class IMAPServerConnection:
       await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
+    if self._is_universe_mailbox:
+      return self._write_response(b"NO", b"universe mailbox is read-only")
     remote = self._require_remote()
 
-    if mailbox.is_virtual:
-      messages = self._virtual_messages if self._virtual_messages is not None else []
+    with db_open(self._config.db_path) as db:
+      all_msgs = list(db_message_list(db, mailbox.id))
       if uid_mode:
-        max_uid = max(m.uid for m in messages) if messages else 0
+        max_uid = db_mailbox_max_uid(db, mailbox.id)
         uids = set(parse_sequence_set(seq_set_s.strip(), max_uid))
-        deleted = [(i + 1, m) for i, m in enumerate(messages) if "\\Deleted" in m.flags_s and m.uid in uids]
+        deleted = [(i + 1, m) for i, m in enumerate(all_msgs) if "\\Deleted" in m.flags_s and m.uid in uids]
       else:
-        deleted = [(i + 1, m) for i, m in enumerate(messages) if "\\Deleted" in m.flags_s]
-    else:
-      with db_open(self._config.db_path) as db:
-        all_msgs = list(db_message_list(db, mailbox.id))
-        if uid_mode:
-          max_uid = db_mailbox_max_uid(db, mailbox.id)
-          uids = set(parse_sequence_set(seq_set_s.strip(), max_uid))
-          deleted = [(i + 1, m) for i, m in enumerate(all_msgs) if "\\Deleted" in m.flags_s and m.uid in uids]
-        else:
-          deleted = [(i + 1, m) for i, m in enumerate(all_msgs) if "\\Deleted" in m.flags_s]
+        deleted = [(i + 1, m) for i, m in enumerate(all_msgs) if "\\Deleted" in m.flags_s]
 
     deleted.sort(key=lambda x: x[0])
 

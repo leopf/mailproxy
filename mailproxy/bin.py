@@ -1,7 +1,7 @@
 import functools, asyncio, logging, argparse, pathlib, os, dataclasses, webbrowser, urllib.parse, http.server, ssl, importlib.resources, typing
 from typing import TypeVar
 from mailproxy.config import config_from_dict, provider_config_from_dict
-from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_open
+from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_mailbox_add, db_mailbox_by_name, db_mailbox_delete, db_mailbox_list, db_mailbox_rename, db_open
 from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_frontend import handle_imap
 from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
@@ -164,6 +164,55 @@ def exec_account_remove(config: Config, address: str):
     db_account_remove(db, account.key)
   print(f"removed account '{account.key}'")
 
+def exec_mailbox_add(config: Config, address: str, name: str):
+  with db_open(config.db_path) as db:
+    account = db_account_get_by_address(db, address)
+    if account is None:
+      raise RuntimeError(f"no account for address '{address}'")
+    if db_mailbox_by_name(db, account.key, name) is not None:
+      raise RuntimeError(f"mailbox '{name}' already exists for account '{account.key}'")
+    _ = db_mailbox_add(db, account.key, name, 0, 1, is_remote=False)
+  print(f"added local mailbox '{name}' for account '{account.key}'")
+
+def exec_mailbox_list(config: Config, address: str):
+  with db_open(config.db_path) as db:
+    account = db_account_get_by_address(db, address)
+    if account is None:
+      raise RuntimeError(f"no account for address '{address}'")
+    mailboxes = list(db_mailbox_list(db, account.key))
+  if not mailboxes:
+    print("no mailboxes")
+    return
+  for mb in mailboxes:
+    kind = "remote" if mb.is_remote else "local"
+    print(f"{mb.name}\t{kind}")
+
+def exec_mailbox_remove(config: Config, address: str, name: str):
+  with db_open(config.db_path) as db:
+    account = db_account_get_by_address(db, address)
+    if account is None:
+      raise RuntimeError(f"no account for address '{address}'")
+    mailbox = db_mailbox_by_name(db, account.key, name)
+    if mailbox is None:
+      raise RuntimeError(f"no mailbox '{name}' for account '{account.key}'")
+    if mailbox.is_remote:
+      raise RuntimeError(f"mailbox '{name}' is a remote mailbox, remove via IMAP DELETE")
+    db_mailbox_delete(db, mailbox.id)
+  print(f"removed local mailbox '{name}'")
+
+def exec_mailbox_rename(config: Config, address: str, old_name: str, new_name: str):
+  with db_open(config.db_path) as db:
+    account = db_account_get_by_address(db, address)
+    if account is None:
+      raise RuntimeError(f"no account for address '{address}'")
+    mailbox = db_mailbox_by_name(db, account.key, old_name)
+    if mailbox is None:
+      raise RuntimeError(f"no mailbox '{old_name}' for account '{account.key}'")
+    if mailbox.is_remote:
+      raise RuntimeError(f"mailbox '{old_name}' is a remote mailbox, rename via IMAP RENAME")
+    db_mailbox_rename(db, mailbox.id, new_name)
+  print(f"renamed local mailbox '{old_name}' to '{new_name}'")
+
 def exec_get_access_token(config: Config, address: str):
   with db_open(config.db_path) as db:
     account = db_account_get_by_address(db, address)
@@ -259,6 +308,29 @@ def main():
   _ = account_remove_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
   _ = account_remove_parser.add_argument("--address", "-A", help="email address", required=True)
 
+  mailbox_parser = subparsers.add_parser("mailbox")
+  mailbox_sub = mailbox_parser.add_subparsers(dest="mailbox_command", required=True)
+
+  mailbox_add_parser = mailbox_sub.add_parser("add")
+  _ = mailbox_add_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
+  _ = mailbox_add_parser.add_argument("--address", "-A", help="email address", required=True)
+  _ = mailbox_add_parser.add_argument("--name", "-N", help="mailbox name", required=True)
+
+  mailbox_list_parser = mailbox_sub.add_parser("list")
+  _ = mailbox_list_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
+  _ = mailbox_list_parser.add_argument("--address", "-A", help="email address", required=True)
+
+  mailbox_remove_parser = mailbox_sub.add_parser("remove")
+  _ = mailbox_remove_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
+  _ = mailbox_remove_parser.add_argument("--address", "-A", help="email address", required=True)
+  _ = mailbox_remove_parser.add_argument("--name", "-N", help="mailbox name", required=True)
+
+  mailbox_rename_parser = mailbox_sub.add_parser("rename")
+  _ = mailbox_rename_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
+  _ = mailbox_rename_parser.add_argument("--address", "-A", help="email address", required=True)
+  _ = mailbox_rename_parser.add_argument("--old-name", help="old mailbox name", required=True)
+  _ = mailbox_rename_parser.add_argument("--new-name", help="new mailbox name", required=True)
+
   login_parser = subparsers.add_parser("login")
   _add_provider_config_args(login_parser)
 
@@ -291,9 +363,20 @@ def main():
       exec_account_list(config)
     elif account_command == "remove":
       exec_account_remove(config, _ns_get(args, "address", str))
+  elif command == "mailbox":
+    config = _load_config(_ns_get(args, "config", pathlib.Path))
+    mailbox_command = _ns_get(args, "mailbox_command", str)
+    if mailbox_command == "add":
+      exec_mailbox_add(config, _ns_get(args, "address", str), _ns_get(args, "name", str))
+    elif mailbox_command == "list":
+      exec_mailbox_list(config, _ns_get(args, "address", str))
+    elif mailbox_command == "remove":
+      exec_mailbox_remove(config, _ns_get(args, "address", str), _ns_get(args, "name", str))
+    elif mailbox_command == "rename":
+      exec_mailbox_rename(config, _ns_get(args, "address", str), _ns_get(args, "old_name", str), _ns_get(args, "new_name", str))
   elif command == "login":
     logging.basicConfig(level=logging.INFO)
-    provider = _load_oauth_config(_ns_optional(args, "preset", str), _ns_optional(args, "oauth_config", pathlib.Path))
+    provider = _load_oauth_config(_ns_optional(args, "preset", str), _ns_optional(args, "provider_config", pathlib.Path))
     exec_login(provider)
   elif command == "get-access-token":
     config = _load_config(_ns_get(args, "config", pathlib.Path))

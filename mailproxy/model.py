@@ -59,7 +59,6 @@ class Mailbox:
   name: str
   hierarchy_delimiter: str
   flags_s: str
-  is_virtual: bool
   is_remote: bool
   last_synced_uid: int
   is_deleted: bool = False
@@ -75,7 +74,7 @@ class Message:
   received_date: int
   flags_s: str
   size: int
-  data: bytes
+  body_hash: str
   remote_uid: str | None
   is_deleted: bool = False
 
