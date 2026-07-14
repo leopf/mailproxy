@@ -4,7 +4,7 @@ requires = ["setuptools"]
 
 [project]
 name = "mailproxy"
-version = "0.4.0"
+version = "0.1.0"
 authors = [{ name = "leopf" }]
 description = "An IMAP and SMTP proxy to get back control of your E-Mails."
 readme = { file = "README.md", content-type = "text/markdown" }
