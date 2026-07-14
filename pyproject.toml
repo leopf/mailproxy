@@ -41,7 +41,7 @@ include = [
 ]
 
 [tool.setuptools.package-data]
-"mailproxy" = ["py.typed", "assets/*"]
+"mailproxy" = ["py.typed", "assets/*", "presets/*"]
 
 [tool.basedpyright]
 reportUninitializedInstanceVariable = false
