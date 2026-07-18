@@ -8,8 +8,8 @@ class IMAPReadError(Exception):
 def imap_to_quoted_string(value: bytes) -> bytes:
   return b"\"%s\"" % (value.replace(b"\"", b"\\\""),)
 
-def list_match(name: str, pattern: str) -> bool:
-  regex = "".join(".*" if c == "*" else "[^/]*" if c == "%" else re.escape(c) for c in pattern)
+def list_match(name: str, pattern: str, delimiter: str = "/") -> bool:
+  regex = "".join(".*" if c == "*" else f"[^{re.escape(delimiter)}]*" if c == "%" else re.escape(c) for c in pattern)
   return re.fullmatch(regex, name) is not None
 
 def flags_to_s(flags: bytes | list[bytes]) -> str:
@@ -20,11 +20,24 @@ def flags_to_s(flags: bytes | list[bytes]) -> str:
   normalized = [f.decode("ascii").lstrip("\\") for f in parts if f.strip()]
   return "\\" + "\\".join(normalized) + "\\" if normalized else "\\\\"
 
-def parse_internal_date(date_s: bytes) -> int:
-  dt = datetime.datetime.strptime(date_s.decode("ascii"), "%d-%b-%Y %H:%M:%S %z")
-  return int(dt.timestamp())
-
 _MONTHS = (b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec")
+_MONTH_INDEX = {m: i + 1 for i, m in enumerate(_MONTHS)}
+
+def parse_internal_date(date_s: bytes) -> int:
+  s = date_s.decode("ascii")
+  date_part, time_part, tz_part = s.split(" ")
+  day_s, month_s, year_s = date_part.split("-")
+  day = int(day_s)
+  month = _MONTH_INDEX[month_s.encode("ascii")]
+  year = int(year_s)
+  time_parts = time_part.split(":")
+  hour, minute, second = int(time_parts[0]), int(time_parts[1]), int(time_parts[2])
+  tz_sign = 1 if tz_part[0] == "+" else -1
+  tz_hours = int(tz_part[1:3])
+  tz_minutes = int(tz_part[3:5]) if len(tz_part) >= 5 else 0
+  tz_offset = datetime.timezone(datetime.timedelta(hours=tz_hours, minutes=tz_minutes) * tz_sign)
+  dt = datetime.datetime(year, month, day, hour, minute, second, tzinfo=tz_offset)
+  return int(dt.timestamp())
 
 def format_internal_date(ts: int) -> bytes:
   dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
@@ -120,8 +133,12 @@ def text_contains(data: bytes, needle: bytes) -> bool:
   return needle.lower() in header.lower() or needle.lower() in body.lower()
 
 def parse_search_date(date_s: bytes) -> int:
-  dt = datetime.datetime.strptime(date_s.decode("ascii"), "%d-%b-%Y")
-  return int(dt.replace(tzinfo=datetime.timezone.utc).timestamp())
+  parts = date_s.decode("ascii").split("-")
+  day = int(parts[0])
+  month = _MONTH_INDEX[parts[1].encode("ascii")]
+  year = int(parts[2])
+  dt = datetime.datetime(year, month, day, tzinfo=datetime.timezone.utc)
+  return int(dt.timestamp())
 
 class IMAPCommandFailedError(Exception):
   pass

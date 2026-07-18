@@ -132,7 +132,7 @@ class TestMessageSoftDelete(unittest.TestCase):
   def test_update_flags_restores_remote_deleted(self):
     self._add_message(1, "\\Seen\\")
     _ = db_message_delete_except(self.db, self.mailbox_id, set(), 1)
-    db_message_update_flags(self.db, self.mailbox_id, 1, "\\Flagged\\")
+    db_message_update_flags(self.db, self.mailbox_id, 1, "\\Flagged\\", restore=True)
     msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
     assert msg is not None
     self.assertEqual(msg.flags_s, "\\Flagged\\")

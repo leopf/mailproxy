@@ -90,10 +90,10 @@ async def exec_run(config: Config):
     raise RuntimeError("MAILPROXY_PASSWORD env var must be set to run the proxy")
 
   async with asyncio.TaskGroup() as tg:
-    smtp_server = await asyncio.start_server(functools.partial(smtp_server_handle_client, config), config.host, config.smtp_port)
+    smtp_server = await asyncio.start_server(functools.partial(smtp_server_handle_client, config), config.host, config.smtp_port, limit=2**24)
     _ = tg.create_task(smtp_server.serve_forever(), name="SMTP server")
 
-    imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.imap_port)
+    imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.imap_port, limit=2**24)
     _ = tg.create_task(imap_server.serve_forever(), name="IMAP server")
 
 async def exec_dev(config: Config, address: str, _token: str):
@@ -210,6 +210,8 @@ def exec_mailbox_rename(config: Config, address: str, old_name: str, new_name: s
       raise RuntimeError(f"no mailbox '{old_name}' for account '{account.key}'")
     if mailbox.is_remote:
       raise RuntimeError(f"mailbox '{old_name}' is a remote mailbox, rename via IMAP RENAME")
+    if db_mailbox_by_name(db, account.key, new_name) is not None:
+      raise RuntimeError(f"mailbox '{new_name}' already exists for account '{account.key}'")
     db_mailbox_rename(db, mailbox.id, new_name)
   print(f"renamed local mailbox '{old_name}' to '{new_name}'")
 

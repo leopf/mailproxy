@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
 from mailproxy.db import db_message_add, db_message_delete_except, db_message_update_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
-from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, imap_to_quoted_string, parse_internal_date
+from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, format_internal_date, imap_to_quoted_string, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
 from mailproxy.utils import encode_7bit_mailbox_name
 
@@ -30,7 +30,7 @@ class ImapResponse:
   args: list[object]
 
 class IMAPRemoteConnection:
-  _tls_context: ssl.SSLContext = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+  _tls_context: ssl.SSLContext = ssl.create_default_context()
 
   def __init__(self, config: Config, account: Account, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     self.account: Account = account
@@ -126,7 +126,7 @@ class IMAPRemoteConnection:
       with db_open(self.config.db_path) as db:
         if flag_updates:
           for uid, f_s in flag_updates:
-            db_message_update_flags(db, mailbox_id, uid, f_s)
+            db_message_update_flags(db, mailbox_id, uid, f_s, restore=True)
           logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, len(flag_updates))
         deleted_count = db_message_delete_except(db, mailbox_id, seen_uids, last_synced)
         if deleted_count > 0:
@@ -160,7 +160,7 @@ class IMAPRemoteConnection:
 
   async def uid_append(self, mailbox_name: str, flags_s: str, internal_date: int | None, data: bytes):
     flags_b = b"" if flags_s == "\\" else b" (" + b" ".join(b"\\" + f.encode("ascii") for f in flags_s.strip("\\").split("\\") if f) + b")"
-    date_b = b" \"" + datetime.datetime.fromtimestamp(internal_date, tz=datetime.timezone.utc).strftime("%d-%b-%Y %H:%M:%S %z").encode("ascii") + b"\"" if internal_date is not None else b""
+    date_b = b" \"" + format_internal_date(internal_date) + b"\"" if internal_date is not None else b""
     self._start_command(b"APPEND %s%s%s {%d}" % (self._encode_mailbox(mailbox_name), flags_b, date_b, len(data)))
     if await self._imap.peek(1) != b"+":
       await self._read_until_response()

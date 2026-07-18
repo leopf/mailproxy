@@ -1,7 +1,14 @@
-import asyncio, base64, contextlib, logging, pathlib, ssl
+import asyncio, base64, contextlib, logging, pathlib, re, ssl
 from mailproxy.auth import account_get_oauth_access_token
 from mailproxy.db import db_open
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, TLSMode
+
+
+def _dot_stuff(data: bytes) -> bytes:
+  """Apply SMTP transparency: prefix every line starting with '.' with an extra '.'."""
+  normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+  stuffed = re.sub(rb"(?m)^\.", b"..", normalized)
+  return stuffed.replace(b"\n", b"\r\n")
 
 async def _smtp_read_response(reader: asyncio.StreamReader) -> tuple[int, str]:
   lines: list[str] = []
@@ -45,7 +52,9 @@ async def smtp_forward_mail(db_path: pathlib.Path, account: Account, sender: str
   logging.debug("SMTP backend: connecting to %s:%d (tls=%s)", account.smtp_host, account.smtp_port, account.smtp_tlsmode)
   reader, writer = await asyncio.open_connection(account.smtp_host, account.smtp_port, ssl=ssl_param)
   try:
-    _ = await _smtp_read_response(reader)
+    greeting_code, _ = await _smtp_read_response(reader)
+    if greeting_code != 220:
+      raise RuntimeError(f"SMTP server greeting unexpected: {greeting_code}")
     ehlo_domain = account.addresses[0].split("@")[-1] if "@" in account.addresses[0] else "localhost"
     _ = await _smtp_send(writer, reader, f"EHLO {ehlo_domain}")
     if account.smtp_tlsmode == TLSMode.STARTTLS:
@@ -57,7 +66,7 @@ async def smtp_forward_mail(db_path: pathlib.Path, account: Account, sender: str
     for rcp in recipients:
       _ = await _smtp_send(writer, reader, f"RCPT TO:<{rcp}>", expect_code=250)
     _ = await _smtp_send(writer, reader, "DATA", expect_code=354)
-    writer.write(mail_data + b"\r\n.\r\n")
+    writer.write(_dot_stuff(mail_data) + b"\r\n.\r\n")
     await writer.drain()
     _ = await _smtp_read_response(reader)
   finally:

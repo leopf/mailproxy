@@ -304,6 +304,19 @@ def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_d
     "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
     (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid))
 
+def db_message_copy(db: sqlite3.Connection, src_mailbox_id: int, uid: int, dest_mailbox_id: int) -> int:
+  row = fetchone_required(db, "SELECT received_date, flags_s, size, body_hash FROM messages WHERE mailbox_id=? AND uid=? AND is_deleted=0", (src_mailbox_id, uid))
+  received_date = row_field(row, "received_date", int)
+  flags_s = row_field(row, "flags_s", str)
+  size = row_field(row, "size", int)
+  body_hash = row_field(row, "body_hash", str)
+  new_uid = db_mailbox_max_uid(db, dest_mailbox_id) + 1
+  _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid) VALUES (?,?,?,?,?,?,?) " +
+    "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
+    (new_uid, dest_mailbox_id, received_date, flags_s, size, body_hash, None))
+  db_mailbox_update_sync(db, dest_mailbox_id, uid_next=new_uid + 1, last_synced_uid=new_uid)
+  return new_uid
+
 def _message_from_row(row: sqlite3.Row) -> Message:
   return Message(
     uid=row_field(row, "uid", int),
@@ -329,8 +342,11 @@ def db_mailbox_max_uid(db: sqlite3.Connection, mailbox_id: int) -> int:
   value = row_optional(row, "MAX(uid)", int)
   return value if value is not None else 0
 
-def db_message_update_flags(db: sqlite3.Connection, mailbox_id: int, uid: int, flags_s: str):
-  _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=? AND remote_uid IS NOT NULL", (flags_s, mailbox_id, uid))
+def db_message_update_flags(db: sqlite3.Connection, mailbox_id: int, uid: int, flags_s: str, restore: bool = False):
+  if restore:
+    _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=?", (flags_s, mailbox_id, uid))
+  else:
+    _ = db.execute("UPDATE messages SET flags_s=? WHERE mailbox_id=? AND uid=? AND is_deleted=0", (flags_s, mailbox_id, uid))
 
 def db_message_delete_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int):
   _ = db.execute("UPDATE messages SET is_deleted=1, remote_uid=NULL WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
@@ -370,10 +386,10 @@ def db_universe_count(db: sqlite3.Connection, account_key: str) -> int:
   return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "COUNT(*)", int)
 
 def db_universe_count_unseen(db: sqlite3.Connection, account_key: str) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s NOT LIKE '%Seen%'", (account_key,)), "COUNT(*)", int)
+  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s NOT LIKE '%\\Seen\\%'", (account_key,)), "COUNT(*)", int)
 
 def db_universe_count_deleted(db: sqlite3.Connection, account_key: str) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s LIKE '%Deleted%'", (account_key,)), "COUNT(*)", int)
+  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s LIKE '%\\Deleted\\%'", (account_key,)), "COUNT(*)", int)
 
 def db_universe_size(db: sqlite3.Connection, account_key: str) -> int:
   return row_field(fetchone_required(db, "SELECT COALESCE(SUM(messages.size), 0) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "COALESCE(SUM(messages.size), 0)", int)

@@ -34,13 +34,16 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
           return
         case "HELO":
           logging.debug("HELO connected from domain: " + rest)
+          sender = ""
+          recipients.clear()
           reply(250, config.domain)
         case "EHLO":
           logging.debug("EHLO connected from domain: " + rest)
+          sender = ""
+          recipients.clear()
           write_line(f"250-{config.domain} hello")
-          features = "AUTH PLAIN"
-          if not tls_active: features += " STARTTLS"
-          write_line(f"250 {features}")
+          if not tls_active: write_line("250-STARTTLS")
+          write_line("250 AUTH PLAIN")
         case "NOOP":
           reply(250, "OK")
         case "RSET":
@@ -84,7 +87,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
             data_line = await reader.readuntil(b"\r\n")
             if data_line == b".\r\n":
               break
-            if data_line.startswith(b".."):
+            if data_line.startswith(b"."):
               mail_buf.extend(data_line[1:])
             else:
               mail_buf.extend(data_line)
@@ -98,6 +101,8 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
           finally:
             sender = ""
             recipients.clear()
+        case "MAIL" | "RCPT" | "DATA" if account is None:
+          reply(530, "5.7.0  Authentication required")
         case "VRFY":
           reply(252, "cannot VRFY")
         case "STARTTLS" if not tls_active:
@@ -107,6 +112,8 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
             ctx.load_cert_chain(cert_path, key_path)
           await writer.start_tls(ctx)
           tls_active = True
+          sender = ""
+          recipients.clear()
           logging.debug("SMTP STARTTLS: TLS upgrade complete")
         case "STARTTLS":
           reply(503, "TLS already active")

@@ -1,9 +1,9 @@
-import asyncio, dataclasses, datetime, logging, ssl, sqlite3, importlib.resources
+import asyncio, dataclasses, datetime, logging, re, ssl, sqlite3, importlib.resources
 from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import db_mailbox_by_name, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_delete, \
     db_mailbox_list, db_mailbox_max_uid, db_mailbox_rename, db_mailbox_size, db_mailbox_uid_next, db_mailbox_uid_validity, db_mailbox_update_sync, \
-    db_message_add, db_message_body_get, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_open, \
+    db_message_add, db_message_body_get, db_message_copy, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_open, \
     db_universe_count, db_universe_count_deleted, db_universe_count_unseen, db_universe_max_uid, db_universe_messages, db_universe_size
 from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
@@ -19,6 +19,8 @@ _SEARCH_FLAGS = {
   b"DRAFT": b"\\Draft", b"UNDRAFT": b"\\Draft",
   b"RECENT": b"\\Recent", b"OLD": b"\\Recent",
 }
+
+_SEARCH_NEGATE_RE = re.compile(rb"^(UN|OLD)")
 
 _FETCH_ITEM_EXPANSION = {
   b"ALL": (b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE"),
@@ -39,7 +41,7 @@ class IMAPServerConnection:
     self._remote_connection: IMAPRemoteConnection | None = None
     self._mailbox: Mailbox | None = None
     self._mailbox_read_only: bool = False
-    self._capabilities: list[bytes] = [b"IMAP4rev1", b"AUTH=PLAIN", b"STARTTLS"]
+    self._capabilities: list[bytes] = [b"IMAP4rev1", b"AUTH=PLAIN", b"STARTTLS", b"ENABLE", b"IDLE"]
     self._tls_active: bool = False
     self._is_universe_mailbox: bool = False
 
@@ -121,6 +123,13 @@ class IMAPServerConnection:
     await self._writer.start_tls(ctx)
     self._tls_active = True
     self._capabilities = [c for c in self._capabilities if c != b"STARTTLS"]
+    self._mailbox = None
+    self._mailbox_read_only = False
+    self._is_universe_mailbox = False
+    if self._remote_connection is not None:
+      try: await asyncio.wait_for(self._remote_connection.shutdown(), 1)
+      except Exception: pass
+      self._remote_connection = None
     logging.debug("STARTTLS: TLS upgrade complete")
 
   async def _command_logout(self):
@@ -216,6 +225,9 @@ class IMAPServerConnection:
     if is_universe:
       response: dict[bytes, int] = {}
       with db_open(self._config.db_path) as db:
+        if b"MESSAGES" in attrs: response[b"MESSAGES"] = db_universe_count(db, account.key)
+        if b"UIDNEXT" in attrs: response[b"UIDNEXT"] = db_universe_max_uid(db, account.key) + 1
+        if b"UIDVALIDITY" in attrs: response[b"UIDVALIDITY"] = 1
         if b"UNSEEN" in attrs: response[b"UNSEEN"] = db_universe_count_unseen(db, account.key)
         if b"DELETED" in attrs: response[b"DELETED"] = db_universe_count_deleted(db, account.key)
         if b"SIZE" in attrs: response[b"SIZE"] = db_universe_size(db, account.key)
@@ -316,7 +328,7 @@ class IMAPServerConnection:
     with db_open(self._config.db_path) as db:
       for mailbox in db_mailbox_list(db, remote.account.key):
         full_name = reference_name + mailbox.name if reference_name else mailbox.name
-        if list_match(full_name, pattern):
+        if list_match(full_name, pattern, mailbox.hierarchy_delimiter):
           flags = " ".join(mailbox.flags).encode("ascii")
           hierarchy_delimiter_s = imap_to_quoted_string(mailbox.hierarchy_delimiter.encode("ascii"))
           name_s = imap_to_quoted_string(mailbox.name.encode())
@@ -413,44 +425,34 @@ class IMAPServerConnection:
     matching = self._match_messages(seq_set_s, uid_mode, messages)
     logging.debug("FETCH: %d messages, %d matched", len(messages), len(matching))
 
-    seen_uids_to_update: list[tuple[int, int]] = []
+    seen_uids_to_update: list[tuple[int, int, str]] = []
 
     with db_open(self._config.db_path) as body_db:
       for seq, msg in matching:
-        parts: list[bytes] = []
-        response_body: bytes | None = None
-        body_tag = b"BODY[]"
+        chunks: list[tuple[bytes, bytes | None]] = []
         should_set_seen = False
 
         for item in items:
           item_u = item.upper()
-          if item_u == b"UID": parts.append(b"UID %d" % (msg.uid,))
-          elif item_u == b"FLAGS": parts.append(b"FLAGS (%s)" % (flags_to_b(msg.flags_s),))
-          elif item_u == b"INTERNALDATE": parts.append(b"INTERNALDATE \"%s\"" % (format_internal_date(msg.received_date),))
-          elif item_u == b"RFC822.SIZE": parts.append(b"RFC822.SIZE %d" % (msg.size,))
+          if item_u == b"UID": chunks.append((b"UID %d" % (msg.uid,), None))
+          elif item_u == b"FLAGS": chunks.append((b"FLAGS (%s)" % (flags_to_b(msg.flags_s),), None))
+          elif item_u == b"INTERNALDATE": chunks.append((b"INTERNALDATE \"%s\"" % (format_internal_date(msg.received_date),), None))
+          elif item_u == b"RFC822.SIZE": chunks.append((b"RFC822.SIZE %d" % (msg.size,), None))
           elif item_u in (b"BODY[]", b"RFC822"):
             data = db_message_body_get(body_db, msg.body_hash) or b""
-            response_body = data
-            body_tag = b"BODY[]"
-            parts.append(b"%s {%d}" % (body_tag, len(data),))
+            chunks.append((b"BODY[] {%d}" % (len(data),), data))
             should_set_seen = True
           elif item_u == b"BODY.PEEK[]":
             data = db_message_body_get(body_db, msg.body_hash) or b""
-            response_body = data
-            body_tag = b"BODY[]"
-            parts.append(b"%s {%d}" % (body_tag, len(data),))
+            chunks.append((b"BODY[] {%d}" % (len(data),), data))
           elif item_u in (b"BODY[HEADER]", b"BODY.PEEK[HEADER]", b"RFC822.HEADER"):
             raw = db_message_body_get(body_db, msg.body_hash) or b""
             header, _ = split_message(raw)
-            response_body = header
-            body_tag = b"BODY[HEADER]"
-            parts.append(b"%s {%d}" % (body_tag, len(header),))
+            chunks.append((b"BODY[HEADER] {%d}" % (len(header),), header))
           elif item_u in (b"BODY[TEXT]", b"BODY.PEEK[TEXT]", b"RFC822.TEXT"):
             raw = db_message_body_get(body_db, msg.body_hash) or b""
             _, text = split_message(raw)
-            response_body = text
-            body_tag = b"BODY[TEXT]"
-            parts.append(b"%s {%d}" % (body_tag, len(text),))
+            chunks.append((b"BODY[TEXT] {%d}" % (len(text),), text))
             if not item_u.startswith(b"BODY.PEEK"):
               should_set_seen = True
           elif item_u.startswith(b"BODY") or item_u.startswith(b"RFC822"):
@@ -459,53 +461,53 @@ class IMAPServerConnection:
               field_list = self._parse_header_fields(item)
               raw = db_message_body_get(body_db, msg.body_hash) or b""
               filtered = filter_headers(raw, field_list)
-              response_body = filtered
-              body_tag = b"BODY[HEADER.FIELDS (%s)]" % (b" ".join(field_list),) if not is_peek else b"BODY[HEADER.FIELDS (%s)]" % (b" ".join(field_list),)
-              parts.append(b"%s {%d}" % (body_tag, len(filtered),))
+              tag = b"BODY[HEADER.FIELDS (%s)]" % (b" ".join(field_list),)
+              chunks.append((b"%s {%d}" % (tag, len(filtered),), filtered))
             elif b"HEADER" in item_u:
               raw = db_message_body_get(body_db, msg.body_hash) or b""
               header, _ = split_message(raw)
-              response_body = header
-              body_tag = item.replace(b"PEEK", b"") if is_peek else item
-              parts.append(b"%s {%d}" % (body_tag, len(header),))
+              tag = item.replace(b"PEEK", b"") if is_peek else item
+              chunks.append((b"%s {%d}" % (tag, len(header),), header))
             elif b"TEXT" in item_u:
               raw = db_message_body_get(body_db, msg.body_hash) or b""
               _, text = split_message(raw)
-              response_body = text
-              body_tag = item.replace(b"PEEK", b"") if is_peek else item
-              parts.append(b"%s {%d}" % (body_tag, len(text),))
+              tag = item.replace(b"PEEK", b"") if is_peek else item
+              chunks.append((b"%s {%d}" % (tag, len(text),), text))
               if not is_peek:
                 should_set_seen = True
             else:
               data = db_message_body_get(body_db, msg.body_hash) or b""
-              response_body = data
-              body_tag = item.replace(b"PEEK", b"") if is_peek else item
-              parts.append(b"%s {%d}" % (body_tag, len(data),))
+              tag = item.replace(b"PEEK", b"") if is_peek else item
+              chunks.append((b"%s {%d}" % (tag, len(data),), data))
               if not is_peek:
                 should_set_seen = True
           elif item_u in (b"BODYSTRUCTURE", b"BODY"):
-            parts.append(b"BODYSTRUCTURE NIL")
+            chunks.append((b"BODYSTRUCTURE NIL", None))
 
         if should_set_seen and not self._is_universe_mailbox and "\\Seen" not in msg.flags_s:
           new_flags = msg.flags_s.rstrip("\\") + "\\Seen\\" if msg.flags_s != "\\\\" else "\\Seen\\"
           msg = dataclasses.replace(msg, flags_s=new_flags)
-          seen_uids_to_update.append((msg.mailbox_id, msg.uid))
+          seen_uids_to_update.append((msg.mailbox_id, msg.uid, new_flags))
 
-        items_str = b" ".join(parts)
-        if response_body is not None:
-          self._writer.write(b"* %d FETCH (%s\r\n" % (seq, items_str))
-          self._writer.write(response_body)
-          self._writer.write(b")\r\n")
-        else:
-          self._write_line(b"* %d FETCH (%s)" % (seq, items_str))
+        self._writer.write(b"* %d FETCH (" % (seq,))
+        first = True
+        for header, body in chunks:
+          if not first:
+            self._writer.write(b" ")
+          first = False
+          self._writer.write(header)
+          if body is not None:
+            self._writer.write(b"\r\n")
+            self._writer.write(body)
+        self._writer.write(b")\r\n")
 
     if seen_uids_to_update:
       remote = self._require_remote()
       with db_open(self._config.db_path) as db:
-        for mb_id, uid in seen_uids_to_update:
-          db_message_update_flags(db, mb_id, uid, "\\Seen\\")
+        for mb_id, uid, new_flags in seen_uids_to_update:
+          db_message_update_flags(db, mb_id, uid, new_flags)
       if mailbox.is_remote:
-        for _, uid in seen_uids_to_update:
+        for _, uid, _ in seen_uids_to_update:
           await remote.uid_store(uid, b"+FLAGS", "\\Seen\\")
 
     self._write_response(b"OK", b"FETCH completed")
@@ -563,6 +565,21 @@ class IMAPServerConnection:
     self._write_line(b"* SEARCH %s" % (b" ".join(b"%d" % (r,) for r in results),))
     self._write_response(b"OK", b"SEARCH completed")
 
+  def _search_key_arity(self, key: bytes) -> int:
+    """Return the number of tokens (including the key itself) consumed by a search key."""
+    if key in (b"ALL", b"ANSWERED", b"DELETED", b"DRAFT", b"FLAGGED", b"NEW", b"OLD",
+               b"RECENT", b"SEEN", b"UNANSWERED", b"UNDELETED", b"UNDRAFT", b"UNFLAGGED",
+               b"UNSEEN"):
+      return 1
+    if key in (b"BCC", b"BODY", b"CC", b"FROM", b"SUBJECT", b"TEXT", b"TO",
+               b"HEADER", b"LARGER", b"SMALLER", b"UID",
+               b"BEFORE", b"ON", b"SINCE",
+               b"SENTBEFORE", b"SENTON", b"SENTSINCE"):
+      if key == b"HEADER":
+        return 3
+      return 2
+    return 1
+
   def _evaluate_search_criteria(self, tokens: list[bytes], msg: Message, all_messages: list[Message], db: sqlite3.Connection) -> bool:
     j = 0
     matched = True
@@ -571,9 +588,9 @@ class IMAPServerConnection:
       if c in _SEARCH_FLAGS:
         flag = _SEARCH_FLAGS[c].decode("ascii")
         present = flag in msg.flags_s
-        matched = matched and (not present if c.startswith(b"UN") else present)
+        matched = matched and (not present if _SEARCH_NEGATE_RE.match(c) else present)
       elif c == b"NEW":
-        matched = matched and "\\Recent" not in msg.flags_s and "\\Seen" not in msg.flags_s
+        matched = matched and "\\Recent" in msg.flags_s and "\\Seen" not in msg.flags_s
       elif c == b"ALL":
         pass
       elif c == b"UID" and j + 1 < len(tokens):
@@ -621,14 +638,35 @@ class IMAPServerConnection:
         try: matched = matched and msg.size < int(tokens[j])
         except ValueError: matched = False
       elif c == b"NOT" and j + 1 < len(tokens):
-        j += 1
-        sub_tokens = [tokens[j]]
-        matched = matched and not self._evaluate_search_criteria(sub_tokens, msg, all_messages, db)
+        sub_key = tokens[j + 1].upper()
+        arity = self._search_key_arity(sub_key)
+        if j + arity + 1 > len(tokens):
+          matched = False
+        else:
+          sub_tokens = tokens[j + 1:j + arity + 1]
+          sub_matched = self._evaluate_search_criteria(sub_tokens, msg, all_messages, db)
+          matched = matched and not sub_matched
+          j += arity
       elif c == b"OR" and j + 2 < len(tokens):
-        j += 2
-        left = self._evaluate_search_criteria([tokens[j-1]], msg, all_messages, db)
-        right = self._evaluate_search_criteria([tokens[j]], msg, all_messages, db)
-        matched = matched and (left or right)
+        left_key = tokens[j + 1].upper()
+        left_arity = self._search_key_arity(left_key)
+        if j + 1 + left_arity >= len(tokens):
+          matched = False
+          j += 1
+        else:
+          right_start = j + 1 + left_arity
+          right_key = tokens[right_start].upper()
+          right_arity = self._search_key_arity(right_key)
+          if right_start + right_arity > len(tokens):
+            matched = False
+            j = right_start
+          else:
+            left_tokens = tokens[j + 1:right_start]
+            right_tokens = tokens[right_start:right_start + right_arity]
+            left_matched = self._evaluate_search_criteria(left_tokens, msg, all_messages, db)
+            right_matched = self._evaluate_search_criteria(right_tokens, msg, all_messages, db)
+            matched = matched and (left_matched or right_matched)
+            j = right_start + right_arity - 1
       else:
         matched = False
       j += 1
@@ -776,6 +814,8 @@ class IMAPServerConnection:
     account = remote.account
     with db_open(self._config.db_path) as db:
       mailbox = db_mailbox_by_name(db, account.key, old_name)
+      if mailbox is not None and db_mailbox_by_name(db, account.key, new_name) is not None:
+        return self._write_response(b"NO", b"mailbox already exists")
     if mailbox is None:
       if old_name == _UNIVERSE_MAILBOX:
         return self._write_response(b"NO", b"cannot rename universe mailbox")
@@ -797,16 +837,31 @@ class IMAPServerConnection:
     if self._is_universe_mailbox or dest_name == _UNIVERSE_MAILBOX:
       return self._write_response(b"NO", b"universe mailbox is read-only")
     remote = self._require_remote()
+    account = remote.account
 
     with db_open(self._config.db_path) as db:
       messages = list(db_message_list(db, mailbox.id))
+      dest_mailbox = db_mailbox_by_name(db, account.key, dest_name)
+
+    if dest_mailbox is None:
+      return self._write_response(b"NO", b"destination mailbox does not exist")
+
     matching = self._match_messages(seq_set_s, uid_mode, messages)
 
-    if matching and mailbox.is_remote:
+    if mailbox.is_remote and dest_mailbox.is_remote:
+      await remote.uid_copy([msg.uid for _, msg in matching], dest_name)
+      await remote.sync_mailbox(dest_name)
+    else:
       with db_open(self._config.db_path) as db:
-        dest_mailbox = db_mailbox_by_name(db, remote.account.key, dest_name)
-      if dest_mailbox is None or dest_mailbox.is_remote:
-        await remote.uid_copy([msg.uid for _, msg in matching], dest_name)
+        for _, msg in matching:
+          db_message_copy(db, mailbox.id, msg.uid, dest_mailbox.id)
+      if dest_mailbox.is_remote:
+        with db_open(self._config.db_path) as db:
+          msg_bodies = [(msg, db_message_body_get(db, msg.body_hash) or b"") for _, msg in matching]
+        for msg, data in msg_bodies:
+          await remote.uid_append(dest_name, msg.flags_s, msg.received_date, data)
+        await remote.sync_mailbox(dest_name)
+
     self._write_response(b"OK", b"COPY completed")
 
   async def _command_expunge(self, uid_mode: bool):
