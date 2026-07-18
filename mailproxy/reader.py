@@ -1,4 +1,4 @@
-import asyncio
+import asyncio, re
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
@@ -10,6 +10,65 @@ class ReadError(Exception):
 class _StreamReaderLike(Protocol):
   async def read(self, n: int) -> bytes: ...
   def at_eof(self) -> bool: ...
+
+
+def _literal_prefix(pattern: bytes) -> tuple[bytes, bool]:
+  ci = pattern.startswith(b"(?i)")
+  i = 4 if ci else 0
+  prefix = bytearray()
+  while i < len(pattern):
+    c = pattern[i]
+    if c in b"[]().*+?{|^\\":
+      break
+    prefix.append(c)
+    i += 1
+  return bytes(prefix), ci
+
+
+def _partial_prefixes(pattern: bytes) -> list[bytes]:
+  prefixes: list[bytes] = []
+  depth = 0
+  i = 0
+  if pattern.startswith(b"(?i)"):
+    i = 4
+  while i < len(pattern):
+    c = pattern[i]
+    if c == ord(b'(') and i + 1 < len(pattern) and pattern[i + 1] == ord(b'?'):
+      i = pattern.index(b')', i) + 1
+    elif c == ord(b'['):
+      i = pattern.index(b']', i) + 1
+    elif c == ord(b'('):
+      depth += 1
+      i += 1
+    elif c == ord(b')'):
+      depth -= 1
+      i += 1
+      if depth == 0:
+        prefixes.append(pattern[:i])
+    elif c in b"*+?" and depth == 0:
+      i += 1
+      prefixes.append(pattern[:i])
+    else:
+      i += 1
+  return prefixes
+
+
+def _is_prefix(data: bytes, lit: bytes, ci: bool) -> bool:
+  if len(data) > len(lit):
+    return False
+  if ci:
+    return lit[:len(data)].lower() == data.lower()
+  return lit[:len(data)] == data
+
+
+def _is_partial_match(data: bytes, lit_prefix: bytes, ci: bool, partial_compiled: list[re.Pattern[bytes]]) -> bool:
+  if lit_prefix and _is_prefix(data, lit_prefix, ci):
+    return True
+  for pc in partial_compiled:
+    pm = pc.match(data)
+    if pm is not None and pm.end() == len(data):
+      return True
+  return False
 
 
 class ScopedReader:
@@ -101,31 +160,41 @@ class ScopedReader:
       raise ReadError(f"expected {expected!r}, got {result!r}")
     return result
 
-  async def skip_sp(self) -> None:
-    try:
-      c = await self.readexactly(1)
-    except asyncio.IncompleteReadError as e:
-      raise ReadError(f"expected SP, got {bytes(e.partial)!r}") from e
-    if c != b" ":
-      raise ReadError(f"expected SP, got {c!r}")
-
-  async def skip_wsp(self) -> None:
+  async def read_re(self, pattern: bytes) -> re.Match[bytes]:
+    compiled = re.compile(pattern)
+    lit_prefix, ci = _literal_prefix(pattern)
+    partial_compiled = [re.compile(p) for p in _partial_prefixes(pattern)]
     while True:
+      start = self._cursors[-1]
       n = len(self._buf)
-      i = self._cursors[-1]
-      while i < n and self._buf[i] == 0x20:
-        i += 1
-      self._cursors[-1] = i
-      if i < n:
-        return
+      m = compiled.match(self._buf, start)
+      if m is not None:
+        if m.end() < n or (m.end() == start and start < n) or self._at_eof:
+          self._cursors[-1] = m.end()
+          return m
+      elif start < n:
+        data = bytes(self._buf[start:n])
+        if not _is_partial_match(data, lit_prefix, ci, partial_compiled):
+          raise ReadError(f"pattern {pattern!r} did not match")
       if self._at_eof:
-        return
+        if m is not None:
+          self._cursors[-1] = m.end()
+          return m
+        if start >= n:
+          raise asyncio.IncompleteReadError(b"", None)
+        data = bytes(self._buf[start:n])
+        if _is_partial_match(data, lit_prefix, ci, partial_compiled):
+          raise asyncio.IncompleteReadError(data, None)
+        raise ReadError(f"pattern {pattern!r} did not match")
       self._maybe_evict()
       data = await self._reader.read(self._pre_read)
       if not data:
         self._at_eof = True
-        return
-      self._buf.extend(data)
+      else:
+        self._buf.extend(data)
+
+  async def skip_re(self, pattern: bytes) -> None:
+    _ = await self.read_re(pattern)
 
   async def read_crlf(self) -> None:
     _ = await self.read_const(b"\r\n")

@@ -93,6 +93,153 @@ class TestReadUntil(unittest.TestCase):
       _ = _run(r.read_until(b""))
 
 
+class TestReadRe(unittest.TestCase):
+  def test_simple_match(self):
+    r = _make_reader(b"HELLO world")
+    m = _run(r.read_re(br"[A-Z]+"))
+    self.assertEqual(m.group(0), b"HELLO")
+    self.assertEqual(_run(r.readexactly(1)), b" ")
+
+  def test_capture_group(self):
+    r = _make_reader(b"MAIL FROM:<x@y>")
+    m = _run(r.read_re(br"(?i)MAIL FROM: *<([^>]*)>"))
+    self.assertEqual(m.group(1), b"x@y")
+
+  def test_zero_width_match(self):
+    r = _make_reader(b"hello")
+    m = _run(r.read_re(br"\s*"))
+    self.assertEqual(m.group(0), b"")
+    self.assertEqual(_run(r.readexactly(1)), b"h")
+
+  def test_inverse_pattern(self):
+    r = _make_reader(b"FROM:<x>")
+    m = _run(r.read_re(br"[^< \r]*"))
+    self.assertEqual(m.group(0), b"FROM:")
+    self.assertEqual(_run(r.read_const(b"<")), b"<")
+
+  def test_empty_match_at_stop_byte(self):
+    r = _make_reader(b"<x")
+    m = _run(r.read_re(br"[^< \r]*"))
+    self.assertEqual(m.group(0), b"")
+    self.assertEqual(_run(r.read_const(b"<")), b"<")
+
+  def test_streaming_extension(self):
+    r = _make_reader(b"HE", pre_read=1, chunk=1)
+    m = _run(r.read_re(br"[A-Z]+"))
+    self.assertEqual(m.group(0), b"HE")
+    self.assertTrue(r.at_eof)
+
+  def test_streaming_extension_with_more_data(self):
+    r = _make_reader(b"HE", pre_read=2, chunk=2)
+    m = _run(r.read_re(br"[A-Z]+"))
+    self.assertEqual(m.group(0), b"HE")
+
+  def test_no_match_raises_read_error(self):
+    r = _make_reader(b"123abc")
+    with self.assertRaises(ReadError):
+      _ = _run(r.read_re(br"[A-Z]+"))
+
+  def test_eof_empty_buffer_raises_incomplete(self):
+    r = _make_reader(b"")
+    with self.assertRaises(asyncio.IncompleteReadError):
+      _ = _run(r.read_re(br"[A-Z]+"))
+
+  def test_zero_width_on_empty_at_eof(self):
+    r = _make_reader(b"")
+    m = _run(r.read_re(br"\s*"))
+    self.assertEqual(m.group(0), b"")
+
+  def test_match_reaches_end_at_eof(self):
+    r = _make_reader(b"HE")
+    m = _run(r.read_re(br"[A-Z]+"))
+    self.assertEqual(m.group(0), b"HE")
+
+  def test_match_reaches_end_not_eof_reads_more(self):
+    r = _make_reader(b"HE world", pre_read=3)
+    m = _run(r.read_re(br"[A-Z]+"))
+    self.assertEqual(m.group(0), b"HE")
+    self.assertEqual(_run(r.readexactly(1)), b" ")
+
+  def test_star_consumes_run(self):
+    r = _make_reader(b"   hello")
+    m = _run(r.read_re(br" *"))
+    self.assertEqual(m.group(0), b"   ")
+    self.assertEqual(_run(r.readexactly(1)), b"h")
+
+  def test_rollback_mid_match(self):
+    r = _make_reader(b"X YZ", pre_read=1, chunk=1)
+    async def opt1():
+      _ = await r.read_re(br"[^ \r]*")
+      raise ReadError("simulated")
+    async def opt2():
+      return await r.readexactly(4)
+    result = _run(r.read_one_of(opt1, opt2))
+    self.assertEqual(result, b"X YZ")
+
+  def test_streaming_inverse_across_chunks(self):
+    r = _make_reader(b"FROM:<x>", pre_read=2, chunk=2)
+    m = _run(r.read_re(br"[^< \r]*"))
+    self.assertEqual(m.group(0), b"FROM:")
+    self.assertEqual(_run(r.read_const(b"<")), b"<")
+
+  def test_partial_literal_waits_for_more(self):
+    r = _make_reader(b"QUIT", pre_read=1, chunk=1)
+    m = _run(r.read_re(br"(?i)QUIT"))
+    self.assertEqual(m.group(0), b"QUIT")
+
+  def test_partial_variable_waits_for_more(self):
+    r = _make_reader(b"MAIL FROM: <x>", pre_read=2, chunk=2)
+    m = _run(r.read_re(br"(?i)MAIL FROM: *<([^>]*)>"))
+    self.assertEqual(m.group(1), b"x")
+
+  def test_wrong_verb_fails_fast(self):
+    r = _make_reader(b"NOOP\r\n")
+    with self.assertRaises(ReadError):
+      _ = _run(r.read_re(br"(?i)QUIT"))
+
+  def test_eof_on_partial_raises_incomplete(self):
+    r = _make_reader(b"QUI")
+    with self.assertRaises(asyncio.IncompleteReadError):
+      _ = _run(r.read_re(br"(?i)QUIT"))
+
+  def test_eof_on_partial_variable_raises_incomplete(self):
+    r = _make_reader(b"MAIL FROM: <x")
+    with self.assertRaises(asyncio.IncompleteReadError):
+      _ = _run(r.read_re(br"(?i)MAIL FROM: *<([^>]*)>"))
+
+  def test_case_insensitive_verb(self):
+    r = _make_reader(b"quit\r\n")
+    m = _run(r.read_re(br"(?i)QUIT"))
+    self.assertEqual(m.group(0), b"quit")
+
+
+class TestSkipRe(unittest.TestCase):
+  def test_consumes_run(self):
+    r = _make_reader(b"   hello")
+    _run(r.skip_re(br" *"))
+    self.assertEqual(_run(r.readexactly(1)), b"h")
+
+  def test_zero_width_noop(self):
+    r = _make_reader(b"hello")
+    _run(r.skip_re(br" *"))
+    self.assertEqual(_run(r.readexactly(1)), b"h")
+
+  def test_eof_no_raise(self):
+    r = _make_reader(b"   ")
+    _run(r.skip_re(br" *"))
+    self.assertTrue(r.at_eof)
+
+  def test_empty_buffer_zero_width(self):
+    r = _make_reader(b"")
+    _run(r.skip_re(br" *"))
+    self.assertTrue(r.at_eof)
+
+  def test_across_chunks(self):
+    r = _make_reader(b"     hello", pre_read=2, chunk=2)
+    _run(r.skip_re(br" *"))
+    self.assertEqual(_run(r.readexactly(5)), b"hello")
+
+
 class TestReadConst(unittest.TestCase):
   def test_match(self):
     r = _make_reader(b"OK\r\n")
@@ -111,45 +258,6 @@ class TestReadConst(unittest.TestCase):
   def test_empty_match(self):
     r = _make_reader(b"abc")
     self.assertEqual(_run(r.read_const(b"")), b"")
-
-
-class TestSkipSp(unittest.TestCase):
-  def test_consume_one(self):
-    r = _make_reader(b"  hello")
-    _run(r.skip_sp())
-    self.assertEqual(_run(r.readexactly(1)), b" ")
-
-  def test_no_sp_raises(self):
-    r = _make_reader(b"hello")
-    with self.assertRaises(ReadError):
-      _run(r.skip_sp())
-
-  def test_eof_raises(self):
-    r = _make_reader(b"")
-    with self.assertRaises(ReadError):
-      _run(r.skip_sp())
-
-
-class TestSkipWsp(unittest.TestCase):
-  def test_consume_run(self):
-    r = _make_reader(b"   hello")
-    _run(r.skip_wsp())
-    self.assertEqual(_run(r.readexactly(1)), b"h")
-
-  def test_none(self):
-    r = _make_reader(b"hello")
-    _run(r.skip_wsp())
-    self.assertEqual(_run(r.readexactly(1)), b"h")
-
-  def test_eof_no_raise(self):
-    r = _make_reader(b"   ")
-    _run(r.skip_wsp())
-    self.assertTrue(r.at_eof)
-
-  def test_eof_mixed(self):
-    r = _make_reader(b"   ")
-    _run(r.skip_wsp())
-    self.assertTrue(r.at_eof)
 
 
 class TestReadCrlf(unittest.TestCase):
@@ -451,9 +559,9 @@ class TestStreaming(unittest.TestCase):
     result = _run(r.read_one_of(opt1, opt2))
     self.assertEqual(result, b"XYZ")
 
-  def test_skip_wsp_across_chunks(self):
+  def test_skip_re_across_chunks(self):
     r = _make_reader(b"     hello", pre_read=2, chunk=2)
-    _run(r.skip_wsp())
+    _run(r.skip_re(br" *"))
     self.assertEqual(_run(r.readexactly(5)), b"hello")
 
   def test_handle_options_across_chunks(self):

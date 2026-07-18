@@ -5,7 +5,7 @@ from mailproxy.db import db_account_add, db_account_get_by_address, db_account_l
 from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_frontend import handle_imap
 from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
-from mailproxy.smtp_frontend import smtp_server_handle_client
+from mailproxy.smtp.frontend import smtp_server_handle_client
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, OAuthProviderConfig, ProviderConfig, TLSMode
 from mailproxy.utils import json_loads_object, is_object_list
 
