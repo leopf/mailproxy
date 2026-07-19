@@ -23,10 +23,11 @@ class _FakeIMAPServer:
   """Minimal fake remote IMAP server. Can drop the connection mid UID FETCH
   to simulate a timeout (drop_on_fetch = 1-based UID FETCH command index)."""
 
-  def __init__(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0):
+  def __init__(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0):
     self._messages: dict[int, bytes] = messages
     self._drop_on_fetch: int | None = drop_on_fetch
     self._drop_after_items: int = drop_after_items
+    self._idle_delay: float = idle_delay
     self._server: asyncio.Server | None = None
 
   @property
@@ -80,6 +81,17 @@ class _FakeIMAPServer:
           for u in uids:
             writer.write(self._fetch_item(u))
           writer.write(tag + b" OK\r\n")
+        elif cmd == b"IDLE":
+          if self._idle_delay:
+            await asyncio.sleep(self._idle_delay)
+          writer.write(b"+ idling\r\n")
+          await writer.drain()
+          while True:
+            idle_line = await reader.readuntil(b"\r\n")
+            if idle_line.strip().upper() == b"DONE":
+              writer.write(tag + b" OK IDLE terminated\r\n")
+              await writer.drain()
+              break
         elif cmd == b"LOGOUT":
           writer.write(tag + b" OK\r\n")
           await writer.drain()
@@ -123,8 +135,8 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     for server in self._servers:
       await server.stop()
 
-  async def _start_server(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0) -> _FakeIMAPServer:
-    server = _FakeIMAPServer(messages, drop_on_fetch, drop_after_items)
+  async def _start_server(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0) -> _FakeIMAPServer:
+    server = _FakeIMAPServer(messages, drop_on_fetch, drop_after_items, idle_delay)
     await server.start()
     self._servers.append(server)
     return server
@@ -182,6 +194,20 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     await conn.shutdown()
     self.assertEqual(self._message_count(), 3)
     self.assertEqual(self._last_synced_uid(), 1000)
+
+  async def test_idle_cancellation_during_plus_wait_recovers(self):
+    messages = {1: b"one"}
+    server = await self._start_server(messages, idle_delay=1.0)
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+    update_event = asyncio.Event()
+    task = asyncio.create_task(conn.wait_for_update("INBOX", update_event))
+    await asyncio.sleep(0.2)
+    _ = task.cancel()
+    with self.assertRaises(asyncio.CancelledError):
+      await task
+    await conn.sync_mailbox("INBOX")
+    await conn.shutdown()
+    self.assertEqual(self._message_count(), 1)
 
 
 if __name__ == "__main__":

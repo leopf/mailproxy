@@ -1,5 +1,5 @@
 import pathlib, unittest
-from mailproxy.config import config_from_dict, provider_config_from_dict
+from mailproxy.config import config_from_dict, oauth_token_response_from_dict, provider_config_from_dict
 
 
 class TestConfigTls(unittest.TestCase):
@@ -37,6 +37,23 @@ class TestProviderConfig(unittest.TestCase):
 
   def test_use_pkce_parsed(self):
     self.assertTrue(provider_config_from_dict(self._base() | {"use_pkce": True}).use_pkce)
+
+
+class TestTokenResponse(unittest.TestCase):
+  def _base(self) -> dict[str, object]:
+    return {"token_type": "Bearer", "expires_in": 3600, "access_token": "at", "refresh_token": "rt"}
+
+  def test_capitalized_bearer(self):
+    r = oauth_token_response_from_dict(self._base())
+    self.assertEqual(r.access_token, "at")
+
+  def test_lowercase_bearer(self):
+    r = oauth_token_response_from_dict(self._base() | {"token_type": "bearer"})
+    self.assertEqual(r.access_token, "at")
+
+  def test_wrong_type_rejected(self):
+    with self.assertRaises(ValueError):
+      _ = oauth_token_response_from_dict(self._base() | {"token_type": "MAC"})
 
 
 if __name__ == "__main__":

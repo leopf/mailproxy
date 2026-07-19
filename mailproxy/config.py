@@ -102,7 +102,7 @@ def provider_config_from_dict(d: object) -> ProviderConfig:
 
 def oauth_token_response_from_dict(d: object) -> OAuthTokenResponse:
   token_type = _field(d, "token_type", str)
-  if token_type != "Bearer":
+  if token_type.upper() != "BEARER":
     raise ValueError(f"wrong token response token_type: '{token_type}'")
   return OAuthTokenResponse(
     token_type=token_type,
