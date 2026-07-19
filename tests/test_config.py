@@ -1,5 +1,5 @@
 import pathlib, unittest
-from mailproxy.config import config_from_dict
+from mailproxy.config import config_from_dict, provider_config_from_dict
 
 
 class TestConfigTls(unittest.TestCase):
@@ -18,11 +18,25 @@ class TestConfigTls(unittest.TestCase):
 
   def test_tls_cert_without_key_rejected(self):
     with self.assertRaises(ValueError):
-      config_from_dict(self._base() | {"tls_cert_path": "cert.pem"})
+      _ = config_from_dict(self._base() | {"tls_cert_path": "cert.pem"})
 
   def test_tls_key_without_cert_rejected(self):
     with self.assertRaises(ValueError):
-      config_from_dict(self._base() | {"tls_key_path": "key.pem"})
+      _ = config_from_dict(self._base() | {"tls_key_path": "key.pem"})
+
+
+class TestProviderConfig(unittest.TestCase):
+  def _base(self) -> dict[str, object]:
+    return {
+      "imap_host": "imap.example.com", "imap_port": 993, "imap_tlsmode": "DIRECT",
+      "smtp_host": "smtp.example.com", "smtp_port": 587, "smtp_tlsmode": "STARTTLS",
+    }
+
+  def test_use_pkce_defaults_to_false(self):
+    self.assertFalse(provider_config_from_dict(self._base()).use_pkce)
+
+  def test_use_pkce_parsed(self):
+    self.assertTrue(provider_config_from_dict(self._base() | {"use_pkce": True}).use_pkce)
 
 
 if __name__ == "__main__":

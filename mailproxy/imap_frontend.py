@@ -98,7 +98,10 @@ class IMAPServerConnection:
       if not self._is_universe_mailbox:
         remote = self._require_remote()
         if mailbox.is_remote:
-          await remote.sync_mailbox(mailbox.name)
+          try:
+            await remote.sync_mailbox(mailbox.name)
+          except Exception as e:
+            logging.warning("sync failed for '%s', serving cached data: %s", mailbox.name, e)
       self._write_mailbox_update()
     self._write_response(b"OK", b"NOOP completed")
 
@@ -190,7 +193,10 @@ class IMAPServerConnection:
         while True:
           _ = await update_event.wait()
           if self._mailbox is not None and self._mailbox.is_remote:
-            await remote.sync_mailbox(self._mailbox.name)
+            try:
+              await remote.sync_mailbox(self._mailbox.name)
+            except Exception as e:
+              logging.warning("idle sync failed for '%s': %s", self._mailbox.name, e)
           self._write_mailbox_update()
           update_event.clear()
       tasks.extend((asyncio.Task(remote.wait_for_update(mailbox.name, update_event)), asyncio.Task(_update_on_event())))
@@ -273,7 +279,10 @@ class IMAPServerConnection:
         logging.debug("SELECT: '%s' mailbox_in_db=%s needs_sync=%s", mailbox_name, mailbox is not None, needs_sync)
 
       if needs_sync and (mailbox is None or mailbox.is_remote):
-        await remote.sync_mailbox(mailbox_name)
+        try:
+          await remote.sync_mailbox(mailbox_name)
+        except Exception as e:
+          logging.warning("sync failed for '%s', serving cached data: %s", mailbox_name, e)
 
       with db_open(self._config.db_path) as db:
         mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
@@ -850,7 +859,7 @@ class IMAPServerConnection:
     else:
       with db_open(self._config.db_path) as db:
         for _, msg in matching:
-          db_message_copy(db, mailbox.id, msg.uid, dest_mailbox.id)
+          _ = db_message_copy(db, mailbox.id, msg.uid, dest_mailbox.id)
       if dest_mailbox.is_remote:
         with db_open(self._config.db_path) as db:
           msg_bodies = [(msg, db_message_body_get(db, msg.body_hash) or b"") for _, msg in matching]

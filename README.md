@@ -152,6 +152,9 @@ mailproxy account add -C config.json -A you@example.com \
 
 Multiple addresses can be added by repeating `-A`; the first is the account key.
 
+Custom OAuth2 provider configs (via `--provider-config`) additionally support
+`"use_pkce": true` for providers that require PKCE (e.g. Yahoo).
+
 ## Mailboxes
 
 The proxy exposes three kinds of mailboxes:
@@ -161,7 +164,10 @@ The proxy exposes three kinds of mailboxes:
   flag changes, deletions) when selected, on `NOOP`, and during `IDLE`.
   `CREATE`, `DELETE`, `RENAME`, `COPY`, `APPEND`, `STORE`, and `EXPUNGE` are
   forwarded to the remote server. Keyword (non-system) flags are stored
-  locally only and are preserved across syncs.
+  locally only and are preserved across syncs. Messages are synced in batches
+  with a checkpoint after each batch — an interrupted sync resumes where it
+  left off instead of starting over, and a failed sync serves the cached
+  messages instead of failing the mailbox.
 - **Local mailboxes** exist only in the proxy's database. They are managed via
   the `mailbox` CLI commands (not via IMAP) and are useful for archive/storage
   that should never touch the remote server. Messages can be filed into them
@@ -219,7 +225,7 @@ smtp.sendmail("you@example.com", "client@example.com", "Your invoice is ready")
 ## Testing
 
 ```
-python -m unittest discover -s tests    # 171 unit tests
+python -m unittest discover -s tests    # 182 unit tests
 python -m tests.e2e_test               # end-to-end protocol test
 python -m ruff check mailproxy/ tests/ # lint
 ```

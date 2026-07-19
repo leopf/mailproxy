@@ -1,8 +1,8 @@
-import logging, pathlib, sqlite3, tempfile, unittest
+import logging, pathlib, sqlite3, tempfile, unittest, base64, hashlib, urllib.parse
 from typing import override
-from mailproxy.auth import authenticate
+from mailproxy.auth import authenticate, oauth_get_authorization_url, pkce_generate
 from mailproxy.db import db_account_add, db_open
-from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
+from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
 
 PASSWORD = "proxy-pw"
 
@@ -26,7 +26,7 @@ class TestAuthenticate(unittest.TestCase):
     self._tmpdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory()
     self.db_path: pathlib.Path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
     self.db: sqlite3.Connection = db_open(self.db_path)
-    self.config = Config(
+    self.config: Config = Config(
       domain="example.com", log_level=logging.DEBUG, host="127.0.0.1",
       imap_port=143, smtp_port=587, db_path=self.db_path, proxy_password=PASSWORD,
     )
@@ -69,6 +69,39 @@ class TestAuthenticate(unittest.TestCase):
       imap_port=143, smtp_port=587, db_path=self.db_path, proxy_password="",
     )
     self.assertIsNone(authenticate(config, self.db, b"a@example.com", b""))
+
+
+class TestPkce(unittest.TestCase):
+  def _oauth_auth(self) -> AuthenticationOAUTH2:
+    return AuthenticationOAUTH2(
+      scope="mail-w", client_id="cid", client_secret=None,
+      authorization_base_url="https://auth.example/authorize", token_url="https://auth.example/token",
+      redirect_url="http://localhost:8081",
+    )
+
+  def test_verifier_challenge_pair(self):
+    verifier, challenge = pkce_generate()
+    expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    self.assertEqual(challenge, expected)
+    self.assertGreaterEqual(len(verifier), 43)
+
+  def test_authorization_url_with_pkce(self):
+    url = oauth_get_authorization_url(self._oauth_auth(), "CHALLENGE")
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    self.assertEqual(qs["code_challenge"], ["CHALLENGE"])
+    self.assertEqual(qs["code_challenge_method"], ["S256"])
+
+  def test_authorization_url_with_state(self):
+    url = oauth_get_authorization_url(self._oauth_auth(), state="STATE123")
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    self.assertEqual(qs["state"], ["STATE123"])
+
+  def test_authorization_url_without_pkce(self):
+    url = oauth_get_authorization_url(self._oauth_auth())
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    self.assertNotIn("code_challenge", qs)
+    self.assertNotIn("code_challenge_method", qs)
+    self.assertNotIn("state", qs)
 
 
 if __name__ == "__main__":

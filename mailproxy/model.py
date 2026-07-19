@@ -94,6 +94,7 @@ class OAuthProviderConfig:
   authorization_base_url: str
   token_url: str
   redirect_url: str
+  use_pkce: bool = False
 
 @dataclasses.dataclass(frozen=True)
 class ProviderConfig:
@@ -109,6 +110,7 @@ class ProviderConfig:
   authorization_base_url: str | None = None
   token_url: str | None = None
   redirect_url: str | None = None
+  use_pkce: bool = False
 
   @property
   def is_oauth2(self) -> bool:

@@ -1,4 +1,4 @@
-import http.client, urllib.parse, datetime, base64, sqlite3, hmac
+import http.client, urllib.parse, datetime, base64, hashlib, secrets, sqlite3, hmac
 from mailproxy.config import oauth_token_response_from_dict
 from mailproxy.db import db_account_get_by_address, row_field, row_optional, fetchone
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, OAUTHAccessTokenResult
@@ -8,7 +8,7 @@ class AuthenticationError(Exception):
   pass
 
 def _fetch_access_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]) -> OAUTHAccessTokenResult:
-  data = { "client_id": auth.client_id, "scope": auth.scope } | extra_data
+  data = { "client_id": auth.client_id } | extra_data
   if auth.client_secret is not None:
     data["client_secret"] = auth.client_secret
 
@@ -43,11 +43,24 @@ def _fetch_access_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]) 
 def oauth_fetch_access_token_with_refresh_token(auth: AuthenticationOAUTH2, refresh_token: str) -> OAUTHAccessTokenResult:
   return _fetch_access_token(auth, { "grant_type": "refresh_token", "refresh_token": refresh_token })
 
-def oauth_fetch_access_token_with_authorization_code(auth: AuthenticationOAUTH2, authorization_code: str) -> OAUTHAccessTokenResult:
-  return _fetch_access_token(auth, { "grant_type": "authorization_code", "code": authorization_code, "redirect_uri": auth.redirect_url })
+def oauth_fetch_access_token_with_authorization_code(auth: AuthenticationOAUTH2, authorization_code: str, code_verifier: str | None = None) -> OAUTHAccessTokenResult:
+  extra_data = { "grant_type": "authorization_code", "code": authorization_code, "redirect_uri": auth.redirect_url }
+  if code_verifier is not None:
+    extra_data["code_verifier"] = code_verifier
+  return _fetch_access_token(auth, extra_data)
 
-def oauth_get_authorization_url(auth: AuthenticationOAUTH2) -> str:
-  data = { "client_id": auth.client_id, "scope": auth.scope, "redirect_uri": auth.redirect_url, "response_type": "code", "response_mode": "query" }
+def pkce_generate() -> tuple[str, str]:
+  verifier = secrets.token_urlsafe(64)
+  challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+  return verifier, challenge
+
+def oauth_get_authorization_url(auth: AuthenticationOAUTH2, code_challenge: str | None = None, state: str | None = None) -> str:
+  data = { "client_id": auth.client_id, "scope": auth.scope, "redirect_uri": auth.redirect_url, "response_type": "code" }
+  if state is not None:
+    data["state"] = state
+  if code_challenge is not None:
+    data["code_challenge"] = code_challenge
+    data["code_challenge_method"] = "S256"
   return f"{auth.authorization_base_url}?{urllib.parse.urlencode(data)}"
 
 def authenticate_sasl(config: Config, db: sqlite3.Connection, sasl_b64: bytes) -> Account | None:

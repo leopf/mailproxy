@@ -1,9 +1,9 @@
-import functools, asyncio, logging, argparse, pathlib, os, dataclasses, webbrowser, urllib.parse, http.server, ssl, importlib.resources, typing
+import functools, asyncio, logging, argparse, pathlib, os, dataclasses, secrets, webbrowser, urllib.parse, http.server, ssl, importlib.resources, typing
 from typing import TypeVar
 from mailproxy.config import config_from_dict, provider_config_from_dict
 from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_mailbox_add, db_mailbox_by_name, db_mailbox_delete, db_mailbox_list, db_mailbox_rename, db_open
 from mailproxy.imap_frontend import handle_imap
-from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
+from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code, pkce_generate
 from mailproxy.smtp_frontend import smtp_server_handle_client
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, OAuthProviderConfig, ProviderConfig, TLSMode
 from mailproxy.utils import json_loads_object, is_object_list
@@ -40,6 +40,7 @@ def _load_oauth_config(preset: str | None, provider_config_path: pathlib.Path | 
     smtp_host=provider.smtp_host, smtp_port=provider.smtp_port, smtp_tlsmode=provider.smtp_tlsmode,
     scope=provider.scope, client_id=provider.client_id, client_secret=provider.client_secret,
     authorization_base_url=provider.authorization_base_url, token_url=provider.token_url, redirect_url=provider.redirect_url,
+    use_pkce=provider.use_pkce,
   )
 
 def _add_imap_args(p: argparse.ArgumentParser) -> None:
@@ -229,46 +230,70 @@ def exec_login(provider: OAuthProviderConfig):
     redirect_url=provider.redirect_url,
   )
 
-  redirection_endpoint: urllib.parse.ParseResult = urllib.parse.urlparse(auth.redirect_url)
+  code_verifier: str | None = None
+  code_challenge: str | None = None
+  if provider.use_pkce:
+    code_verifier, code_challenge = pkce_generate()
 
-  if redirection_endpoint.hostname is None:
-    raise ValueError("hostname of redirect url is None")
+  state = secrets.token_urlsafe(32)
+  auth_url = oauth_get_authorization_url(auth, code_challenge, state)
 
-  if redirection_endpoint.port is None:
-    raise ValueError("port of redirect url is None")
+  if auth.redirect_url == "oob":
+    _ = webbrowser.open(auth_url)
+    print("If your browser did not open, visit:")
+    print("  " + auth_url)
+    print("After you authorize, the provider will display an authorization code.")
+    raw = input("Paste the authorization code (or the full redirected URL) here: ").strip()
+    if "code=" in raw:
+      qs = urllib.parse.parse_qs(urllib.parse.urlparse(raw).query)
+      code = next(iter(qs.get("code", [])), raw)
+    else:
+      code = raw
+  else:
+    redirection_endpoint: urllib.parse.ParseResult = urllib.parse.urlparse(auth.redirect_url)
 
-  _ = webbrowser.open(oauth_get_authorization_url(auth))
+    if redirection_endpoint.hostname is None:
+      raise ValueError("hostname of redirect url is None")
 
-  authorization_code: list[str] = []
+    if redirection_endpoint.port is None:
+      raise ValueError("port of redirect url is None")
 
-  class AuthorizationHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-      parsed_url = urllib.parse.urlparse(self.path)
-      parsed_qs = urllib.parse.parse_qs(parsed_url.query)
-      code = next(iter(parsed_qs.get("code", [])), None)
-      body = b"no code" if code is None else b"success"
-      if code is not None:
-        authorization_code.append(code)
-      self.send_response(200)
-      self.send_header("Content-Type", "text/plain; charset=utf-8")
-      self.send_header("Content-Length", str(len(body)))
-      self.end_headers()
-      _ = self.wfile.write(body)
+    _ = webbrowser.open(auth_url)
 
-  auth_server = http.server.HTTPServer((redirection_endpoint.hostname, redirection_endpoint.port), AuthorizationHandler)
+    authorization_code: list[str] = []
 
-  if redirection_endpoint.scheme == "https":
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    class AuthorizationHandler(http.server.BaseHTTPRequestHandler):
+      def do_GET(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        parsed_qs = urllib.parse.parse_qs(parsed_url.query)
+        received_code = next(iter(parsed_qs.get("code", [])), None)
+        received_state = next(iter(parsed_qs.get("state", [])), None)
+        if received_state is not None and received_state != state:
+          received_code = None
+        body = b"no code" if received_code is None else b"success"
+        if received_code is not None:
+          authorization_code.append(received_code)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        _ = self.wfile.write(body)
 
-    with importlib.resources.path("mailproxy.assets", "dummy-cert.pem") as cert_path, importlib.resources.path("mailproxy.assets", "dummy-key.pem") as key_path:
-      ctx.load_cert_chain(cert_path, key_path)
-    auth_server.socket = ctx.wrap_socket(auth_server.socket, server_side=True)
+    auth_server = http.server.HTTPServer((redirection_endpoint.hostname, redirection_endpoint.port), AuthorizationHandler)
 
-  while not authorization_code:
-    _ = auth_server.handle_request()
+    if redirection_endpoint.scheme == "https":
+      ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
-  code = authorization_code[0]
-  access_token_result = oauth_fetch_access_token_with_authorization_code(auth, code)
+      with importlib.resources.path("mailproxy.assets", "dummy-cert.pem") as cert_path, importlib.resources.path("mailproxy.assets", "dummy-key.pem") as key_path:
+        ctx.load_cert_chain(cert_path, key_path)
+      auth_server.socket = ctx.wrap_socket(auth_server.socket, server_side=True)
+
+    while not authorization_code:
+      _ = auth_server.handle_request()
+
+    code = authorization_code[0]
+
+  access_token_result = oauth_fetch_access_token_with_authorization_code(auth, code, code_verifier)
 
   print("success, we have an access and refresh token :)")
   print("expires at: ", str(access_token_result.expires_at))

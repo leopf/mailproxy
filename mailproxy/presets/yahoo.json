@@ -8,7 +8,8 @@
   "scope": "mail-w ycal-w sdct-w",
   "client_id": "dj0yJmk9WVZUaWRNUUZSQTBNJmQ9WVdrOVNqbHJUMGhtTkU4bWNHbzlNQT09JnM9Y29uc3VtZXJzZWNyZXQmc3Y9MCZ4PTgz",
   "client_secret": null,
+  "use_pkce": true,
   "authorization_base_url": "https://api.login.yahoo.com/oauth2/request_auth",
   "token_url": "https://api.login.yahoo.com/oauth2/get_token",
-  "redirect_url": "https://localhost:8081"
+  "redirect_url": "oob"
 }

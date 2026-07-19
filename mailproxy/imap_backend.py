@@ -16,6 +16,8 @@ def _is_bytes_list(value: object) -> TypeGuard[list[bytes]]:
     return False
   return all(isinstance(v, bytes) for v in cast(list[object], value))
 
+FETCH_BATCH_SIZE = 500
+
 @dataclass(frozen=True)
 class SelectResult:
   uid_validity: int
@@ -75,36 +77,32 @@ class IMAPRemoteConnection:
           db_mailbox_update_sync(db, mailbox.id, uid_next=uid_next, flags_s=flags_s)
 
     if uid_next > last_synced + 1:
-      self._start_command(b"UID FETCH %d:* (UID FLAGS INTERNALDATE BODY[])" % (last_synced + 1,))
-      max_uid = 0
-      count = 0
-      with db_open(self.config.db_path) as db:
-        async for resp in self._read_responses():
-          if resp.kind != b"FETCH": continue
-          items = resp.args[1]
-          if not _is_fetch_items(items): continue
-          uid = items.get(b"UID")
-          if not isinstance(uid, int): continue
-          uid_int = uid
-          if uid_int <= last_synced:
-            logging.debug("sync_mailbox: '%s' skipping uid %d (<= last_synced %d)", mailbox_name, uid_int, last_synced)
-            continue
-          flags = items.get(b"FLAGS", b"")
-          internal_date = items.get(b"INTERNALDATE", b"")
-          body = items.get(b"BODY[]", b"")
-          msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
-          received_date = parse_internal_date(internal_date) if isinstance(internal_date, bytes) and internal_date else int(datetime.datetime.now().timestamp())
-          db_message_add(db, uid_int, mailbox_id, received_date, msg_flags_s, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int))
+      synced = last_synced
+      while uid_next > synced + 1:
+        batch_lo = synced + 1
+        batch_hi = min(synced + FETCH_BATCH_SIZE, uid_next - 1)
+        count = 0
+        self._start_command(b"UID FETCH %d:%d (UID FLAGS INTERNALDATE BODY.PEEK[])" % (batch_lo, batch_hi))
+        with db_open(self.config.db_path) as db:
+          async for resp in self._read_responses():
+            if resp.kind != b"FETCH": continue
+            items = resp.args[1]
+            if not _is_fetch_items(items): continue
+            uid = items.get(b"UID")
+            if not isinstance(uid, int): continue
+            uid_int = uid
+            if uid_int < batch_lo or uid_int > batch_hi: continue
+            flags = items.get(b"FLAGS", b"")
+            internal_date = items.get(b"INTERNALDATE", b"")
+            body = items.get(b"BODY[]", b"")
+            msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
+            received_date = parse_internal_date(internal_date) if isinstance(internal_date, bytes) and internal_date else int(datetime.datetime.now().timestamp())
+            db_message_add(db, uid_int, mailbox_id, received_date, msg_flags_s, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int))
+            count += 1
+          db_mailbox_update_sync(db, mailbox_id, last_synced_uid=batch_hi)
           db.commit()
-          if uid_int > max_uid: max_uid = uid_int
-          count += 1
-        if count > 0:
-          db_mailbox_update_sync(db, mailbox_id, last_synced_uid=max_uid)
-          db.commit()
-      if count > 0:
-        logging.debug("sync_mailbox: '%s' fetched %d new messages (up to uid %d)", mailbox_name, count, max_uid)
-      else:
-        logging.debug("sync_mailbox: '%s' no new messages", mailbox_name)
+        synced = batch_hi
+        logging.debug("sync_mailbox: '%s' batch %d:%d done (%d messages, %d remaining)", mailbox_name, batch_lo, batch_hi, count, max(uid_next - 1 - batch_hi, 0))
 
     if last_synced > 0:
       self._start_command(b"UID FETCH 1:%d (UID FLAGS)" % (last_synced,))
@@ -191,7 +189,7 @@ class IMAPRemoteConnection:
       await self._read_until_response()
     else:
       logging.debug("uid_expunge: remote lacks UIDPLUS, falling back to SELECT + EXPUNGE")
-      await self._command_select(mailbox_name)
+      _ = await self._command_select(mailbox_name)
       self._start_command(b"EXPUNGE")
       await self._read_until_response()
 
@@ -201,10 +199,13 @@ class IMAPRemoteConnection:
 
   async def wait_for_update(self, mailbox_name: str, update_event: asyncio.Event):
     logging.debug("wait_for_update: '%s' entering IDLE", mailbox_name)
+    idle_started = False
     try:
       _ = await self._command_select(mailbox_name)
       self._start_command(b"IDLE")
+      idle_started = True
       if await self._imap.peek(1) != b"+":
+        await self._read_until_response()
         raise RuntimeError("server didnt respond with + in idle!")
       await self._imap.read_const(b"+")
       _ = await self._imap.read_text_line()
@@ -218,9 +219,34 @@ class IMAPRemoteConnection:
           logging.debug("wait_for_update: '%s' got %s", mailbox_name, resp.kind)
           update_event.set()
     finally:
-      self._writer.write(b"DONE\r\n")
-      await self._read_until_response()
+      if idle_started:
+        try:
+          self._writer.write(b"DONE\r\n")
+          await self._drain_idle_done_response()
+        except Exception as e:
+          logging.warning("wait_for_update: error exiting IDLE for '%s': %s", mailbox_name, e)
       logging.debug("wait_for_update: '%s' IDLE done", mailbox_name)
+
+  async def _drain_idle_done_response(self):
+    expected = b"A%d" % (self._command_counter,)
+    while True:
+      c = await self._imap.peek(1)
+      if not c:
+        return
+      if c == b"+":
+        await self._imap.read_const(b"+")
+        _ = await self._imap.read_text_line()
+        continue
+      tag = await self._imap.read_tag()
+      await self._imap.skip_sp()
+      if tag == b"*":
+        _ = await self._read_untagged()
+      elif tag == expected:
+        _ = (await self._imap.read_atom()).upper()
+        _ = await self._read_resp_text()
+        return
+      else:
+        raise IMAPReadError(f"unexpected tag {tag!r} while exiting IDLE, expected {expected!r}")
 
   async def _init(self):
     logging.debug("IMAP init: " + (await self._imap.read_text_line()).decode())

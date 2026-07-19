@@ -80,6 +80,7 @@ def oauth_provider_config_from_dict(d: object) -> OAuthProviderConfig:
     authorization_base_url=_field(d, "authorization_base_url", str),
     token_url=_field(d, "token_url", str),
     redirect_url=_field(d, "redirect_url", str),
+    use_pkce=_field_with_default(d, "use_pkce", bool, False),
   )
 
 def provider_config_from_dict(d: object) -> ProviderConfig:
@@ -96,6 +97,7 @@ def provider_config_from_dict(d: object) -> ProviderConfig:
     authorization_base_url=_optional_field(d, "authorization_base_url", str),
     token_url=_optional_field(d, "token_url", str),
     redirect_url=_optional_field(d, "redirect_url", str),
+    use_pkce=_field_with_default(d, "use_pkce", bool, False),
   )
 
 def oauth_token_response_from_dict(d: object) -> OAuthTokenResponse:
