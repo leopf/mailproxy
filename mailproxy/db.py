@@ -1,6 +1,7 @@
 import sqlite3, pathlib, datetime, json, typing
 from collections.abc import Iterator
 from typing import TypeVar
+from mailproxy.imap_parsing import SYSTEM_FLAGS, flags_s_to_set, flags_set_to_s
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Mailbox, Message, TLSMode
 from mailproxy.utils import json_loads_object, is_object_list
 
@@ -94,6 +95,11 @@ def _migrate(db: sqlite3.Connection):
   mb_cols = [typing.cast(str, r[1]) for r in typing.cast(list[sqlite3.Row], db.execute("PRAGMA table_info(mailboxes)").fetchall())]
   if "is_deleted" not in mb_cols:
     _ = db.execute("ALTER TABLE mailboxes ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+  version = row_field(fetchone_required(db, "PRAGMA user_version"), "user_version", int)
+  if version < 1:
+    _ = db.execute("UPDATE messages SET size=(SELECT LENGTH(data) FROM message_bodies WHERE hash=body_hash) " +
+      "WHERE size != (SELECT LENGTH(data) FROM message_bodies WHERE hash=body_hash)")
+    _ = db.execute("PRAGMA user_version=1")
 
 def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
   conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
@@ -298,11 +304,11 @@ def db_message_body_get(db: sqlite3.Connection, body_hash: str) -> bytes | None:
   row = fetchone(db, "SELECT data FROM message_bodies WHERE hash=?", (body_hash,))
   return None if row is None else row_field(row, "data", bytes)
 
-def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, size: int, data: bytes, remote_uid: str | None):
+def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, data: bytes, remote_uid: str | None):
   body_hash = db_message_body_add(db, data)
   _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid) VALUES (?,?,?,?,?,?,?) " +
     "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
-    (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid))
+    (uid, mailbox_id, received_date, flags_s, len(data), body_hash, remote_uid))
 
 def db_message_copy(db: sqlite3.Connection, src_mailbox_id: int, uid: int, dest_mailbox_id: int) -> int:
   row = fetchone_required(db, "SELECT received_date, flags_s, size, body_hash FROM messages WHERE mailbox_id=? AND uid=? AND is_deleted=0", (src_mailbox_id, uid))
@@ -347,6 +353,23 @@ def db_message_update_flags(db: sqlite3.Connection, mailbox_id: int, uid: int, f
     _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=?", (flags_s, mailbox_id, uid))
   else:
     _ = db.execute("UPDATE messages SET flags_s=? WHERE mailbox_id=? AND uid=? AND is_deleted=0", (flags_s, mailbox_id, uid))
+
+def db_messages_merge_flags(db: sqlite3.Connection, mailbox_id: int, remote_flags: list[tuple[int, str]]) -> int:
+  current: dict[int, tuple[str, bool]] = {}
+  for row in iter_rows(db, "SELECT uid, flags_s, is_deleted FROM messages WHERE mailbox_id=?", (mailbox_id,)):
+    current[row_field(row, "uid", int)] = (row_field(row, "flags_s", str), bool(row_field(row, "is_deleted", int)))
+  changed = 0
+  with db:
+    for uid, remote_s in remote_flags:
+      entry = current.get(uid)
+      if entry is None:
+        continue
+      local_s, is_deleted = entry
+      merged = flags_set_to_s(flags_s_to_set(remote_s) | (flags_s_to_set(local_s) - SYSTEM_FLAGS))
+      if merged != local_s or is_deleted:
+        _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=?", (merged, mailbox_id, uid))
+        changed += 1
+  return changed
 
 def db_message_delete_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int):
   _ = db.execute("UPDATE messages SET is_deleted=1, remote_uid=NULL WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))

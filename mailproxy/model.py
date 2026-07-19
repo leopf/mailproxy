@@ -49,6 +49,8 @@ class Config:
   smtp_port: int
   db_path: pathlib.Path
   proxy_password: str = ""
+  tls_cert_path: pathlib.Path | None = None
+  tls_key_path: pathlib.Path | None = None
 
 @dataclasses.dataclass(frozen=True)
 class Mailbox:

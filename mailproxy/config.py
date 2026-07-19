@@ -51,6 +51,10 @@ def _validate_port(name: str, value: int) -> int:
   return value
 
 def config_from_dict(d: object) -> Config:
+  tls_cert_path = _optional_field(d, "tls_cert_path", str)
+  tls_key_path = _optional_field(d, "tls_key_path", str)
+  if (tls_cert_path is None) != (tls_key_path is None):
+    raise ValueError("tls_cert_path and tls_key_path must be set together")
   return Config(
     db_path=pathlib.Path(_field(d, "db_path", str)),
     domain=_validate_host("domain", _field(d, "domain", str)),
@@ -58,6 +62,8 @@ def config_from_dict(d: object) -> Config:
     host=_validate_host("host", _field_with_default(d, "host", str, "0.0.0.0")),
     imap_port=_validate_port("imap_port", _field_with_default(d, "imap_port", int, 143)),
     smtp_port=_validate_port("smtp_port", _field_with_default(d, "smtp_port", int, 587)),
+    tls_cert_path=None if tls_cert_path is None else pathlib.Path(tls_cert_path),
+    tls_key_path=None if tls_key_path is None else pathlib.Path(tls_key_path),
   )
 
 def oauth_provider_config_from_dict(d: object) -> OAuthProviderConfig:

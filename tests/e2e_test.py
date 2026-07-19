@@ -286,6 +286,26 @@ def test_smtp(result: TestResult) -> None:
   except Exception as e:
     result.fail("MAIL FROM without auth", str(e))
 
+  try:
+    b64 = _b64plain(ACCOUNT, PASSWORD)
+    r = _smtp_session(["EHLO test", f"AUTH PLAIN {b64}", "RCPT TO:<x@example.com>"])
+    if "503" in r[-1]:
+      result.ok("RCPT before MAIL rejected")
+    else:
+      result.fail("RCPT before MAIL", f"got {r[-1]}")
+  except Exception as e:
+    result.fail("RCPT before MAIL", str(e))
+
+  try:
+    b64 = _b64plain(ACCOUNT, PASSWORD)
+    r = _smtp_session(["EHLO test", f"AUTH PLAIN {b64}", "MAIL FROM:<sender@test.com>", "DATA"])
+    if "503" in r[-1]:
+      result.ok("DATA before RCPT rejected")
+    else:
+      result.fail("DATA before RCPT", f"got {r[-1]}")
+  except Exception as e:
+    result.fail("DATA before RCPT", str(e))
+
 
 def main() -> None:
   print("Starting mailproxy server...")

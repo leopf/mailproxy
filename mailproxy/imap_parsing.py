@@ -71,6 +71,8 @@ def parse_sequence_set(set_s: bytes, max_val: int) -> list[int]:
         result.append(num)
   return result
 
+SYSTEM_FLAGS = frozenset({"Seen", "Answered", "Flagged", "Deleted", "Draft", "Recent"})
+
 def flags_s_to_set(flags_s: str) -> set[str]:
   return set(f for f in flags_s.strip("\\").split("\\") if f)
 

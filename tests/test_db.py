@@ -2,7 +2,7 @@ import pathlib, sqlite3, tempfile, unittest
 from typing import override
 from mailproxy.db import db_open, db_account_add, db_mailbox_add, db_message_add, db_message_delete_by_uid, \
     db_message_delete_except, \
-    db_message_list, db_message_get_by_uid, db_message_update_flags, db_message_count, db_messages_clear, \
+    db_message_list, db_message_get_by_uid, db_message_update_flags, db_messages_merge_flags, db_message_count, db_messages_clear, \
     db_message_body_get, db_universe_messages, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_count_deleted, \
     db_mailbox_size, db_mailbox_max_uid, db_mailbox_delete, db_mailbox_list, db_mailbox_by_name, \
     db_mailbox_get_by_id, db_mailbox_rename, fetchone, iter_rows, row_field
@@ -38,7 +38,7 @@ class TestMessageSoftDelete(unittest.TestCase):
     self._tmpdir.cleanup()
 
   def _add_message(self, uid: int, flags_s: str = "\\Seen\\", data: bytes = b"Subject: test\r\n\r\nbody"):
-    db_message_add(self.db, uid, self.mailbox_id, 1700000000, flags_s, len(data), data, str(uid))
+    db_message_add(self.db, uid, self.mailbox_id, 1700000000, flags_s, data, str(uid))
 
   def test_delete_marks_soft_not_hard(self):
     self._add_message(1)
@@ -46,6 +46,13 @@ class TestMessageSoftDelete(unittest.TestCase):
     row = fetchone(self.db, "SELECT is_deleted FROM messages WHERE mailbox_id=? AND uid=?", (self.mailbox_id, 1))
     assert row is not None
     self.assertEqual(row_field(row, "is_deleted", int), 1)
+
+  def test_size_derived_from_body(self):
+    data = b"Subject: x\r\n\r\n" + b"y" * 123
+    self._add_message(1, data=data)
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(msg.size, len(data))
 
   def test_deleted_not_in_message_list(self):
     self._add_message(1)
@@ -117,7 +124,7 @@ class TestMessageSoftDelete(unittest.TestCase):
     self._add_message(1, "\\Seen\\", b"old data")
     db_message_delete_by_uid(self.db, self.mailbox_id, 1)
     self.assertIsNone(db_message_get_by_uid(self.db, self.mailbox_id, 1))
-    db_message_add(self.db, 1, self.mailbox_id, 1700000001, "\\Seen\\", 8, b"new data", "1")
+    db_message_add(self.db, 1, self.mailbox_id, 1700000001, "\\Seen\\", b"new data", "1")
     msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
     assert msg is not None
     self.assertEqual(db_message_body_get(self.db, msg.body_hash), b"new data")
@@ -161,8 +168,8 @@ class TestMailboxSoftDelete(unittest.TestCase):
     self.assertEqual(row_field(row, "is_deleted", int), 1)
 
   def test_delete_soft_deletes_messages(self):
-    db_message_add(self.db, 1, self.mailbox_id, 1700000000, "\\Seen\\", 4, b"data", "1")
-    db_message_add(self.db, 2, self.mailbox_id, 1700000001, "\\Seen\\", 4, b"data", "2")
+    db_message_add(self.db, 1, self.mailbox_id, 1700000000, "\\Seen\\", b"data", "1")
+    db_message_add(self.db, 2, self.mailbox_id, 1700000001, "\\Seen\\", b"data", "2")
     db_mailbox_delete(self.db, self.mailbox_id)
     count = fetchone(self.db, "SELECT COUNT(*) as c FROM messages WHERE mailbox_id=? AND is_deleted=0", (self.mailbox_id,))
     assert count is not None
@@ -192,6 +199,64 @@ class TestMailboxSoftDelete(unittest.TestCase):
     self.assertEqual(mb.name, "Renamed")
 
 
+class TestMergeFlags(unittest.TestCase):
+  @override
+  def setUp(self):
+    self._tmpdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory()
+    self.db_path: pathlib.Path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
+    self.db: sqlite3.Connection = db_open(self.db_path)
+    self.account: Account = _make_account()
+    db_account_add(self.db, self.account)
+    self.mailbox_id: int = db_mailbox_add(self.db, self.account.key, "INBOX", 12345, 1)
+
+  @override
+  def tearDown(self):
+    self.db.close()
+    self._tmpdir.cleanup()
+
+  def _add_message(self, uid: int, flags_s: str = "\\Seen\\"):
+    db_message_add(self.db, uid, self.mailbox_id, 1700000000, flags_s, b"data", str(uid))
+
+  def test_local_keywords_preserved(self):
+    self._add_message(1, "\\Seen\\MyTag\\")
+    changed = db_messages_merge_flags(self.db, self.mailbox_id, [(1, "\\Answered\\")])
+    self.assertEqual(changed, 1)
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(msg.flags_s, "\\Answered\\MyTag\\")
+
+  def test_remote_keywords_kept(self):
+    self._add_message(1, "\\Seen\\")
+    changed = db_messages_merge_flags(self.db, self.mailbox_id, [(1, "\\Seen\\RemoteKw\\")])
+    self.assertEqual(changed, 1)
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(msg.flags_s, "\\RemoteKw\\Seen\\")
+
+  def test_system_flags_replaced_by_remote(self):
+    self._add_message(1, "\\Seen\\Flagged\\")
+    changed = db_messages_merge_flags(self.db, self.mailbox_id, [(1, "\\Answered\\")])
+    self.assertEqual(changed, 1)
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(msg.flags_s, "\\Answered\\")
+
+  def test_soft_deleted_restored(self):
+    self._add_message(1, "\\Seen\\MyTag\\")
+    _ = db_message_delete_except(self.db, self.mailbox_id, set(), 1)
+    changed = db_messages_merge_flags(self.db, self.mailbox_id, [(1, "\\Seen\\")])
+    self.assertEqual(changed, 1)
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertFalse(msg.is_deleted)
+    self.assertEqual(msg.flags_s, "\\MyTag\\Seen\\")
+
+  def test_unchanged_not_rewritten(self):
+    self._add_message(1, "\\Seen\\")
+    changed = db_messages_merge_flags(self.db, self.mailbox_id, [(1, "\\Seen\\"), (2, "\\Seen\\")])
+    self.assertEqual(changed, 0)
+
+
 class TestSchemaMigration(unittest.TestCase):
   def test_is_deleted_columns_exist(self):
     tmpdir = tempfile.TemporaryDirectory()
@@ -214,6 +279,24 @@ class TestSchemaMigration(unittest.TestCase):
     self.assertIn("is_deleted", msg_cols)
     mb_cols = [row_field(r, "name", str) for r in iter_rows(db, "PRAGMA table_info(mailboxes)")]
     self.assertIn("is_deleted", mb_cols)
+    db.close()
+    tmpdir.cleanup()
+
+  def test_size_migration_fixes_wrong_sizes(self):
+    tmpdir = tempfile.TemporaryDirectory()
+    db_path = pathlib.Path(tmpdir.name) / "test.sqlite"
+    db = db_open(db_path)
+    db_account_add(db, _make_account())
+    mailbox_id = db_mailbox_add(db, "test@example.com", "INBOX", 12345, 1)
+    db_message_add(db, 1, mailbox_id, 1700000000, "\\Seen\\", b"hello world", "1")
+    _ = db.execute("UPDATE messages SET size=0")
+    _ = db.execute("PRAGMA user_version=0")
+    db.commit()
+    db.close()
+    db = db_open(db_path)
+    msg = db_message_get_by_uid(db, mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(msg.size, len(b"hello world"))
     db.close()
     tmpdir.cleanup()
 

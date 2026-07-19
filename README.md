@@ -75,21 +75,24 @@ which configured account the connection uses.
 - Local mailboxes for proxy-only storage — messages in them never leave the
   proxy and are never synced to the remote server
 - IDLE for push notifications from the remote server
-- STARTTLS on the proxy side (bundled self-signed certificate);
-  DIRECT/STARTTLS/NONE modes toward the remote server
+- STARTTLS on the proxy side (bundled self-signed certificate by default,
+  custom certificate configurable); DIRECT/STARTTLS/NONE toward the remote
+  server
 - Presets for Gmail, Microsoft, and Yahoo; custom OAuth2 configs supported
 - Zero runtime dependencies (Python 3.13 standard library)
 
 ## Configuration
 
-| Field         | Type   | Default     | Description                              |
-|---------------|--------|-------------|------------------------------------------|
-| `domain`      | string | required    | Domain shown in the IMAP greeting        |
-| `log_level`   | string | `"DEBUG"`   | Python logging level                     |
-| `host`        | string | `"0.0.0.0"` | Bind address                            |
-| `imap_port`   | int    | `143`       | Local IMAP port                         |
-| `smtp_port`   | int    | `587`       | Local SMTP port                         |
-| `db_path`     | string | required    | Path to the SQLite database              |
+| Field           | Type   | Default     | Description                              |
+|-----------------|--------|-------------|------------------------------------------|
+| `domain`        | string | required    | Domain shown in the IMAP greeting        |
+| `log_level`     | string | `"DEBUG"`   | Python logging level                     |
+| `host`          | string | `"0.0.0.0"` | Bind address                            |
+| `imap_port`     | int    | `143`       | Local IMAP port                         |
+| `smtp_port`     | int    | `587`       | Local SMTP port                         |
+| `db_path`       | string | required    | Path to the SQLite database              |
+| `tls_cert_path` | string | unset       | TLS certificate for STARTTLS (bundled self-signed cert if unset) |
+| `tls_key_path`  | string | unset       | TLS private key for STARTTLS (must be set together with `tls_cert_path`) |
 
 The proxy password is read from the `MAILPROXY_PASSWORD` environment variable.
 
@@ -157,7 +160,8 @@ The proxy exposes three kinds of mailboxes:
   created automatically from the remote `LIST` and kept in sync (new messages,
   flag changes, deletions) when selected, on `NOOP`, and during `IDLE`.
   `CREATE`, `DELETE`, `RENAME`, `COPY`, `APPEND`, `STORE`, and `EXPUNGE` are
-  forwarded to the remote server.
+  forwarded to the remote server. Keyword (non-system) flags are stored
+  locally only and are preserved across syncs.
 - **Local mailboxes** exist only in the proxy's database. They are managed via
   the `mailbox` CLI commands (not via IMAP) and are useful for archive/storage
   that should never touch the remote server. Messages can be filed into them
@@ -215,7 +219,7 @@ smtp.sendmail("you@example.com", "client@example.com", "Your invoice is ready")
 ## Testing
 
 ```
-python -m unittest discover -s tests    # 156 unit tests
+python -m unittest discover -s tests    # 171 unit tests
 python -m tests.e2e_test               # end-to-end protocol test
 python -m ruff check mailproxy/ tests/ # lint
 ```

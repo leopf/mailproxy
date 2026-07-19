@@ -1,4 +1,4 @@
-import re, base64, json, typing
+import re, base64, importlib.resources, json, pathlib, ssl, typing
 from typing import TypeGuard
 
 
@@ -23,6 +23,16 @@ def match_lineb(pattern: bytes, line: bytes, flags: int = re.I) -> dict[str, byt
   m = re.fullmatch(pattern, line, flags)
   if m is None: return None
   else: return { "": b"" } | m.groupdict()
+
+def server_tls_context(cert_path: pathlib.Path | None, key_path: pathlib.Path | None) -> ssl.SSLContext:
+  ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+  if cert_path is not None and key_path is not None:
+    ctx.load_cert_chain(cert_path, key_path)
+  else:
+    with importlib.resources.path("mailproxy.assets", "dummy-cert.pem") as dummy_cert, \
+        importlib.resources.path("mailproxy.assets", "dummy-key.pem") as dummy_key:
+      ctx.load_cert_chain(dummy_cert, dummy_key)
+  return ctx
 
 def encode_7bit_mailbox_name(s: str):
     return re.sub(

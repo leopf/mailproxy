@@ -1,9 +1,9 @@
-import asyncio, logging, re, ssl, importlib.resources
+import asyncio, logging, re
 from mailproxy.db import db_open
 from mailproxy.auth import authenticate_sasl
 from mailproxy.model import Account, Config
 from mailproxy.smtp_backend import smtp_forward_mail
-from mailproxy.utils import match_line
+from mailproxy.utils import match_line, server_tls_context
 
 async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
   def write_line(line: str):
@@ -16,7 +16,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
     write_line(f"{code} {textstring}")
 
   account: Account | None = None
-  sender: str = ""
+  sender: str | None = None
   recipients: list[str] = []
   tls_active: bool = False
 
@@ -34,12 +34,12 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
           return
         case "HELO":
           logging.debug("HELO connected from domain: " + rest)
-          sender = ""
+          sender = None
           recipients.clear()
           reply(250, config.domain)
         case "EHLO":
           logging.debug("EHLO connected from domain: " + rest)
-          sender = ""
+          sender = None
           recipients.clear()
           write_line(f"250-{config.domain} hello")
           if not tls_active: write_line("250-STARTTLS")
@@ -48,7 +48,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
           reply(250, "OK")
         case "RSET":
           logging.debug("resetting connection")
-          sender = ""
+          sender = None
           recipients.clear()
           reply(250, "OK")
         case "AUTH" if (m:=match_line(r"PLAIN (?P<data>\S+)", rest)):
@@ -77,42 +77,45 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
           recipients.clear()
           reply(250, "OK")
         case "RCPT" if account is not None and (m:=match_line(r"TO:<(?P<recipient>.*)>( .*)?", rest)):
-          logging.debug("added recipient: " + m["recipient"])
-          recipients.append(m["recipient"])
-          reply(250, "OK")
-        case "DATA" if account is not None:
-          reply(354, "Start mail input; end with <CRLF>.<CRLF>")
-          mail_buf = bytearray()
-          while True:
-            data_line = await reader.readuntil(b"\r\n")
-            if data_line == b".\r\n":
-              break
-            if data_line.startswith(b"."):
-              mail_buf.extend(data_line[1:])
-            else:
-              mail_buf.extend(data_line)
-          mail_data = bytes(mail_buf)
-          try:
-            await smtp_forward_mail(config.db_path, account, sender, tuple(recipients), mail_data)
+          if sender is None:
+            reply(503, "5.5.1 Bad sequence of commands")
+          else:
+            logging.debug("added recipient: " + m["recipient"])
+            recipients.append(m["recipient"])
             reply(250, "OK")
-          except Exception as e:
-            logging.error("failed to send message: %s", e)
-            reply(451, "local error in processing")
-          finally:
-            sender = ""
-            recipients.clear()
+        case "DATA" if account is not None:
+          if sender is None or not recipients:
+            reply(503, "5.5.1 Bad sequence of commands")
+          else:
+            reply(354, "Start mail input; end with <CRLF>.<CRLF>")
+            mail_buf = bytearray()
+            while True:
+              data_line = await reader.readuntil(b"\r\n")
+              if data_line == b".\r\n":
+                break
+              if data_line.startswith(b"."):
+                mail_buf.extend(data_line[1:])
+              else:
+                mail_buf.extend(data_line)
+            mail_data = bytes(mail_buf)
+            try:
+              await smtp_forward_mail(config.db_path, account, sender, tuple(recipients), mail_data)
+              reply(250, "OK")
+            except Exception as e:
+              logging.error("failed to send message: %s", e)
+              reply(451, "local error in processing")
+            finally:
+              sender = None
+              recipients.clear()
         case "MAIL" | "RCPT" | "DATA" if account is None:
           reply(530, "5.7.0  Authentication required")
         case "VRFY":
           reply(252, "cannot VRFY")
         case "STARTTLS" if not tls_active:
           reply(220, "Ready to start TLS")
-          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-          with importlib.resources.path("mailproxy.assets", "dummy-cert.pem") as cert_path, importlib.resources.path("mailproxy.assets", "dummy-key.pem") as key_path:
-            ctx.load_cert_chain(cert_path, key_path)
-          await writer.start_tls(ctx)
+          await writer.start_tls(server_tls_context(config.tls_cert_path, config.tls_key_path))
           tls_active = True
-          sender = ""
+          sender = None
           recipients.clear()
           logging.debug("SMTP STARTTLS: TLS upgrade complete")
         case "STARTTLS":

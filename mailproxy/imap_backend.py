@@ -2,7 +2,7 @@ import asyncio, base64, datetime, logging, ssl
 from dataclasses import dataclass
 from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
-from mailproxy.db import db_message_add, db_message_delete_except, db_message_update_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
+from mailproxy.db import db_message_add, db_message_delete_except, db_messages_merge_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
 from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, format_internal_date, imap_to_quoted_string, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
 from mailproxy.utils import encode_7bit_mailbox_name
@@ -75,7 +75,7 @@ class IMAPRemoteConnection:
           db_mailbox_update_sync(db, mailbox.id, uid_next=uid_next, flags_s=flags_s)
 
     if uid_next > last_synced + 1:
-      self._start_command(b"UID FETCH %d:* (UID FLAGS INTERNALDATE RFC822.SIZE BODY[])" % (last_synced + 1,))
+      self._start_command(b"UID FETCH %d:* (UID FLAGS INTERNALDATE BODY[])" % (last_synced + 1,))
       max_uid = 0
       count = 0
       with db_open(self.config.db_path) as db:
@@ -91,11 +91,10 @@ class IMAPRemoteConnection:
             continue
           flags = items.get(b"FLAGS", b"")
           internal_date = items.get(b"INTERNALDATE", b"")
-          size = items.get(b"RFC822.SIZE", 0)
           body = items.get(b"BODY[]", b"")
           msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
           received_date = parse_internal_date(internal_date) if isinstance(internal_date, bytes) and internal_date else int(datetime.datetime.now().timestamp())
-          db_message_add(db, uid_int, mailbox_id, received_date, msg_flags_s, int(size) if isinstance(size, int) else 0, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int))
+          db_message_add(db, uid_int, mailbox_id, received_date, msg_flags_s, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int))
           db.commit()
           if uid_int > max_uid: max_uid = uid_int
           count += 1
@@ -125,9 +124,8 @@ class IMAPRemoteConnection:
 
       with db_open(self.config.db_path) as db:
         if flag_updates:
-          for uid, f_s in flag_updates:
-            db_message_update_flags(db, mailbox_id, uid, f_s, restore=True)
-          logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, len(flag_updates))
+          changed = db_messages_merge_flags(db, mailbox_id, flag_updates)
+          logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, changed)
         deleted_count = db_message_delete_except(db, mailbox_id, seen_uids, last_synced)
         if deleted_count > 0:
           logging.debug("sync_mailbox: '%s' soft-deleted %d messages (removed on remote)", mailbox_name, deleted_count)
@@ -185,9 +183,16 @@ class IMAPRemoteConnection:
     await self._read_until_response()
     await self.sync_mailbox_list()
 
-  async def uid_expunge(self, uids: list[int]):
-    if uids:
+  async def uid_expunge(self, uids: list[int], mailbox_name: str):
+    if not uids:
+      return
+    if b"UIDPLUS" in self._capabilities:
       self._start_command(b"UID EXPUNGE %s" % (b",".join(b"%d" % (u,) for u in uids),))
+      await self._read_until_response()
+    else:
+      logging.debug("uid_expunge: remote lacks UIDPLUS, falling back to SELECT + EXPUNGE")
+      await self._command_select(mailbox_name)
+      self._start_command(b"EXPUNGE")
       await self._read_until_response()
 
   async def uid_copy(self, uids: list[int], dest_mailbox: str):

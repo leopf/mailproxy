@@ -1,4 +1,4 @@
-import asyncio, dataclasses, datetime, logging, re, ssl, sqlite3, importlib.resources
+import asyncio, dataclasses, datetime, logging, re, sqlite3
 from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import db_mailbox_by_name, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_delete, \
@@ -6,10 +6,11 @@ from mailproxy.db import db_mailbox_by_name, db_mailbox_count_deleted, db_mailbo
     db_message_add, db_message_body_get, db_message_copy, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_open, \
     db_universe_count, db_universe_count_deleted, db_universe_count_unseen, db_universe_max_uid, db_universe_messages, db_universe_size
 from mailproxy.imap_backend import IMAPRemoteConnection
-from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
+from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, SYSTEM_FLAGS, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
     filter_headers, flags_to_s, format_internal_date, header_contains, body_contains, text_contains, parse_search_date, \
     imap_to_quoted_string, parse_internal_date, parse_sequence_set, split_message
 from mailproxy.model import Account, Config, Mailbox, Message
+from mailproxy.utils import server_tls_context
 
 _SEARCH_FLAGS = {
   b"SEEN": b"\\Seen", b"UNSEEN": b"\\Seen",
@@ -28,8 +29,6 @@ _FETCH_ITEM_EXPANSION = {
   b"FULL": (b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE", b"BODY[]"),
 }
 
-_REMOTE_SYSTEM_FLAGS = frozenset({"Seen", "Answered", "Flagged", "Deleted", "Draft", "Recent"})
-
 _UNIVERSE_MAILBOX = "Universe"
 
 class IMAPServerConnection:
@@ -41,7 +40,7 @@ class IMAPServerConnection:
     self._remote_connection: IMAPRemoteConnection | None = None
     self._mailbox: Mailbox | None = None
     self._mailbox_read_only: bool = False
-    self._capabilities: list[bytes] = [b"IMAP4rev1", b"AUTH=PLAIN", b"STARTTLS", b"ENABLE", b"IDLE"]
+    self._capabilities: list[bytes] = [b"IMAP4rev1", b"AUTH=PLAIN", b"STARTTLS", b"ENABLE", b"IDLE", b"UIDPLUS"]
     self._tls_active: bool = False
     self._is_universe_mailbox: bool = False
 
@@ -117,10 +116,7 @@ class IMAPServerConnection:
       self._write_response(b"NO", b"TLS already active")
       return
     self._write_response(b"OK", b"Begin TLS negotiation now")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    with importlib.resources.path("mailproxy.assets", "dummy-cert.pem") as cert_path, importlib.resources.path("mailproxy.assets", "dummy-key.pem") as key_path:
-      ctx.load_cert_chain(cert_path, key_path)
-    await self._writer.start_tls(ctx)
+    await self._writer.start_tls(server_tls_context(self._config.tls_cert_path, self._config.tls_key_path))
     self._tls_active = True
     self._capabilities = [c for c in self._capabilities if c != b"STARTTLS"]
     self._mailbox = None
@@ -352,7 +348,7 @@ class IMAPServerConnection:
       with db_open(self._config.db_path) as db:
         deleted = [m.uid for m in db_message_list(db, mailbox.id) if "\\Deleted" in m.flags_s]
       if deleted and mailbox.is_remote:
-        await remote.uid_expunge(deleted)
+        await remote.uid_expunge(deleted, mailbox.name)
       with db_open(self._config.db_path) as db:
         for uid in deleted:
           db_message_delete_by_uid(db, mailbox.id, uid)
@@ -691,7 +687,7 @@ class IMAPServerConnection:
     if silent: op_s = op_s[:-len(b".SILENT")]
 
     op_mode = op_s[0:1] if op_s[:1] in (b"+", b"-") else b"="
-    remote_new_flags = {f for f in new_flags if f in _REMOTE_SYSTEM_FLAGS}
+    remote_new_flags = {f for f in new_flags if f in SYSTEM_FLAGS}
     remote_flags_s = flags_set_to_s(remote_new_flags)
 
     logging.debug("STORE: seq_set=%s op=%s flags=%s uid_mode=%s remote_flags=%s", seq_set_s.decode(), op_s.decode(), sorted(new_flags), uid_mode, remote_flags_s)
@@ -765,7 +761,7 @@ class IMAPServerConnection:
     else:
       with db_open(self._config.db_path) as db:
         uid = db_mailbox_max_uid(db, mailbox.id) + 1
-        db_message_add(db, uid, mailbox.id, int(datetime.datetime.now().timestamp()), flags_s, len(data), data, None)
+        db_message_add(db, uid, mailbox.id, int(datetime.datetime.now().timestamp()), flags_s, data, None)
         db_mailbox_update_sync(db, mailbox.id, uid_next=uid + 1, last_synced_uid=uid)
 
     self._write_response(b"OK", b"APPEND completed")
@@ -889,7 +885,7 @@ class IMAPServerConnection:
     deleted.sort(key=lambda x: x[0])
 
     if mailbox.is_remote:
-      await remote.uid_expunge([m.uid for _, m in deleted])
+      await remote.uid_expunge([m.uid for _, m in deleted], mailbox.name)
 
     offset = 0
     for seq, msg in deleted:
