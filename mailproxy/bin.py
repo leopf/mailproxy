@@ -2,7 +2,6 @@ import functools, asyncio, logging, argparse, pathlib, os, dataclasses, webbrows
 from typing import TypeVar
 from mailproxy.config import config_from_dict, provider_config_from_dict
 from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_mailbox_add, db_mailbox_by_name, db_mailbox_delete, db_mailbox_list, db_mailbox_rename, db_open
-from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_frontend import handle_imap
 from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code
 from mailproxy.smtp_frontend import smtp_server_handle_client
@@ -54,7 +53,7 @@ def _add_smtp_args(p: argparse.ArgumentParser) -> None:
   _ = p.add_argument("--smtp-tlsmode", type=str.upper, choices=[m.value for m in TLSMode])
 
 def _add_provider_config_args(p: argparse.ArgumentParser) -> None:
-  _ = p.add_argument("--preset", help="preset name (gmail, microsoft, yahoo, fastmail)")
+  _ = p.add_argument("--preset", help="preset name (gmail, microsoft, yahoo)")
   _ = p.add_argument("--provider-config", type=pathlib.Path, help="path to provider config json")
 
 def _ns_get(args: argparse.Namespace, name: str, expected: type[T]) -> T:
@@ -95,13 +94,6 @@ async def exec_run(config: Config):
 
     imap_server = await asyncio.start_server(functools.partial(handle_imap, config), config.host, config.imap_port, limit=2**24)
     _ = tg.create_task(imap_server.serve_forever(), name="IMAP server")
-
-async def exec_dev(config: Config, address: str, _token: str):
-  with db_open(config.db_path) as db:
-    account = db_account_get_by_address(db, address)
-  if account is None:
-    raise RuntimeError(f"no account for address '{address}'")
-  _ = await IMAPRemoteConnection.open(config, account)
 
 def exec_account_add(config: Config, addresses: list[str], preset: str | None, provider_config_path: pathlib.Path | None,
     refresh_token: str | None, imap_host: str | None, imap_port: int | None, imap_tlsmode: str | None,
@@ -340,11 +332,6 @@ def main():
   _ = get_access_token_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
   _ = get_access_token_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
 
-  dev_parser = subparsers.add_parser("dev")
-  _ = dev_parser.add_argument("--config", "-C", help="config path", required=True, type=pathlib.Path)
-  _ = dev_parser.add_argument("--address", "-A", help="email address", required=True, type=str)
-  _ = dev_parser.add_argument("--token", "-T", help="access token (unused, kept for compat)", required=False, type=str)
-
   args = parser.parse_args()
 
   command = _ns_get(args, "command", str)
@@ -383,9 +370,6 @@ def main():
   elif command == "get-access-token":
     config = _load_config(_ns_get(args, "config", pathlib.Path))
     exec_get_access_token(config, _ns_get(args, "address", str))
-  elif command == "dev":
-    config = _load_config(_ns_get(args, "config", pathlib.Path))
-    asyncio.run(exec_dev(config, _ns_get(args, "address", str), _ns_get(args, "token", str)))
   else:
     raise RuntimeError("unknown command!")
 

@@ -61,17 +61,22 @@ mailproxy run -C config.json
 ```
 
 Point your mail client or scripts at the configured `host`:`imap_port` (IMAP)
-and `host`:`smtp_port` (SMTP). Use any username and the proxy password you set.
+and `host`:`smtp_port` (SMTP). Log in with one of the account's addresses as
+the username and the proxy password as the password. The username selects
+which configured account the connection uses.
 
 ## Features
 
 - Handles OAuth2 token refresh internally; clients authenticate with a password
 - Local SQLite cache with soft-delete — deleted messages are marked, not removed
 - Standard IMAP4rev1 and SMTP — any IMAP/SMTP library works as a client
-- Virtual mailboxes (`Virtual/All`, `Virtual/Unseen`, `Virtual/Flagged`) for
-  cross-folder views
+- `Universe` mailbox: read-only virtual view over all messages of an account,
+  including soft-deleted ones — your backup is browsable from any mail client
+- Local mailboxes for proxy-only storage — messages in them never leave the
+  proxy and are never synced to the remote server
 - IDLE for push notifications from the remote server
-- STARTTLS and implicit TLS on both IMAP and SMTP
+- STARTTLS on the proxy side (bundled self-signed certificate);
+  DIRECT/STARTTLS/NONE modes toward the remote server
 - Presets for Gmail, Microsoft, and Yahoo; custom OAuth2 configs supported
 - Zero runtime dependencies (Python 3.13 standard library)
 
@@ -95,9 +100,12 @@ mailproxy login -C config.json --preset gmail          # OAuth2 login flow
 mailproxy account add -C config.json -A you@... ...     # Add an account
 mailproxy account list -C config.json                   # List accounts
 mailproxy account remove -C config.json -A you@...      # Remove an account
+mailproxy mailbox add -C config.json -A you@... -N Archive    # Create a local mailbox
+mailproxy mailbox list -C config.json -A you@...              # List mailboxes
+mailproxy mailbox remove -C config.json -A you@... -N Archive # Remove a local mailbox
+mailproxy mailbox rename -C config.json -A you@... --old-name X --new-name Y
 mailproxy get-access-token -C config.json -A you@...    # Test OAuth2 refresh
 mailproxy run -C config.json                            # Run the proxy
-mailproxy dev -C config.json -A you@...                 # Debug a remote connection
 ```
 
 ### Adding accounts
@@ -141,14 +149,35 @@ mailproxy account add -C config.json -A you@example.com \
 
 Multiple addresses can be added by repeating `-A`; the first is the account key.
 
+## Mailboxes
+
+The proxy exposes three kinds of mailboxes:
+
+- **Remote mailboxes** mirror the folders on the remote server. They are
+  created automatically from the remote `LIST` and kept in sync (new messages,
+  flag changes, deletions) when selected, on `NOOP`, and during `IDLE`.
+  `CREATE`, `DELETE`, `RENAME`, `COPY`, `APPEND`, `STORE`, and `EXPUNGE` are
+  forwarded to the remote server.
+- **Local mailboxes** exist only in the proxy's database. They are managed via
+  the `mailbox` CLI commands (not via IMAP) and are useful for archive/storage
+  that should never touch the remote server. Messages can be filed into them
+  with `COPY` or `APPEND` from any IMAP client.
+- **`Universe`** is a virtual, read-only mailbox computed on-the-fly. It
+  contains every message stored for the account across all mailboxes —
+  **including soft-deleted ones** (see below). It cannot be modified:
+  `STORE`, `APPEND`, `COPY`, `EXPUNGE`, and `DELETE` against it are rejected.
+
 ## Backup behavior
 
 When a message or mailbox is deleted (via `EXPUNGE`, `CLOSE`, or `DELETE`),
 the operation is forwarded to the remote server as normal, but locally the
 record is **soft-deleted** rather than removed from disk:
 
-- Soft-deleted items are hidden from all queries — the proxy behaves
-  identically to a normal server from the client's perspective
+- Soft-deleted items are hidden from all queries in their original mailbox —
+  the proxy behaves identically to a normal server from the client's
+  perspective
+- Soft-deleted messages remain visible in the read-only `Universe` mailbox,
+  so the local backup can be browsed and recovered from any mail client
 - If the remote still has the message, re-syncing automatically restores it
 - If the remote has lost the data, the soft-deleted record persists as a
   permanent local backup
@@ -163,7 +192,7 @@ Standard IMAP/SMTP libraries work as clients:
 import imaplib, email
 
 imap = imaplib.IMAP4("host", 9143)
-imap.login("anything", "yourproxypassword")
+imap.login("you@gmail.com", "yourproxypassword")
 imap.select("INBOX")
 
 _, msgs = imap.search(None, 'SUBJECT', '"invoice"')
@@ -179,14 +208,14 @@ for num in msgs[0].split():
 import smtplib
 
 smtp = smtplib.SMTP("host", 9587)
-smtp.login("anything", "yourproxypassword")
+smtp.login("you@gmail.com", "yourproxypassword")
 smtp.sendmail("you@example.com", "client@example.com", "Your invoice is ready")
 ```
 
 ## Testing
 
 ```
-python -m unittest discover -s tests    # 112 unit tests
+python -m unittest discover -s tests    # 156 unit tests
 python -m tests.e2e_test               # end-to-end protocol test
 python -m ruff check mailproxy/ tests/ # lint
 ```
@@ -212,7 +241,8 @@ mailproxy/
 
 The proxy maintains a SQLite database with `accounts`, `mailboxes`, and
 `messages` tables. On `SELECT` or `NOOP`, the backend syncs new messages and
-flag changes from the remote. Virtual mailboxes are computed on-the-fly.
+flag changes from the remote. The `Universe` mailbox is computed on-the-fly;
+local mailboxes never leave the database.
 
 ## TLS modes
 
