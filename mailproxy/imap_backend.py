@@ -1,11 +1,12 @@
 import asyncio, base64, datetime, logging, ssl
 from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator
 from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
 from mailproxy.db import db_message_add, db_message_delete_except, db_messages_merge_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
 from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, format_internal_date, imap_to_quoted_string, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
-from mailproxy.utils import encode_7bit_mailbox_name
+from mailproxy.utils import KeyedLock, encode_7bit_mailbox_name
 
 
 def _is_fetch_items(value: object) -> TypeGuard[dict[bytes, object]]:
@@ -17,6 +18,15 @@ def _is_bytes_list(value: object) -> TypeGuard[list[bytes]]:
   return all(isinstance(v, bytes) for v in cast(list[object], value))
 
 FETCH_BATCH_SIZE = 500
+
+_sync_locks: KeyedLock[tuple[str, str]] = KeyedLock()
+_mailbox_list_locks: KeyedLock[str] = KeyedLock()
+
+def iter_uid_batches(uid_low: int, uid_high: int, batch_size: int) -> Iterator[tuple[int, int]]:
+  if uid_low > uid_high:
+    return
+  for start in range(uid_low, uid_high + 1, batch_size):
+    yield start, min(start + batch_size - 1, uid_high)
 
 @dataclass(frozen=True)
 class SelectResult:
@@ -30,6 +40,24 @@ class SelectResult:
 class ImapResponse:
   kind: bytes
   args: list[object]
+
+@dataclass
+class _MessageRecord:
+  uid: int
+  flags_s: str
+  internal_date: bytes
+  body: bytes
+
+@dataclass
+class _FlagRecord:
+  uid: int
+  flags_s: str
+
+@dataclass
+class _SyncState:
+  mailbox_id: int
+  last_synced_uid: int
+  uid_next: int
 
 class IMAPRemoteConnection:
   _tls_context: ssl.SSLContext = ssl.create_default_context()
@@ -53,14 +81,20 @@ class IMAPRemoteConnection:
       try: self._writer.close()
       except Exception: pass
 
-  async def sync_mailbox(self, mailbox_name: str):
-    logging.debug("sync_mailbox: '%s'", mailbox_name)
-    select_result = await self._command_select(mailbox_name)
+  async def sync_mailbox(self, mailbox_name: str) -> None:
+    async with _sync_locks.acquire((self.account.key, mailbox_name)):
+      logging.debug("sync_mailbox: '%s'", mailbox_name)
+      select_result = await self._command_select(mailbox_name)
+      state = await self._apply_mailbox_state(mailbox_name, select_result)
+      await self._fetch_new_messages(mailbox_name, state)
+      if state.last_synced_uid > 0:
+        await self._sync_flag_changes_and_deletions(mailbox_name, state.mailbox_id, state.last_synced_uid)
+
+  async def _apply_mailbox_state(self, mailbox_name: str, select_result: SelectResult) -> _SyncState:
     uid_validity = select_result.uid_validity
     uid_next = select_result.uid_next
     flags_s = select_result.flags_s
     logging.debug("sync_mailbox: '%s' uid_validity=%d uid_next=%d exists=%d", mailbox_name, uid_validity, uid_next, select_result.exists)
-
     with db_open(self.config.db_path) as db:
       mailbox = db_mailbox_by_name(db, self.account.key, mailbox_name)
       if mailbox is None:
@@ -75,79 +109,88 @@ class IMAPRemoteConnection:
           last_synced = 0
         else:
           db_mailbox_update_sync(db, mailbox.id, uid_next=uid_next, flags_s=flags_s)
+    return _SyncState(mailbox_id=mailbox_id, last_synced_uid=last_synced, uid_next=uid_next)
 
-    if uid_next > last_synced + 1:
-      synced = last_synced
-      while uid_next > synced + 1:
-        batch_lo = synced + 1
-        batch_hi = min(synced + FETCH_BATCH_SIZE, uid_next - 1)
-        count = 0
-        self._start_command(b"UID FETCH %d:%d (UID FLAGS INTERNALDATE BODY.PEEK[])" % (batch_lo, batch_hi))
-        with db_open(self.config.db_path) as db:
-          async for resp in self._read_responses():
-            if resp.kind != b"FETCH": continue
-            items = resp.args[1]
-            if not _is_fetch_items(items): continue
-            uid = items.get(b"UID")
-            if not isinstance(uid, int): continue
-            uid_int = uid
-            if uid_int < batch_lo or uid_int > batch_hi: continue
-            flags = items.get(b"FLAGS", b"")
-            internal_date = items.get(b"INTERNALDATE", b"")
-            body = items.get(b"BODY[]", b"")
-            msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
-            received_date = parse_internal_date(internal_date) if isinstance(internal_date, bytes) and internal_date else int(datetime.datetime.now().timestamp())
-            db_message_add(db, uid_int, mailbox_id, received_date, msg_flags_s, bytes(body) if isinstance(body, (bytes, bytearray)) else b"", str(uid_int))
-            count += 1
-          db_mailbox_update_sync(db, mailbox_id, last_synced_uid=batch_hi)
-          db.commit()
-        synced = batch_hi
-        logging.debug("sync_mailbox: '%s' batch %d:%d done (%d messages, %d remaining)", mailbox_name, batch_lo, batch_hi, count, max(uid_next - 1 - batch_hi, 0))
-
-    if last_synced > 0:
-      self._start_command(b"UID FETCH 1:%d (UID FLAGS)" % (last_synced,))
-      flag_updates: list[tuple[int, str]] = []
-      seen_uids: set[int] = set()
-      async for resp in self._read_responses():
-        if resp.kind != b"FETCH": continue
-        items = resp.args[1]
-        if not _is_fetch_items(items): continue
-        uid = items.get(b"UID")
-        if not isinstance(uid, int): continue
-        uid_int = uid
-        seen_uids.add(uid_int)
-        flags = items.get(b"FLAGS", b"")
-        msg_flags_s = flags_to_s(flags) if isinstance(flags, bytes) else "\\\\"
-        flag_updates.append((uid_int, msg_flags_s))
-
+  async def _fetch_new_messages(self, mailbox_name: str, state: _SyncState) -> None:
+    for batch_lo, batch_hi in iter_uid_batches(state.last_synced_uid + 1, state.uid_next - 1, FETCH_BATCH_SIZE):
+      count = 0
+      self._start_command(b"UID FETCH %d:%d (UID FLAGS INTERNALDATE BODY.PEEK[])" % (batch_lo, batch_hi))
       with db_open(self.config.db_path) as db:
-        if flag_updates:
-          changed = db_messages_merge_flags(db, mailbox_id, flag_updates)
-          logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, changed)
-        deleted_count = db_message_delete_except(db, mailbox_id, seen_uids, last_synced)
-        if deleted_count > 0:
-          logging.debug("sync_mailbox: '%s' soft-deleted %d messages (removed on remote)", mailbox_name, deleted_count)
+        async for rec in self._iter_message_records(range_filter=(batch_lo, batch_hi)):
+          received_date = parse_internal_date(rec.internal_date) if rec.internal_date else int(datetime.datetime.now().timestamp())
+          db_message_add(db, rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid))
+          count += 1
+        db_mailbox_update_sync(db, state.mailbox_id, last_synced_uid=batch_hi)
+        db.commit()
+      logging.debug("sync_mailbox: '%s' batch %d:%d done (%d messages, %d remaining)", mailbox_name, batch_lo, batch_hi, count, max(state.uid_next - 1 - batch_hi, 0))
+
+  async def _sync_flag_changes_and_deletions(self, mailbox_name: str, mailbox_id: int, last_synced_uid: int) -> None:
+    self._start_command(b"UID FETCH 1:%d (UID FLAGS)" % (last_synced_uid,))
+    flag_updates: list[tuple[int, str]] = []
+    seen_uids: set[int] = set()
+    async for rec in self._iter_flag_records():
+      seen_uids.add(rec.uid)
+      flag_updates.append((rec.uid, rec.flags_s))
+    with db_open(self.config.db_path) as db:
+      if flag_updates:
+        changed = db_messages_merge_flags(db, mailbox_id, flag_updates)
+        logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, changed)
+      deleted_count = db_message_delete_except(db, mailbox_id, seen_uids, last_synced_uid)
+      if deleted_count > 0:
+        logging.debug("sync_mailbox: '%s' soft-deleted %d messages (removed on remote)", mailbox_name, deleted_count)
+
+  async def _iter_message_records(self, range_filter: tuple[int, int] | None = None) -> AsyncIterator[_MessageRecord]:
+    async for resp in self._read_responses():
+      if resp.kind != b"FETCH": continue
+      items = resp.args[1]
+      if not _is_fetch_items(items): continue
+      uid = items.get(b"UID")
+      if not isinstance(uid, int): continue
+      if range_filter is not None and not (range_filter[0] <= uid <= range_filter[1]): continue
+      flags = items.get(b"FLAGS", b"")
+      internal_date = items.get(b"INTERNALDATE")
+      body = items.get(b"BODY[]")
+      yield _MessageRecord(
+        uid=uid,
+        flags_s=flags_to_s(flags if isinstance(flags, bytes) else b""),
+        internal_date=internal_date if isinstance(internal_date, bytes) and internal_date else b"",
+        body=body if isinstance(body, bytes) else b"",
+      )
+
+  async def _iter_flag_records(self) -> AsyncIterator[_FlagRecord]:
+    async for resp in self._read_responses():
+      if resp.kind != b"FETCH": continue
+      items = resp.args[1]
+      if not _is_fetch_items(items): continue
+      uid = items.get(b"UID")
+      if not isinstance(uid, int): continue
+      flags = items.get(b"FLAGS", b"")
+      yield _FlagRecord(
+        uid=uid,
+        flags_s=flags_to_s(flags if isinstance(flags, bytes) else b""),
+      )
 
   async def sync_mailbox_list(self):
-    logging.debug("sync_mailbox_list: listing remote mailboxes")
-    self._start_command(b"LIST \"\" \"*\"")
-    remote_mailboxes: list[tuple[bytes, bytes, bytes]] = []
-    async for resp in self._read_responses():
-      if resp.kind != b"LIST": continue
-      flags_raw = resp.args[0]
-      delim = resp.args[1]
-      name = resp.args[2]
-      if isinstance(flags_raw, bytes) and isinstance(delim, bytes) and isinstance(name, bytes):
-        remote_mailboxes.append((flags_raw, delim, name))
+    async with _mailbox_list_locks.acquire(self.account.key):
+      logging.debug("sync_mailbox_list: listing remote mailboxes")
+      self._start_command(b"LIST \"\" \"*\"")
+      remote_mailboxes: list[tuple[bytes, bytes, bytes]] = []
+      async for resp in self._read_responses():
+        if resp.kind != b"LIST": continue
+        flags_raw = resp.args[0]
+        delim = resp.args[1]
+        name = resp.args[2]
+        if isinstance(flags_raw, bytes) and isinstance(delim, bytes) and isinstance(name, bytes):
+          remote_mailboxes.append((flags_raw, delim, name))
 
-    with db_open(self.config.db_path) as db:
-      added = 0
-      for flags, delim, name_b in remote_mailboxes:
-        name_s = name_b.decode("utf-8")
-        if db_mailbox_by_name(db, self.account.key, name_s) is None:
-          _ = db_mailbox_add(db, self.account.key, name_s, 0, 1, flags_to_s(flags), delim.decode("ascii") if delim else "/")
-          added += 1
-    logging.debug("sync_mailbox_list: %d remote mailboxes, %d new", len(remote_mailboxes), added)
+      with db_open(self.config.db_path) as db:
+        added = 0
+        for flags, delim, name_b in remote_mailboxes:
+          name_s = name_b.decode("utf-8")
+          if db_mailbox_by_name(db, self.account.key, name_s) is None:
+            _ = db_mailbox_add(db, self.account.key, name_s, 0, 1, flags_to_s(flags), delim.decode("ascii") if delim else "/")
+            added += 1
+      logging.debug("sync_mailbox_list: %d remote mailboxes, %d new", len(remote_mailboxes), added)
 
   async def uid_store(self, uid: int, op: bytes, flags_s: str):
     flags_b = b" ".join(b"\\" + f.encode("ascii") for f in flags_s.strip("\\").split("\\") if f) if flags_s != "\\" else b""

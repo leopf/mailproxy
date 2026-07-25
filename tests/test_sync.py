@@ -2,7 +2,7 @@ import asyncio, logging, pathlib, re, tempfile, typing, unittest
 from typing import override
 from mailproxy import imap_backend
 from mailproxy.db import db_account_add, db_message_body_get, db_message_get_by_uid, db_message_list, db_mailbox_by_name, db_open
-from mailproxy.imap_backend import IMAPRemoteConnection
+from mailproxy.imap_backend import IMAPRemoteConnection, iter_uid_batches
 from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 
 
@@ -29,12 +29,17 @@ class _FakeIMAPServer:
     self._drop_after_items: int = drop_after_items
     self._idle_delay: float = idle_delay
     self._server: asyncio.Server | None = None
+    self._body_fetch_count: int = 0
 
   @property
   def port(self) -> int:
     assert self._server is not None and self._server.sockets
     addr = typing.cast(tuple[str, int], self._server.sockets[0].getsockname())
     return addr[1]
+
+  @property
+  def body_fetch_count(self) -> int:
+    return self._body_fetch_count
 
   async def start(self):
     self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -72,14 +77,17 @@ class _FakeIMAPServer:
           assert m is not None
           lo, hi = int(m.group(1)), int(m.group(2))
           uids = [u for u in sorted(self._messages) if lo <= u <= hi]
+          with_body = b"BODY" in args.upper()
           if self._drop_on_fetch is not None and fetch_cmd_count == self._drop_on_fetch:
             uids = uids[:self._drop_after_items]
             for u in uids:
-              writer.write(self._fetch_item(u))
+              writer.write(self._fetch_item(u, with_body))
+              if with_body: self._body_fetch_count += 1
             await writer.drain()
             break
           for u in uids:
-            writer.write(self._fetch_item(u))
+            writer.write(self._fetch_item(u, with_body))
+            if with_body: self._body_fetch_count += 1
           writer.write(tag + b" OK\r\n")
         elif cmd == b"IDLE":
           if self._idle_delay:
@@ -105,10 +113,12 @@ class _FakeIMAPServer:
       try: writer.close()
       except Exception: pass
 
-  def _fetch_item(self, uid: int) -> bytes:
-    body = self._messages[uid]
+  def _fetch_item(self, uid: int, with_body: bool) -> bytes:
     seq = sorted(self._messages).index(uid) + 1
-    return b'* %d FETCH (UID %d FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {%d}\r\n%s)\r\n' % (seq, uid, len(body), body)
+    if with_body:
+      body = self._messages[uid]
+      return b'* %d FETCH (UID %d FLAGS (\\Seen) INTERNALDATE "01-Jan-2024 00:00:00 +0000" BODY[] {%d}\r\n%s)\r\n' % (seq, uid, len(body), body)
+    return b'* %d FETCH (UID %d FLAGS (\\Seen))\r\n' % (seq, uid)
 
 
 class TestSync(unittest.IsolatedAsyncioTestCase):
@@ -195,6 +205,19 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self._message_count(), 3)
     self.assertEqual(self._last_synced_uid(), 1000)
 
+  async def test_concurrent_sync_serializes_and_avoids_duplicate_fetch(self):
+    messages = {u: b"Subject: msg %d\r\n\r\nbody %d" % (u, u) for u in range(1, 121)}
+    server = await self._start_server(messages)
+    account = _make_account(server.port)
+    conn1 = await IMAPRemoteConnection.open(self.config, account)
+    conn2 = await IMAPRemoteConnection.open(self.config, account)
+    _ = await asyncio.gather(conn1.sync_mailbox("INBOX"), conn2.sync_mailbox("INBOX"))
+    await conn1.shutdown()
+    await conn2.shutdown()
+    self.assertEqual(self._message_count(), 120)
+    self.assertEqual(self._last_synced_uid(), 120)
+    self.assertEqual(server.body_fetch_count, 120)
+
   async def test_idle_cancellation_during_plus_wait_recovers(self):
     messages = {1: b"one"}
     server = await self._start_server(messages, idle_delay=1.0)
@@ -208,6 +231,23 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     await conn.sync_mailbox("INBOX")
     await conn.shutdown()
     self.assertEqual(self._message_count(), 1)
+
+
+class TestIterUidBatches(unittest.TestCase):
+  def test_empty_when_low_exceeds_high(self):
+    self.assertEqual(list(iter_uid_batches(1, 0, 50)), [])
+
+  def test_single_batch_smaller_than_size(self):
+    self.assertEqual(list(iter_uid_batches(1, 120, 500)), [(1, 120)])
+
+  def test_exact_multiple(self):
+    self.assertEqual(list(iter_uid_batches(1, 100, 50)), [(1, 50), (51, 100)])
+
+  def test_final_short_batch(self):
+    self.assertEqual(list(iter_uid_batches(1, 120, 50)), [(1, 50), (51, 100), (101, 120)])
+
+  def test_single_uid_batch(self):
+    self.assertEqual(list(iter_uid_batches(77, 77, 50)), [(77, 77)])
 
 
 if __name__ == "__main__":

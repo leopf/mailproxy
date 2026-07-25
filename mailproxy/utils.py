@@ -1,5 +1,6 @@
-import re, base64, importlib.resources, json, pathlib, ssl, typing
-from typing import TypeGuard
+import re, base64, importlib.resources, json, pathlib, ssl, typing, asyncio, contextlib
+from collections.abc import AsyncGenerator
+from typing import Generic, TypeGuard, TypeVar
 
 
 def json_loads_object(s: str) -> object:
@@ -47,3 +48,19 @@ def decode_7bit_mailbox_name(s: str):
         lambda m: base64.b64decode(m.group(1).replace(',', '/') + '=' * ((4 - len(m.group(1)) % 4) % 4)).decode('utf-16be'),
         s.replace('&-', '&')
     )
+
+
+K = TypeVar("K")
+
+class KeyedLock(Generic[K]):
+  def __init__(self) -> None:
+    self._locks: dict[K, asyncio.Lock] = {}
+
+  @contextlib.asynccontextmanager
+  async def acquire(self, key: K) -> AsyncGenerator[None, None]:
+    lock = self._locks.get(key)
+    if lock is None:
+      lock = asyncio.Lock()
+      self._locks[key] = lock
+    async with lock:
+      yield

@@ -1,5 +1,5 @@
-import unittest
-from mailproxy.utils import match_line, match_lineb, encode_7bit_mailbox_name, decode_7bit_mailbox_name, is_str_object_dict, is_object_list, json_loads_object
+import asyncio, unittest
+from mailproxy.utils import KeyedLock, match_line, match_lineb, encode_7bit_mailbox_name, decode_7bit_mailbox_name, is_str_object_dict, is_object_list, json_loads_object
 
 
 class TestMatchLine(unittest.TestCase):
@@ -92,6 +92,35 @@ class TestTypeGuards(unittest.TestCase):
   def test_json_loads_object(self):
     result = json_loads_object('{"a": 1}')
     self.assertEqual(result, {"a": 1})
+
+
+class TestKeyedLock(unittest.IsolatedAsyncioTestCase):
+  async def test_same_key_serializes(self):
+    lock: KeyedLock[str] = KeyedLock()
+    order: list[str] = []
+
+    async def hold(key: str, label: str, delay: float) -> None:
+      async with lock.acquire(key):
+        order.append(label + "_enter")
+        await asyncio.sleep(delay)
+        order.append(label + "_exit")
+
+    _ = await asyncio.gather(hold("k", "a", 0.05), hold("k", "b", 0.0))
+    self.assertEqual(order, ["a_enter", "a_exit", "b_enter", "b_exit"])
+
+  async def test_different_keys_run_concurrently(self):
+    lock: KeyedLock[str] = KeyedLock()
+    both_entered = asyncio.Event()
+
+    async def hold(key: str) -> None:
+      async with lock.acquire(key):
+        both_entered.set()
+
+    async def wait_other(key: str) -> None:
+      async with lock.acquire(key):
+        self.assertTrue(both_entered.is_set())
+
+    _ = await asyncio.gather(hold("a"), wait_other("b"))
 
 
 if __name__ == "__main__":
