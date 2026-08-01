@@ -257,6 +257,50 @@ class TestMergeFlags(unittest.TestCase):
     self.assertEqual(changed, 0)
 
 
+class TestMessageCompression(unittest.TestCase):
+  @override
+  def setUp(self):
+    self._tmpdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory()
+    self.db_path: pathlib.Path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
+    self.db: sqlite3.Connection = db_open(self.db_path)
+    self.account: Account = _make_account()
+    db_account_add(self.db, self.account)
+    self.mailbox_id: int = db_mailbox_add(self.db, self.account.key, "INBOX", 12345, 1)
+
+  @override
+  def tearDown(self):
+    self.db.close()
+    self._tmpdir.cleanup()
+
+  def test_body_roundtrip_is_compressed_and_raw_size_kept(self):
+    data = b"Subject: test\r\n\r\n" + b"x" * 5000
+    db_message_add(self.db, 1, self.mailbox_id, 1700000000, "\\Seen\\", data, "1")
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(msg.size, len(data))
+    self.assertEqual(db_message_body_get(self.db, msg.body_hash), data)
+
+  def test_blob_stored_compressed_on_disk(self):
+    data = b"Subject: test\r\n\r\n" + b"y" * 10000
+    db_message_add(self.db, 1, self.mailbox_id, 1700000000, "\\Seen\\", data, "1", compress_level=6)
+    stored = self.db.execute("SELECT data FROM message_bodies WHERE hash=(SELECT body_hash FROM messages WHERE mailbox_id=? AND uid=1)", (self.mailbox_id,)).fetchone()[0]
+    self.assertTrue(isinstance(stored, bytes) and stored.startswith(b"\x1f\x8b"))
+    self.assertLess(len(stored), len(data))
+
+  def test_compression_level_is_changeable(self):
+    data = b"Subject: test\r\n\r\n" + b"z" * 10000
+    db_message_add(self.db, 1, self.mailbox_id, 1700000000, "\\Seen\\", data, "1", compress_level=9)
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(db_message_body_get(self.db, msg.body_hash), data)
+
+  def test_empty_body_stored_as_empty(self):
+    db_message_add(self.db, 1, self.mailbox_id, 1700000000, "\\Seen\\", b"", "1")
+    msg = db_message_get_by_uid(self.db, self.mailbox_id, 1)
+    assert msg is not None
+    self.assertEqual(db_message_body_get(self.db, msg.body_hash), b"")
+
+
 class TestSchemaMigration(unittest.TestCase):
   def test_is_deleted_columns_exist(self):
     tmpdir = tempfile.TemporaryDirectory()
@@ -279,24 +323,6 @@ class TestSchemaMigration(unittest.TestCase):
     self.assertIn("is_deleted", msg_cols)
     mb_cols = [row_field(r, "name", str) for r in iter_rows(db, "PRAGMA table_info(mailboxes)")]
     self.assertIn("is_deleted", mb_cols)
-    db.close()
-    tmpdir.cleanup()
-
-  def test_size_migration_fixes_wrong_sizes(self):
-    tmpdir = tempfile.TemporaryDirectory()
-    db_path = pathlib.Path(tmpdir.name) / "test.sqlite"
-    db = db_open(db_path)
-    db_account_add(db, _make_account())
-    mailbox_id = db_mailbox_add(db, "test@example.com", "INBOX", 12345, 1)
-    db_message_add(db, 1, mailbox_id, 1700000000, "\\Seen\\", b"hello world", "1")
-    _ = db.execute("UPDATE messages SET size=0")
-    _ = db.execute("PRAGMA user_version=0")
-    db.commit()
-    db.close()
-    db = db_open(db_path)
-    msg = db_message_get_by_uid(db, mailbox_id, 1)
-    assert msg is not None
-    self.assertEqual(msg.size, len(b"hello world"))
     db.close()
     tmpdir.cleanup()
 

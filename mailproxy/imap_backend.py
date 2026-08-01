@@ -118,7 +118,7 @@ class IMAPRemoteConnection:
       with db_session(self.config.db_path) as db:
         async for rec in self._iter_message_records(range_filter=(batch_lo, batch_hi)):
           received_date = parse_internal_date(rec.internal_date) if rec.internal_date else int(datetime.datetime.now().timestamp())
-          db_message_add(db, rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid))
+          db_message_add(db, rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid), self.config.body_compression_level)
           count += 1
         db_mailbox_update_sync(db, state.mailbox_id, last_synced_uid=batch_hi)
         db.commit()

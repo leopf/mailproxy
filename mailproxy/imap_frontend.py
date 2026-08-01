@@ -528,7 +528,6 @@ class IMAPServerConnection:
     self._write_response(b"OK", b"FETCH completed")
 
   def _parse_header_fields(self, item: bytes) -> list[bytes]:
-    import re
     m = re.search(rb'\((?P<fields>[^)]*)\)', item)
     if m is None:
       return []
@@ -782,7 +781,7 @@ class IMAPServerConnection:
     else:
       with db_session(self._config.db_path) as db:
         uid = db_mailbox_max_uid(db, mailbox.id) + 1
-        db_message_add(db, uid, mailbox.id, int(datetime.datetime.now().timestamp()), flags_s, data, None)
+        db_message_add(db, uid, mailbox.id, int(datetime.datetime.now().timestamp()), flags_s, data, None, self._config.body_compression_level)
         db_mailbox_update_sync(db, mailbox.id, uid_next=uid + 1, last_synced_uid=uid)
 
     self._write_response(b"OK", b"APPEND completed")

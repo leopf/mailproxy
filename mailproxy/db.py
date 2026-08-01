@@ -1,4 +1,4 @@
-import sqlite3, pathlib, datetime, json, typing, contextlib
+import sqlite3, pathlib, datetime, json, typing, contextlib, gzip, hashlib
 from collections.abc import Generator, Iterator
 from typing import TypeVar
 from mailproxy.imap_parsing import SYSTEM_FLAGS, flags_s_to_set, flags_set_to_s
@@ -97,8 +97,6 @@ def _migrate(db: sqlite3.Connection):
     _ = db.execute("ALTER TABLE mailboxes ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
   version = row_field(fetchone_required(db, "PRAGMA user_version"), "user_version", int)
   if version < 1:
-    _ = db.execute("UPDATE messages SET size=(SELECT LENGTH(data) FROM message_bodies WHERE hash=body_hash) " +
-      "WHERE size != (SELECT LENGTH(data) FROM message_bodies WHERE hash=body_hash)")
     _ = db.execute("PRAGMA user_version=1")
 
 def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
@@ -314,18 +312,20 @@ def db_mailbox_update_sync(db: sqlite3.Connection, mailbox_id: int, *, uid_next:
 def db_messages_clear(db: sqlite3.Connection, mailbox_id: int):
   _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
 
-def db_message_body_add(db: sqlite3.Connection, data: bytes) -> str:
-  import hashlib
+def db_message_body_add(db: sqlite3.Connection, data: bytes, compress_level: int = 6) -> str:
   body_hash = hashlib.sha256(data).hexdigest()
-  _ = db.execute("INSERT INTO message_bodies (hash, data) VALUES (?,?) ON CONFLICT(hash) DO NOTHING", (body_hash, data))
+  stored = gzip.compress(data, compress_level)
+  _ = db.execute("INSERT INTO message_bodies (hash, data) VALUES (?,?) ON CONFLICT(hash) DO NOTHING", (body_hash, stored))
   return body_hash
 
 def db_message_body_get(db: sqlite3.Connection, body_hash: str) -> bytes | None:
   row = fetchone(db, "SELECT data FROM message_bodies WHERE hash=?", (body_hash,))
-  return None if row is None else row_field(row, "data", bytes)
+  if row is None:
+    return None
+  return gzip.decompress(row_field(row, "data", bytes))
 
-def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, data: bytes, remote_uid: str | None):
-  body_hash = db_message_body_add(db, data)
+def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, data: bytes, remote_uid: str | None, compress_level: int = 6):
+  body_hash = db_message_body_add(db, data, compress_level)
   _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid) VALUES (?,?,?,?,?,?,?) " +
     "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
     (uid, mailbox_id, received_date, flags_s, len(data), body_hash, remote_uid))

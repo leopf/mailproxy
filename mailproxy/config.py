@@ -54,6 +54,9 @@ def config_from_dict(d: object) -> Config:
   tls_cert_path = _optional_field(d, "tls_cert_path", str)
   tls_key_path = _optional_field(d, "tls_key_path", str)
   log_file = _optional_field(d, "log_file", str)
+  body_compression_level = _field_with_default(d, "body_compression_level", int, 6)
+  if body_compression_level < 1 or body_compression_level > 9:
+    raise ValueError("body_compression_level must be between 1 and 9")
   if (tls_cert_path is None) != (tls_key_path is None):
     raise ValueError("tls_cert_path and tls_key_path must be set together")
   return Config(
@@ -66,6 +69,7 @@ def config_from_dict(d: object) -> Config:
     tls_cert_path=None if tls_cert_path is None else pathlib.Path(tls_cert_path),
     tls_key_path=None if tls_key_path is None else pathlib.Path(tls_key_path),
     log_file=None if log_file is None else pathlib.Path(log_file),
+    body_compression_level=body_compression_level,
   )
 
 def oauth_provider_config_from_dict(d: object) -> OAuthProviderConfig:

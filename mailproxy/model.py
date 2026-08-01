@@ -52,6 +52,7 @@ class Config:
   tls_cert_path: pathlib.Path | None = None
   tls_key_path: pathlib.Path | None = None
   log_file: pathlib.Path | None = None
+  body_compression_level: int = 6
 
 @dataclasses.dataclass(frozen=True)
 class Mailbox:
