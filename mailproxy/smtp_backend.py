@@ -1,4 +1,5 @@
 import asyncio, base64, contextlib, logging, re, ssl
+from collections.abc import Awaitable, Callable
 from mailproxy.auth import account_get_oauth_access_token
 from mailproxy.db import DatabaseSession
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
@@ -47,10 +48,15 @@ async def _smtp_authenticate(writer: asyncio.StreamWriter, reader: asyncio.Strea
       auth_string = f"\0{account.addresses[0]}\0{account.auth.password}"
       _ = await _smtp_send(writer, reader, f"AUTH PLAIN {base64.b64encode(auth_string.encode()).decode()}", expect_code=235)
 
-async def smtp_forward_mail(config: Config, account: Account, sender: str, recipients: tuple[str, ...], mail_data: bytes):
+async def smtp_forward_mail(config: Config, account: Account, sender: str, recipients: tuple[str, ...], mail_data: bytes,
+    open_connection: Callable[..., Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]] | None = None):
   ssl_param = ssl.create_default_context() if account.smtp_tlsmode == TLSMode.DIRECT else None
   logging.debug("SMTP backend: connecting to %s:%d (tls=%s)", account.smtp_host, account.smtp_port, account.smtp_tlsmode)
-  reader, writer = await asyncio.open_connection(account.smtp_host, account.smtp_port, ssl=ssl_param)
+  if open_connection is None:
+    connect = lambda: asyncio.open_connection(account.smtp_host, account.smtp_port, ssl=ssl_param)
+  else:
+    connect = open_connection
+  reader, writer = await connect()
   try:
     greeting_code, _ = await _smtp_read_response(reader)
     if greeting_code != 220:

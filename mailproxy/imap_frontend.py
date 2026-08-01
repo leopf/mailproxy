@@ -1,4 +1,5 @@
 import asyncio, dataclasses, datetime, logging, re
+from collections.abc import Awaitable, Callable
 from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import DatabaseSession
@@ -29,10 +30,12 @@ _FETCH_ITEM_EXPANSION = {
 _UNIVERSE_MAILBOX = "Universe"
 
 class IMAPServerConnection:
-  def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+  def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+      remote_factory: Callable[[Config, Account], Awaitable[IMAPRemoteConnection]] | None = None) -> None:
     self._config: Config = config
     self._reader: IMAPReader = IMAPReader(reader)
     self._writer: asyncio.StreamWriter = writer
+    self._remote_factory: Callable[[Config, Account], Awaitable[IMAPRemoteConnection]] | None = remote_factory
     self._last_tag: bytes | None = None
     self._remote_connection: IMAPRemoteConnection | None = None
     self._mailbox: Mailbox | None = None
@@ -920,7 +923,10 @@ class IMAPServerConnection:
   async def _open_remote(self, account: Account):
     if self._remote_connection is not None:
       await self._remote_connection.shutdown()
-    self._remote_connection = await IMAPRemoteConnection.open(self._config, account)
+    if self._remote_factory is not None:
+      self._remote_connection = await self._remote_factory(self._config, account)
+    else:
+      self._remote_connection = await IMAPRemoteConnection.open(self._config, account)
 
   async def _handle_command(self):
     self._last_tag = await self._reader.read_atom()
