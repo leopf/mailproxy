@@ -1,8 +1,8 @@
-import sqlite3, pathlib, datetime, json, typing, contextlib, gzip, hashlib
-from collections.abc import Generator, Iterator
+import sqlite3, pathlib, datetime, json, typing, gzip, hashlib
+from collections.abc import Iterator
 from typing import TypeVar
 from mailproxy.imap_parsing import SYSTEM_FLAGS, flags_s_to_set, flags_set_to_s
-from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Mailbox, Message, TLSMode
+from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, Mailbox, Message, TLSMode
 from mailproxy.utils import json_loads_object, is_object_list
 
 T = TypeVar("T")
@@ -95,7 +95,7 @@ def _migrate(db: sqlite3.Connection):
   mb_cols = [typing.cast(str, r[1]) for r in typing.cast(list[sqlite3.Row], db.execute("PRAGMA table_info(mailboxes)").fetchall())]
   if "is_deleted" not in mb_cols:
     _ = db.execute("ALTER TABLE mailboxes ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
-  version = row_field(fetchone_required(db, "PRAGMA user_version"), "user_version", int)
+  version = row_field(typing.cast(sqlite3.Row, db.execute("PRAGMA user_version").fetchone()), "user_version", int)
   if version < 1:
     _ = db.execute("PRAGMA user_version=1")
 
@@ -109,45 +109,6 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
     _migrate(conn)
 
   return conn
-
-@contextlib.contextmanager
-def db_session(db_path: pathlib.Path) -> Generator[sqlite3.Connection, None, None]:
-  """Context manager that opens and, on exit, closes a database connection.
-
-  ``db_open`` returns a bare ``sqlite3.Connection`` whose ``__exit__`` only
-  commits/rolls back and does not close. Long-running servers open a connection
-  per command, so relying on ``with db_open(...) as db:`` alone leaks a file
-  descriptor + memory every call. ``db_session`` yields the same connection but
-  always closes it on exit.
-  """
-  conn = db_open(db_path)
-  try:
-    yield conn
-    conn.commit()
-  except BaseException:
-    conn.rollback()
-    raise
-  finally:
-    conn.close()
-
-def fetchone(db: sqlite3.Connection, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row | None:
-  cursor: sqlite3.Cursor = db.execute(query, params)
-  result: sqlite3.Row | None = typing.cast(sqlite3.Row | None, cursor.fetchone())
-  return result
-
-def fetchone_required(db: sqlite3.Connection, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row:
-  row = fetchone(db, query, params)
-  if row is None:
-    raise ValueError("query returned no rows")
-  return row
-
-def iter_rows(db: sqlite3.Connection, query: str, params: tuple[object, ...] = ()) -> Iterator[sqlite3.Row]:
-  cursor: sqlite3.Cursor = db.execute(query, params)
-  while True:
-    row: sqlite3.Row | None = typing.cast(sqlite3.Row | None, cursor.fetchone())
-    if row is None:
-      break
-    yield row
 
 def _account_from_row(row: sqlite3.Row) -> Account:
   addresses_raw: object = json_loads_object(row_field(row, "addresses", str))
@@ -198,52 +159,6 @@ def _account_from_row(row: sqlite3.Row) -> Account:
     created_at=created_at,
   )
 
-def db_account_add(db: sqlite3.Connection, account: Account, initial_refresh_token: str | None = None):
-  auth = account.auth
-  if isinstance(auth, AuthenticationOAUTH2):
-    auth_type, scope, client_id, client_secret = "OAUTH2", auth.scope, auth.client_id, auth.client_secret
-    authorization_base_url, token_url, redirect_url = auth.authorization_base_url, auth.token_url, auth.redirect_url
-    password = None
-  else:
-    auth_type = "PLAIN"
-    scope = client_id = client_secret = None
-    authorization_base_url = token_url = redirect_url = None
-    password = auth.password
-
-  if isinstance(auth, AuthenticationOAUTH2) and initial_refresh_token is None:
-    raise ValueError("initial_refresh_token required for OAUTH2 account")
-
-  with db:
-    _ = db.execute("""INSERT INTO accounts
-      (account_key, addresses, imap_host, imap_port, imap_tlsmode, smtp_host, smtp_port, smtp_tlsmode,
-       auth_type, scope, client_id, client_secret, authorization_base_url, token_url, redirect_url, password)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-      (account.key, json.dumps(list(account.addresses)), account.imap_host, account.imap_port, account.imap_tlsmode.value,
-       account.smtp_host, account.smtp_port, account.smtp_tlsmode.value, auth_type, scope, client_id, client_secret,
-       authorization_base_url, token_url, redirect_url, password))
-
-    if isinstance(auth, AuthenticationOAUTH2):
-      _ = db.execute("INSERT INTO oauth2_data (account_key, access_token, refresh_token, expires_at) VALUES (?,?,?,?)",
-        (account.key, None, initial_refresh_token, None))
-
-def db_account_list(db: sqlite3.Connection) -> list[Account]:
-  return [ _account_from_row(row) for row in iter_rows(db, "SELECT * FROM accounts ORDER BY created_at") ]
-
-def db_account_get(db: sqlite3.Connection, account_key: str) -> Account | None:
-  row = fetchone(db, "SELECT * FROM accounts WHERE account_key=?", (account_key,))
-  return None if row is None else _account_from_row(row)
-
-def db_account_get_by_address(db: sqlite3.Connection, address: str) -> Account | None:
-  row = fetchone(db, "SELECT * FROM accounts WHERE EXISTS (SELECT 1 FROM json_each(addresses) WHERE value=?)", (address,))
-  return None if row is None else _account_from_row(row)
-
-def db_account_remove(db: sqlite3.Connection, account_key: str):
-  with db:
-    _ = db.execute("DELETE FROM messages WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_key=?)", (account_key,))
-    _ = db.execute("DELETE FROM mailboxes WHERE account_key=?", (account_key,))
-    _ = db.execute("DELETE FROM oauth2_data WHERE account_key=?", (account_key,))
-    _ = db.execute("DELETE FROM accounts WHERE account_key=?", (account_key,))
-
 def _mailbox_from_row(row: sqlite3.Row) -> Mailbox:
   return Mailbox(
     id=row_field(row, "id", int),
@@ -258,91 +173,6 @@ def _mailbox_from_row(row: sqlite3.Row) -> Mailbox:
     is_deleted=bool(row_field(row, "is_deleted", int)),
   )
 
-def db_mailbox_by_name(db: sqlite3.Connection, account_key: str, name: str) -> Mailbox | None:
-  result = fetchone(db, "SELECT * FROM mailboxes WHERE account_key=? AND name=? AND is_deleted=0", (account_key, name))
-  return None if result is None else _mailbox_from_row(result)
-
-def db_mailbox_list(db: sqlite3.Connection, account_key: str):
-  for item in iter_rows(db, "SELECT * FROM mailboxes WHERE account_key=? AND is_deleted=0 ORDER BY name", (account_key,)):
-    yield _mailbox_from_row(item)
-
-def db_mailbox_count_messages(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COUNT(*)", int)
-
-def db_mailbox_uid_next(db: sqlite3.Connection, account_key: str, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT uid_next FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)), "uid_next", int)
-
-def db_mailbox_uid_validity(db: sqlite3.Connection, account_key: str, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)), "uid_validity", int)
-
-def db_mailbox_count_unseen(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s NOT LIKE '%\\Seen\\%'", (mailbox_id,)), "COUNT(*)", int)
-
-def db_mailbox_count_deleted(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s LIKE '%\\Deleted\\%'", (mailbox_id,)), "COUNT(*)", int)
-
-def db_mailbox_size(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COALESCE(SUM(size), 0) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COALESCE(SUM(size), 0)", int)
-
-def db_mailbox_add(db: sqlite3.Connection, account_key: str, name: str, uid_validity: int, uid_next: int = 1, \
-    flags_s: str = "\\\\", hierarchy_delimiter: str = "/", is_remote: bool = True) -> int:
-  cur = db.execute("INSERT INTO mailboxes (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, is_remote, last_synced_uid) " +
-    "VALUES (?,?,?,?,?,?,?,0) " +
-    "ON CONFLICT(account_key, name) DO UPDATE SET is_deleted=0, uid_validity=excluded.uid_validity, uid_next=excluded.uid_next, " +
-    "flags_s=excluded.flags_s, hierarchy_delimiter=excluded.hierarchy_delimiter, is_remote=excluded.is_remote " +
-    "RETURNING id", (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, 1 if is_remote else 0))
-  row = typing.cast(sqlite3.Row | None, cur.fetchone())
-  assert row is not None
-  row_id = row_field(row, "id", int)
-  _ = db.execute("UPDATE messages SET is_deleted=0 WHERE mailbox_id=? AND remote_uid IS NOT NULL", (row_id,))
-  return row_id
-
-def db_mailbox_update_sync(db: sqlite3.Connection, mailbox_id: int, *, uid_next: int | None = None, \
-    uid_validity: int | None = None, last_synced_uid: int | None = None, flags_s: str | None = None):
-  sets: list[str] = []
-  params: list[int | str] = []
-  if uid_next is not None: sets.append("uid_next=?"); params.append(uid_next)
-  if uid_validity is not None: sets.append("uid_validity=?"); params.append(uid_validity)
-  if last_synced_uid is not None: sets.append("last_synced_uid=?"); params.append(last_synced_uid)
-  if flags_s is not None: sets.append("flags_s=?"); params.append(flags_s)
-  if sets:
-    params.append(mailbox_id)
-    _ = db.execute("UPDATE mailboxes SET %s WHERE id=?" % (", ".join(sets),), params)
-
-def db_messages_clear(db: sqlite3.Connection, mailbox_id: int):
-  _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
-
-def db_message_body_add(db: sqlite3.Connection, data: bytes, compress_level: int = 6) -> str:
-  body_hash = hashlib.sha256(data).hexdigest()
-  stored = gzip.compress(data, compress_level)
-  _ = db.execute("INSERT INTO message_bodies (hash, data) VALUES (?,?) ON CONFLICT(hash) DO NOTHING", (body_hash, stored))
-  return body_hash
-
-def db_message_body_get(db: sqlite3.Connection, body_hash: str) -> bytes | None:
-  row = fetchone(db, "SELECT data FROM message_bodies WHERE hash=?", (body_hash,))
-  if row is None:
-    return None
-  return gzip.decompress(row_field(row, "data", bytes))
-
-def db_message_add(db: sqlite3.Connection, uid: int, mailbox_id: int, received_date: int, flags_s: str, data: bytes, remote_uid: str | None, compress_level: int = 6):
-  body_hash = db_message_body_add(db, data, compress_level)
-  _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid) VALUES (?,?,?,?,?,?,?) " +
-    "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
-    (uid, mailbox_id, received_date, flags_s, len(data), body_hash, remote_uid))
-
-def db_message_copy(db: sqlite3.Connection, src_mailbox_id: int, uid: int, dest_mailbox_id: int) -> int:
-  row = fetchone_required(db, "SELECT received_date, flags_s, size, body_hash FROM messages WHERE mailbox_id=? AND uid=? AND is_deleted=0", (src_mailbox_id, uid))
-  received_date = row_field(row, "received_date", int)
-  flags_s = row_field(row, "flags_s", str)
-  size = row_field(row, "size", int)
-  body_hash = row_field(row, "body_hash", str)
-  new_uid = db_mailbox_max_uid(db, dest_mailbox_id) + 1
-  _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid) VALUES (?,?,?,?,?,?,?) " +
-    "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
-    (new_uid, dest_mailbox_id, received_date, flags_s, size, body_hash, None))
-  db_mailbox_update_sync(db, dest_mailbox_id, uid_next=new_uid + 1, last_synced_uid=new_uid)
-  return new_uid
-
 def _message_from_row(row: sqlite3.Row) -> Message:
   return Message(
     uid=row_field(row, "uid", int),
@@ -355,88 +185,288 @@ def _message_from_row(row: sqlite3.Row) -> Message:
     is_deleted=bool(row_field(row, "is_deleted", int)),
   )
 
-def db_message_list(db: sqlite3.Connection, mailbox_id: int):
-  for row in iter_rows(db, "SELECT * FROM messages WHERE mailbox_id=? AND is_deleted=0 ORDER BY uid", (mailbox_id,)):
-    yield _message_from_row(row)
+class DatabaseSession:
+  """A config-aware, context-managed database connection.
 
-def db_message_get_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int) -> Message | None:
-  result = fetchone(db, "SELECT * FROM messages WHERE mailbox_id=? AND uid=? AND is_deleted=0", (mailbox_id, uid))
-  return None if result is None else _message_from_row(result)
+  Holds the ``Config`` once so callers don't thread ``db_path`` or the body
+  compression level through every call. ``__enter__`` opens a fresh connection
+  and ``__exit__`` commits (or rolls back on error) and closes it, so the
+  connection lifecycle is handled in one place.
+  """
 
-def db_mailbox_max_uid(db: sqlite3.Connection, mailbox_id: int) -> int:
-  row = fetchone_required(db, "SELECT MAX(uid) FROM messages WHERE mailbox_id=?", (mailbox_id,))
-  value = row_optional(row, "MAX(uid)", int)
-  return value if value is not None else 0
+  def __init__(self, config: Config):
+    self._config: Config = config
+    self._conn: sqlite3.Connection | None = None
 
-def db_message_update_flags(db: sqlite3.Connection, mailbox_id: int, uid: int, flags_s: str, restore: bool = False):
-  if restore:
-    _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=?", (flags_s, mailbox_id, uid))
-  else:
-    _ = db.execute("UPDATE messages SET flags_s=? WHERE mailbox_id=? AND uid=? AND is_deleted=0", (flags_s, mailbox_id, uid))
+  @property
+  def conn(self) -> sqlite3.Connection:
+    if self._conn is None:
+      raise RuntimeError("DatabaseSession is not open")
+    return self._conn
 
-def db_messages_merge_flags(db: sqlite3.Connection, mailbox_id: int, remote_flags: list[tuple[int, str]]) -> int:
-  current: dict[int, tuple[str, bool]] = {}
-  for row in iter_rows(db, "SELECT uid, flags_s, is_deleted FROM messages WHERE mailbox_id=?", (mailbox_id,)):
-    current[row_field(row, "uid", int)] = (row_field(row, "flags_s", str), bool(row_field(row, "is_deleted", int)))
-  changed = 0
-  with db:
-    for uid, remote_s in remote_flags:
-      entry = current.get(uid)
-      if entry is None:
-        continue
-      local_s, is_deleted = entry
-      merged = flags_set_to_s(flags_s_to_set(remote_s) | (flags_s_to_set(local_s) - SYSTEM_FLAGS))
-      if merged != local_s or is_deleted:
-        _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=?", (merged, mailbox_id, uid))
-        changed += 1
-  return changed
+  def fetchone(self, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row | None:
+    cursor: sqlite3.Cursor = self.conn.execute(query, params)
+    result: sqlite3.Row | None = typing.cast(sqlite3.Row | None, cursor.fetchone())
+    return result
 
-def db_message_delete_by_uid(db: sqlite3.Connection, mailbox_id: int, uid: int):
-  _ = db.execute("UPDATE messages SET is_deleted=1, remote_uid=NULL WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
+  def fetchone_required(self, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row:
+    row = self.fetchone(query, params)
+    if row is None:
+      raise ValueError("query returned no rows")
+    return row
 
-def db_message_delete_except(db: sqlite3.Connection, mailbox_id: int, uids: set[int], max_uid: int) -> int:
-  if not uids:
-    cursor = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid<=? AND remote_uid IS NOT NULL", (mailbox_id, max_uid))
+  def iter_rows(self, query: str, params: tuple[object, ...] = ()) -> Iterator[sqlite3.Row]:
+    cursor: sqlite3.Cursor = self.conn.execute(query, params)
+    while True:
+      row: sqlite3.Row | None = typing.cast(sqlite3.Row | None, cursor.fetchone())
+      if row is None:
+        break
+      yield row
+
+  def __enter__(self) -> "DatabaseSession":
+    self._conn = db_open(self._config.db_path)
+    return self
+
+  def __exit__(self, exc_type: object | None, exc_val: object | None, exc_tb: object | None) -> None:
+    conn = self._conn
+    self._conn = None
+    if conn is None:
+      return
+    if exc_type is None:
+      conn.commit()
+    else:
+      conn.rollback()
+    conn.close()
+
+  # accounts
+
+  def account_add(self, account: Account, initial_refresh_token: str | None = None):
+    db = self.conn
+    auth = account.auth
+    if isinstance(auth, AuthenticationOAUTH2):
+      auth_type, scope, client_id, client_secret = "OAUTH2", auth.scope, auth.client_id, auth.client_secret
+      authorization_base_url, token_url, redirect_url = auth.authorization_base_url, auth.token_url, auth.redirect_url
+      password = None
+    else:
+      auth_type = "PLAIN"
+      scope = client_id = client_secret = None
+      authorization_base_url = token_url = redirect_url = None
+      password = auth.password
+
+    if isinstance(auth, AuthenticationOAUTH2) and initial_refresh_token is None:
+      raise ValueError("initial_refresh_token required for OAUTH2 account")
+
+    with db:
+      _ = db.execute("""INSERT INTO accounts
+        (account_key, addresses, imap_host, imap_port, imap_tlsmode, smtp_host, smtp_port, smtp_tlsmode,
+         auth_type, scope, client_id, client_secret, authorization_base_url, token_url, redirect_url, password)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (account.key, json.dumps(list(account.addresses)), account.imap_host, account.imap_port, account.imap_tlsmode.value,
+         account.smtp_host, account.smtp_port, account.smtp_tlsmode.value, auth_type, scope, client_id, client_secret,
+         authorization_base_url, token_url, redirect_url, password))
+
+      if isinstance(auth, AuthenticationOAUTH2):
+        _ = db.execute("INSERT INTO oauth2_data (account_key, access_token, refresh_token, expires_at) VALUES (?,?,?,?)",
+          (account.key, None, initial_refresh_token, None))
+
+  def account_list(self) -> list[Account]:
+    return [ _account_from_row(row) for row in self.iter_rows("SELECT * FROM accounts ORDER BY created_at") ]
+
+  def account_get(self, account_key: str) -> Account | None:
+    row = self.fetchone("SELECT * FROM accounts WHERE account_key=?", (account_key,))
+    return None if row is None else _account_from_row(row)
+
+  def account_get_by_address(self, address: str) -> Account | None:
+    row = self.fetchone("SELECT * FROM accounts WHERE EXISTS (SELECT 1 FROM json_each(addresses) WHERE value=?)", (address,))
+    return None if row is None else _account_from_row(row)
+
+  def account_remove(self, account_key: str):
+    db = self.conn
+    with db:
+      _ = db.execute("DELETE FROM messages WHERE mailbox_id IN (SELECT id FROM mailboxes WHERE account_key=?)", (account_key,))
+      _ = db.execute("DELETE FROM mailboxes WHERE account_key=?", (account_key,))
+      _ = db.execute("DELETE FROM oauth2_data WHERE account_key=?", (account_key,))
+      _ = db.execute("DELETE FROM accounts WHERE account_key=?", (account_key,))
+
+  # mailboxes
+
+  def mailbox_by_name(self, account_key: str, name: str) -> Mailbox | None:
+    result = self.fetchone("SELECT * FROM mailboxes WHERE account_key=? AND name=? AND is_deleted=0", (account_key, name))
+    return None if result is None else _mailbox_from_row(result)
+
+  def mailbox_list(self, account_key: str):
+    for item in self.iter_rows("SELECT * FROM mailboxes WHERE account_key=? AND is_deleted=0 ORDER BY name", (account_key,)):
+      yield _mailbox_from_row(item)
+
+  def mailbox_count_messages(self, mailbox_id: int) -> int:
+    return row_field(self.fetchone_required("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COUNT(*)", int)
+
+  def mailbox_uid_next(self, account_key: str, mailbox_id: int) -> int:
+    return row_field(self.fetchone_required("SELECT uid_next FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)), "uid_next", int)
+
+  def mailbox_uid_validity(self, account_key: str, mailbox_id: int) -> int:
+    return row_field(self.fetchone_required("SELECT uid_validity FROM mailboxes WHERE account_key=? AND id=?", (account_key, mailbox_id)), "uid_validity", int)
+
+  def mailbox_count_unseen(self, mailbox_id: int) -> int:
+    return row_field(self.fetchone_required("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s NOT LIKE '%\\Seen\\%'", (mailbox_id,)), "COUNT(*)", int)
+
+  def mailbox_count_deleted(self, mailbox_id: int) -> int:
+    return row_field(self.fetchone_required("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0 AND flags_s LIKE '%\\Deleted\\%'", (mailbox_id,)), "COUNT(*)", int)
+
+  def mailbox_size(self, mailbox_id: int) -> int:
+    return row_field(self.fetchone_required("SELECT COALESCE(SUM(size), 0) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COALESCE(SUM(size), 0)", int)
+
+  def mailbox_add(self, account_key: str, name: str, uid_validity: int, uid_next: int = 1, flags_s: str = "\\\\",
+      hierarchy_delimiter: str = "/", is_remote: bool = True) -> int:
+    db = self.conn
+    cur = db.execute("INSERT INTO mailboxes (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, is_remote, last_synced_uid) " +
+      "VALUES (?,?,?,?,?,?,?,0) " +
+      "ON CONFLICT(account_key, name) DO UPDATE SET is_deleted=0, uid_validity=excluded.uid_validity, uid_next=excluded.uid_next, " +
+      "flags_s=excluded.flags_s, hierarchy_delimiter=excluded.hierarchy_delimiter, is_remote=excluded.is_remote " +
+      "RETURNING id", (account_key, uid_next, uid_validity, name, hierarchy_delimiter, flags_s, 1 if is_remote else 0))
+    row = typing.cast(sqlite3.Row | None, cur.fetchone())
+    assert row is not None
+    row_id = row_field(row, "id", int)
+    _ = db.execute("UPDATE messages SET is_deleted=0 WHERE mailbox_id=? AND remote_uid IS NOT NULL", (row_id,))
+    return row_id
+
+  def mailbox_update_sync(self, mailbox_id: int, *, uid_next: int | None = None, uid_validity: int | None = None,
+      last_synced_uid: int | None = None, flags_s: str | None = None):
+    db = self.conn
+    sets: list[str] = []
+    params: list[int | str] = []
+    if uid_next is not None: sets.append("uid_next=?"); params.append(uid_next)
+    if uid_validity is not None: sets.append("uid_validity=?"); params.append(uid_validity)
+    if last_synced_uid is not None: sets.append("last_synced_uid=?"); params.append(last_synced_uid)
+    if flags_s is not None: sets.append("flags_s=?"); params.append(flags_s)
+    if sets:
+      params.append(mailbox_id)
+      _ = db.execute("UPDATE mailboxes SET %s WHERE id=?" % (", ".join(sets),), params)
+
+  def messages_clear(self, mailbox_id: int):
+    _ = self.conn.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
+
+  def mailbox_max_uid(self, mailbox_id: int) -> int:
+    row = self.fetchone_required("SELECT MAX(uid) FROM messages WHERE mailbox_id=?", (mailbox_id,))
+    value = row_optional(row, "MAX(uid)", int)
+    return value if value is not None else 0
+
+  def mailbox_delete(self, mailbox_id: int):
+    db = self.conn
+    with db:
+      _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
+      _ = db.execute("UPDATE mailboxes SET is_deleted=1 WHERE id=?", (mailbox_id,))
+
+  def mailbox_rename(self, mailbox_id: int, new_name: str):
+    _ = self.conn.execute("UPDATE mailboxes SET name=? WHERE id=?", (new_name, mailbox_id))
+
+  def mailbox_get_by_id(self, mailbox_id: int) -> Mailbox | None:
+    result = self.fetchone("SELECT * FROM mailboxes WHERE id=? AND is_deleted=0", (mailbox_id,))
+    return None if result is None else _mailbox_from_row(result)
+
+  # messages
+
+  def message_body_add(self, data: bytes) -> str:
+    body_hash = hashlib.sha256(data).hexdigest()
+    stored = gzip.compress(data, self._config.body_compression_level)
+    _ = self.conn.execute("INSERT INTO message_bodies (hash, data) VALUES (?,?) ON CONFLICT(hash) DO NOTHING", (body_hash, stored))
+    return body_hash
+
+  def message_body_get(self, body_hash: str) -> bytes | None:
+    row = self.fetchone("SELECT data FROM message_bodies WHERE hash=?", (body_hash,))
+    if row is None:
+      return None
+    return gzip.decompress(row_field(row, "data", bytes))
+
+  def message_add(self, uid: int, mailbox_id: int, received_date: int, flags_s: str, data: bytes, remote_uid: str | None):
+    body_hash = self.message_body_add(data)
+    _ = self.conn.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid) VALUES (?,?,?,?,?,?,?) " +
+      "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
+      (uid, mailbox_id, received_date, flags_s, len(data), body_hash, remote_uid))
+
+  def message_copy(self, src_mailbox_id: int, uid: int, dest_mailbox_id: int) -> int:
+    db = self.conn
+    row = self.fetchone_required("SELECT received_date, flags_s, size, body_hash FROM messages WHERE mailbox_id=? AND uid=? AND is_deleted=0", (src_mailbox_id, uid))
+    received_date = row_field(row, "received_date", int)
+    flags_s = row_field(row, "flags_s", str)
+    size = row_field(row, "size", int)
+    body_hash = row_field(row, "body_hash", str)
+    new_uid = self.mailbox_max_uid(dest_mailbox_id) + 1
+    _ = db.execute("INSERT INTO messages (uid, mailbox_id, received_date, flags_s, size, body_hash, remote_uid) VALUES (?,?,?,?,?,?,?) " +
+      "ON CONFLICT(mailbox_id, uid) DO UPDATE SET received_date=excluded.received_date, flags_s=excluded.flags_s, size=excluded.size, body_hash=excluded.body_hash, remote_uid=excluded.remote_uid, is_deleted=0",
+      (new_uid, dest_mailbox_id, received_date, flags_s, size, body_hash, None))
+    self.mailbox_update_sync(dest_mailbox_id, uid_next=new_uid + 1, last_synced_uid=new_uid)
+    return new_uid
+
+  def message_list(self, mailbox_id: int):
+    for row in self.iter_rows("SELECT * FROM messages WHERE mailbox_id=? AND is_deleted=0 ORDER BY uid", (mailbox_id,)):
+      yield _message_from_row(row)
+
+  def message_get_by_uid(self, mailbox_id: int, uid: int) -> Message | None:
+    result = self.fetchone("SELECT * FROM messages WHERE mailbox_id=? AND uid=? AND is_deleted=0", (mailbox_id, uid))
+    return None if result is None else _message_from_row(result)
+
+  def message_update_flags(self, mailbox_id: int, uid: int, flags_s: str, restore: bool = False):
+    if restore:
+      _ = self.conn.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=?", (flags_s, mailbox_id, uid))
+    else:
+      _ = self.conn.execute("UPDATE messages SET flags_s=? WHERE mailbox_id=? AND uid=? AND is_deleted=0", (flags_s, mailbox_id, uid))
+
+  def messages_merge_flags(self, mailbox_id: int, remote_flags: list[tuple[int, str]]) -> int:
+    db = self.conn
+    current: dict[int, tuple[str, bool]] = {}
+    for row in self.iter_rows("SELECT uid, flags_s, is_deleted FROM messages WHERE mailbox_id=?", (mailbox_id,)):
+      current[row_field(row, "uid", int)] = (row_field(row, "flags_s", str), bool(row_field(row, "is_deleted", int)))
+    changed = 0
+    with db:
+      for uid, remote_s in remote_flags:
+        entry = current.get(uid)
+        if entry is None:
+          continue
+        local_s, is_deleted = entry
+        merged = flags_set_to_s(flags_s_to_set(remote_s) | (flags_s_to_set(local_s) - SYSTEM_FLAGS))
+        if merged != local_s or is_deleted:
+          _ = db.execute("UPDATE messages SET flags_s=?, is_deleted=0 WHERE mailbox_id=? AND uid=?", (merged, mailbox_id, uid))
+          changed += 1
+    return changed
+
+  def message_delete_by_uid(self, mailbox_id: int, uid: int):
+    _ = self.conn.execute("UPDATE messages SET is_deleted=1, remote_uid=NULL WHERE mailbox_id=? AND uid=?", (mailbox_id, uid))
+
+  def message_delete_except(self, mailbox_id: int, uids: set[int], max_uid: int) -> int:
+    db = self.conn
+    if not uids:
+      cursor = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid<=? AND remote_uid IS NOT NULL", (mailbox_id, max_uid))
+      return cursor.rowcount
+    placeholders = ",".join("?" for _ in uids)
+    params = [mailbox_id, max_uid] + list(uids)
+    cursor = db.execute(f"UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid<=? AND remote_uid IS NOT NULL AND uid NOT IN ({placeholders})", params)
     return cursor.rowcount
-  placeholders = ",".join("?" for _ in uids)
-  params = [mailbox_id, max_uid] + list(uids)
-  cursor = db.execute(f"UPDATE messages SET is_deleted=1 WHERE mailbox_id=? AND is_deleted=0 AND uid<=? AND remote_uid IS NOT NULL AND uid NOT IN ({placeholders})", params)
-  return cursor.rowcount
 
-def db_mailbox_delete(db: sqlite3.Connection, mailbox_id: int):
-  with db:
-    _ = db.execute("UPDATE messages SET is_deleted=1 WHERE mailbox_id=?", (mailbox_id,))
-    _ = db.execute("UPDATE mailboxes SET is_deleted=1 WHERE id=?", (mailbox_id,))
+  def message_count(self, mailbox_id: int) -> int:
+    return row_field(self.fetchone_required("SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COUNT(*)", int)
 
-def db_mailbox_rename(db: sqlite3.Connection, mailbox_id: int, new_name: str):
-  _ = db.execute("UPDATE mailboxes SET name=? WHERE id=?", (new_name, mailbox_id))
+  # universe
 
-def db_mailbox_get_by_id(db: sqlite3.Connection, mailbox_id: int) -> Mailbox | None:
-  result = fetchone(db, "SELECT * FROM mailboxes WHERE id=? AND is_deleted=0", (mailbox_id,))
-  return None if result is None else _mailbox_from_row(result)
+  def universe_messages(self, account_key: str) -> list[Message]:
+    query = ("SELECT messages.id AS uid, messages.mailbox_id, messages.received_date, "
+             "messages.flags_s, messages.size, messages.body_hash, messages.remote_uid, messages.is_deleted "
+             "FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id "
+             "WHERE mailboxes.account_key=? ORDER BY messages.id ASC")
+    return [_message_from_row(row) for row in self.iter_rows(query, (account_key,))]
 
-def db_message_count(db: sqlite3.Connection, mailbox_id: int) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages WHERE mailbox_id=? AND is_deleted=0", (mailbox_id,)), "COUNT(*)", int)
+  def universe_count(self, account_key: str) -> int:
+    return row_field(self.fetchone_required("SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "COUNT(*)", int)
 
-def db_universe_messages(db: sqlite3.Connection, account_key: str) -> list[Message]:
-  query = ("SELECT messages.id AS uid, messages.mailbox_id, messages.received_date, "
-           "messages.flags_s, messages.size, messages.body_hash, messages.remote_uid, messages.is_deleted "
-           "FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id "
-           "WHERE mailboxes.account_key=? ORDER BY messages.id ASC")
-  return [_message_from_row(row) for row in iter_rows(db, query, (account_key,))]
+  def universe_count_unseen(self, account_key: str) -> int:
+    return row_field(self.fetchone_required("SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s NOT LIKE '%\\Seen\\%'", (account_key,)), "COUNT(*)", int)
 
-def db_universe_count(db: sqlite3.Connection, account_key: str) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "COUNT(*)", int)
+  def universe_count_deleted(self, account_key: str) -> int:
+    return row_field(self.fetchone_required("SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s LIKE '%\\Deleted\\%'", (account_key,)), "COUNT(*)", int)
 
-def db_universe_count_unseen(db: sqlite3.Connection, account_key: str) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s NOT LIKE '%\\Seen\\%'", (account_key,)), "COUNT(*)", int)
+  def universe_size(self, account_key: str) -> int:
+    return row_field(self.fetchone_required("SELECT COALESCE(SUM(messages.size), 0) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "COALESCE(SUM(messages.size), 0)", int)
 
-def db_universe_count_deleted(db: sqlite3.Connection, account_key: str) -> int:
-  return row_field(fetchone_required(db, "SELECT COUNT(*) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=? AND messages.flags_s LIKE '%\\Deleted\\%'", (account_key,)), "COUNT(*)", int)
-
-def db_universe_size(db: sqlite3.Connection, account_key: str) -> int:
-  return row_field(fetchone_required(db, "SELECT COALESCE(SUM(messages.size), 0) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "COALESCE(SUM(messages.size), 0)", int)
-
-def db_universe_max_uid(db: sqlite3.Connection, account_key: str) -> int:
-  value = row_optional(fetchone_required(db, "SELECT MAX(messages.id) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "MAX(messages.id)", int)
-  return value if value is not None else 0
+  def universe_max_uid(self, account_key: str) -> int:
+    value = row_optional(self.fetchone_required("SELECT MAX(messages.id) FROM messages JOIN mailboxes ON messages.mailbox_id=mailboxes.id WHERE mailboxes.account_key=?", (account_key,)), "MAX(messages.id)", int)
+    return value if value is not None else 0

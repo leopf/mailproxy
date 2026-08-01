@@ -1,7 +1,7 @@
 import functools, asyncio, logging, argparse, pathlib, os, dataclasses, secrets, webbrowser, urllib.parse, http.server, ssl, importlib.resources, typing
 from typing import TypeVar
 from mailproxy.config import config_from_dict, provider_config_from_dict
-from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_mailbox_add, db_mailbox_by_name, db_mailbox_delete, db_mailbox_list, db_mailbox_rename, db_session
+from mailproxy.db import DatabaseSession
 from mailproxy.imap_frontend import handle_imap
 from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code, pkce_generate
 from mailproxy.smtp_frontend import smtp_server_handle_client
@@ -136,14 +136,14 @@ def exec_account_add(config: Config, addresses: list[str], preset: str | None, p
     smtp_host=sm_host, smtp_port=sm_port, smtp_tlsmode=sm_tls,
     auth=auth,
   )
-  with db_session(config.db_path) as db:
-    db_account_add(db, account, refresh_token)
+  with DatabaseSession(config) as db:
+    db.account_add(account, refresh_token)
 
   print(f"added account '{account.key}' ({', '.join(account.addresses)})")
 
 def exec_account_list(config: Config):
-  with db_session(config.db_path) as db:
-    accounts = db_account_list(db)
+  with DatabaseSession(config) as db:
+    accounts = db.account_list()
 
   if not accounts:
     print("no accounts")
@@ -155,29 +155,29 @@ def exec_account_list(config: Config):
     print(f"{a.key}\t{', '.join(a.addresses)}\t{a.imap_host}:{a.imap_port}\t{auth_type}\t{created}")
 
 def exec_account_remove(config: Config, address: str):
-  with db_session(config.db_path) as db:
-    account = db_account_get_by_address(db, address)
+  with DatabaseSession(config) as db:
+    account = db.account_get_by_address(address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
-    db_account_remove(db, account.key)
+    db.account_remove(account.key)
   print(f"removed account '{account.key}'")
 
 def exec_mailbox_add(config: Config, address: str, name: str):
-  with db_session(config.db_path) as db:
-    account = db_account_get_by_address(db, address)
+  with DatabaseSession(config) as db:
+    account = db.account_get_by_address(address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
-    if db_mailbox_by_name(db, account.key, name) is not None:
+    if db.mailbox_by_name(account.key, name) is not None:
       raise RuntimeError(f"mailbox '{name}' already exists for account '{account.key}'")
-    _ = db_mailbox_add(db, account.key, name, 0, 1, is_remote=False)
+    _ = db.mailbox_add(account.key, name, 0, 1, is_remote=False)
   print(f"added local mailbox '{name}' for account '{account.key}'")
 
 def exec_mailbox_list(config: Config, address: str):
-  with db_session(config.db_path) as db:
-    account = db_account_get_by_address(db, address)
+  with DatabaseSession(config) as db:
+    account = db.account_get_by_address(address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
-    mailboxes = list(db_mailbox_list(db, account.key))
+    mailboxes = list(db.mailbox_list(account.key))
   if not mailboxes:
     print("no mailboxes")
     return
@@ -186,36 +186,36 @@ def exec_mailbox_list(config: Config, address: str):
     print(f"{mb.name}\t{kind}")
 
 def exec_mailbox_remove(config: Config, address: str, name: str):
-  with db_session(config.db_path) as db:
-    account = db_account_get_by_address(db, address)
+  with DatabaseSession(config) as db:
+    account = db.account_get_by_address(address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
-    mailbox = db_mailbox_by_name(db, account.key, name)
+    mailbox = db.mailbox_by_name(account.key, name)
     if mailbox is None:
       raise RuntimeError(f"no mailbox '{name}' for account '{account.key}'")
     if mailbox.is_remote:
       raise RuntimeError(f"mailbox '{name}' is a remote mailbox, remove via IMAP DELETE")
-    db_mailbox_delete(db, mailbox.id)
+    db.mailbox_delete(mailbox.id)
   print(f"removed local mailbox '{name}'")
 
 def exec_mailbox_rename(config: Config, address: str, old_name: str, new_name: str):
-  with db_session(config.db_path) as db:
-    account = db_account_get_by_address(db, address)
+  with DatabaseSession(config) as db:
+    account = db.account_get_by_address(address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
-    mailbox = db_mailbox_by_name(db, account.key, old_name)
+    mailbox = db.mailbox_by_name(account.key, old_name)
     if mailbox is None:
       raise RuntimeError(f"no mailbox '{old_name}' for account '{account.key}'")
     if mailbox.is_remote:
       raise RuntimeError(f"mailbox '{old_name}' is a remote mailbox, rename via IMAP RENAME")
-    if db_mailbox_by_name(db, account.key, new_name) is not None:
+    if db.mailbox_by_name(account.key, new_name) is not None:
       raise RuntimeError(f"mailbox '{new_name}' already exists for account '{account.key}'")
-    db_mailbox_rename(db, mailbox.id, new_name)
+    db.mailbox_rename(mailbox.id, new_name)
   print(f"renamed local mailbox '{old_name}' to '{new_name}'")
 
 def exec_get_access_token(config: Config, address: str):
-  with db_session(config.db_path) as db:
-    account = db_account_get_by_address(db, address)
+  with DatabaseSession(config) as db:
+    account = db.account_get_by_address(address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
     if not isinstance(account.auth, AuthenticationOAUTH2):

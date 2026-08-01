@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from collections.abc import AsyncIterator, Iterator
 from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
-from mailproxy.db import db_message_add, db_message_delete_except, db_messages_merge_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_session
+from mailproxy.db import DatabaseSession
 from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, format_internal_date, imap_to_quoted_string, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
 from mailproxy.utils import KeyedLock, encode_7bit_mailbox_name
@@ -95,34 +95,34 @@ class IMAPRemoteConnection:
     uid_next = select_result.uid_next
     flags_s = select_result.flags_s
     logging.debug("sync_mailbox: '%s' uid_validity=%d uid_next=%d exists=%d", mailbox_name, uid_validity, uid_next, select_result.exists)
-    with db_session(self.config.db_path) as db:
-      mailbox = db_mailbox_by_name(db, self.account.key, mailbox_name)
+    with DatabaseSession(self.config) as db:
+      mailbox = db.mailbox_by_name(self.account.key, mailbox_name)
       if mailbox is None:
-        mailbox_id = db_mailbox_add(db, self.account.key, mailbox_name, uid_validity, uid_next, flags_s)
+        mailbox_id = db.mailbox_add(self.account.key, mailbox_name, uid_validity, uid_next, flags_s)
         last_synced = 0
       else:
         mailbox_id = mailbox.id
         last_synced = mailbox.last_synced_uid
         if uid_validity != 0 and mailbox.uid_validity != uid_validity:
-          db_messages_clear(db, mailbox.id)
-          db_mailbox_update_sync(db, mailbox.id, uid_validity=uid_validity, uid_next=uid_next, last_synced_uid=0, flags_s=flags_s)
+          db.messages_clear(mailbox.id)
+          db.mailbox_update_sync(mailbox.id, uid_validity=uid_validity, uid_next=uid_next, last_synced_uid=0, flags_s=flags_s)
           last_synced = 0
         else:
-          db_mailbox_update_sync(db, mailbox.id, uid_next=uid_next, flags_s=flags_s)
+          db.mailbox_update_sync(mailbox.id, uid_next=uid_next, flags_s=flags_s)
     return _SyncState(mailbox_id=mailbox_id, last_synced_uid=last_synced, uid_next=uid_next)
 
   async def _fetch_new_messages(self, mailbox_name: str, state: _SyncState) -> None:
-    for batch_lo, batch_hi in iter_uid_batches(state.last_synced_uid + 1, state.uid_next - 1, FETCH_BATCH_SIZE):
-      count = 0
-      self._start_command(b"UID FETCH %d:%d (UID FLAGS INTERNALDATE BODY.PEEK[])" % (batch_lo, batch_hi))
-      with db_session(self.config.db_path) as db:
+    with DatabaseSession(self.config) as db:
+      for batch_lo, batch_hi in iter_uid_batches(state.last_synced_uid + 1, state.uid_next - 1, FETCH_BATCH_SIZE):
+        count = 0
+        self._start_command(b"UID FETCH %d:%d (UID FLAGS INTERNALDATE BODY.PEEK[])" % (batch_lo, batch_hi))
         async for rec in self._iter_message_records(range_filter=(batch_lo, batch_hi)):
           received_date = parse_internal_date(rec.internal_date) if rec.internal_date else int(datetime.datetime.now().timestamp())
-          db_message_add(db, rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid), self.config.body_compression_level)
+          db.message_add(rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid))
+          db.mailbox_update_sync(state.mailbox_id, last_synced_uid=rec.uid)
+          db.conn.commit()
           count += 1
-        db_mailbox_update_sync(db, state.mailbox_id, last_synced_uid=batch_hi)
-        db.commit()
-      logging.debug("sync_mailbox: '%s' batch %d:%d done (%d messages, %d remaining)", mailbox_name, batch_lo, batch_hi, count, max(state.uid_next - 1 - batch_hi, 0))
+        logging.debug("sync_mailbox: '%s' batch %d:%d done (%d messages, %d remaining)", mailbox_name, batch_lo, batch_hi, count, max(state.uid_next - 1 - batch_hi, 0))
 
   async def _sync_flag_changes_and_deletions(self, mailbox_name: str, mailbox_id: int, last_synced_uid: int) -> None:
     self._start_command(b"UID FETCH 1:%d (UID FLAGS)" % (last_synced_uid,))
@@ -131,11 +131,11 @@ class IMAPRemoteConnection:
     async for rec in self._iter_flag_records():
       seen_uids.add(rec.uid)
       flag_updates.append((rec.uid, rec.flags_s))
-    with db_session(self.config.db_path) as db:
+    with DatabaseSession(self.config) as db:
       if flag_updates:
-        changed = db_messages_merge_flags(db, mailbox_id, flag_updates)
+        changed = db.messages_merge_flags(mailbox_id, flag_updates)
         logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, changed)
-      deleted_count = db_message_delete_except(db, mailbox_id, seen_uids, last_synced_uid)
+      deleted_count = db.message_delete_except(mailbox_id, seen_uids, last_synced_uid)
       if deleted_count > 0:
         logging.debug("sync_mailbox: '%s' soft-deleted %d messages (removed on remote)", mailbox_name, deleted_count)
 
@@ -183,12 +183,12 @@ class IMAPRemoteConnection:
         if isinstance(flags_raw, bytes) and isinstance(delim, bytes) and isinstance(name, bytes):
           remote_mailboxes.append((flags_raw, delim, name))
 
-      with db_session(self.config.db_path) as db:
+      with DatabaseSession(self.config) as db:
         added = 0
         for flags, delim, name_b in remote_mailboxes:
           name_s = name_b.decode("utf-8")
-          if db_mailbox_by_name(db, self.account.key, name_s) is None:
-            _ = db_mailbox_add(db, self.account.key, name_s, 0, 1, flags_to_s(flags), delim.decode("ascii") if delim else "/")
+          if db.mailbox_by_name(self.account.key, name_s) is None:
+            _ = db.mailbox_add(self.account.key, name_s, 0, 1, flags_to_s(flags), delim.decode("ascii") if delim else "/")
             added += 1
       logging.debug("sync_mailbox_list: %d remote mailboxes, %d new", len(remote_mailboxes), added)
 
@@ -319,7 +319,7 @@ class IMAPRemoteConnection:
 
     if isinstance(self.account.auth, AuthenticationOAUTH2):
       logging.debug("IMAP: authenticating as OAUTH2 (XOAUTH2)")
-      with db_session(self.config.db_path) as db:
+      with DatabaseSession(self.config) as db:
         access_token = account_get_oauth_access_token(db, self.account)
       await self._command_authenticate(b"XOAUTH2", f"user={self.account.addresses[0]}\1auth=Bearer {access_token}\1\1".encode())
     else:

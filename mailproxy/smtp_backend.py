@@ -1,7 +1,7 @@
-import asyncio, base64, contextlib, logging, pathlib, re, ssl
+import asyncio, base64, contextlib, logging, re, ssl
 from mailproxy.auth import account_get_oauth_access_token
-from mailproxy.db import db_session
-from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, TLSMode
+from mailproxy.db import DatabaseSession
+from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
 
 
 def _dot_stuff(data: bytes) -> bytes:
@@ -27,11 +27,11 @@ async def _smtp_send(writer: asyncio.StreamWriter, reader: asyncio.StreamReader,
     raise RuntimeError(f"SMTP command '{command}' failed: {code} {message}")
   return code, message
 
-async def _smtp_authenticate(writer: asyncio.StreamWriter, reader: asyncio.StreamReader, account: Account, db_path: pathlib.Path):
+async def _smtp_authenticate(writer: asyncio.StreamWriter, reader: asyncio.StreamReader, account: Account, config: Config):
   match account.auth:
     case AuthenticationOAUTH2():
       logging.debug("SMTP backend: authenticating as OAUTH2 (XOAUTH2)")
-      with db_session(db_path) as db:
+      with DatabaseSession(config) as db:
         access_token = account_get_oauth_access_token(db, account)
       auth_string = f"user={account.addresses[0]}\1auth=Bearer {access_token}\1\1"
       code, message = await _smtp_send(writer, reader, f"AUTH XOAUTH2 {base64.b64encode(auth_string.encode()).decode()}")
@@ -47,7 +47,7 @@ async def _smtp_authenticate(writer: asyncio.StreamWriter, reader: asyncio.Strea
       auth_string = f"\0{account.addresses[0]}\0{account.auth.password}"
       _ = await _smtp_send(writer, reader, f"AUTH PLAIN {base64.b64encode(auth_string.encode()).decode()}", expect_code=235)
 
-async def smtp_forward_mail(db_path: pathlib.Path, account: Account, sender: str, recipients: tuple[str, ...], mail_data: bytes):
+async def smtp_forward_mail(config: Config, account: Account, sender: str, recipients: tuple[str, ...], mail_data: bytes):
   ssl_param = ssl.create_default_context() if account.smtp_tlsmode == TLSMode.DIRECT else None
   logging.debug("SMTP backend: connecting to %s:%d (tls=%s)", account.smtp_host, account.smtp_port, account.smtp_tlsmode)
   reader, writer = await asyncio.open_connection(account.smtp_host, account.smtp_port, ssl=ssl_param)
@@ -61,7 +61,7 @@ async def smtp_forward_mail(db_path: pathlib.Path, account: Account, sender: str
       _ = await _smtp_send(writer, reader, "STARTTLS")
       await writer.start_tls(ssl.create_default_context())
       _ = await _smtp_send(writer, reader, f"EHLO {ehlo_domain}")
-    await _smtp_authenticate(writer, reader, account, db_path)
+    await _smtp_authenticate(writer, reader, account, config)
     _ = await _smtp_send(writer, reader, f"MAIL FROM:<{sender}>", expect_code=250)
     for rcp in recipients:
       _ = await _smtp_send(writer, reader, f"RCPT TO:<{rcp}>", expect_code=250)

@@ -1,6 +1,6 @@
-import http.client, urllib.parse, datetime, base64, hashlib, secrets, sqlite3, hmac
+import http.client, urllib.parse, datetime, base64, hashlib, secrets, hmac
 from mailproxy.config import oauth_token_response_from_dict
-from mailproxy.db import db_account_get_by_address, row_field, row_optional, fetchone
+from mailproxy.db import DatabaseSession, row_field, row_optional
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, OAUTHAccessTokenResult
 from mailproxy.utils import json_loads_object
 
@@ -63,7 +63,7 @@ def oauth_get_authorization_url(auth: AuthenticationOAUTH2, code_challenge: str 
     data["code_challenge_method"] = "S256"
   return f"{auth.authorization_base_url}?{urllib.parse.urlencode(data)}"
 
-def authenticate_sasl(config: Config, db: sqlite3.Connection, sasl_b64: bytes) -> Account | None:
+def authenticate_sasl(config: Config, db: DatabaseSession, sasl_b64: bytes) -> Account | None:
   try:
     decoded = base64.b64decode(sasl_b64)
   except Exception:
@@ -74,19 +74,19 @@ def authenticate_sasl(config: Config, db: sqlite3.Connection, sasl_b64: bytes) -
   _authzid, authcid, passwd = parts
   return authenticate(config, db, authcid, passwd)
 
-def authenticate(config: Config, db: sqlite3.Connection, username: bytes, password: bytes) -> Account | None:
+def authenticate(config: Config, db: DatabaseSession, username: bytes, password: bytes) -> Account | None:
   if not config.proxy_password:
     return None
-  account = db_account_get_by_address(db, username.decode())
+  account = db.account_get_by_address(username.decode())
   if account is None:
     return None
   if not hmac.compare_digest(password, config.proxy_password.encode()):
     return None
   return account
 
-def account_get_oauth_access_token(db: sqlite3.Connection, account: Account) -> str:
+def account_get_oauth_access_token(db: DatabaseSession, account: Account) -> str:
   assert isinstance(account.auth, AuthenticationOAUTH2)
-  row = fetchone(db, "SELECT access_token, refresh_token, expires_at FROM oauth2_data WHERE account_key=?", (account.key,))
+  row = db.fetchone("SELECT access_token, refresh_token, expires_at FROM oauth2_data WHERE account_key=?", (account.key,))
   if row is None:
     raise AuthenticationError(f"no oauth2 data for account '{account.key}'")
 
@@ -99,7 +99,7 @@ def account_get_oauth_access_token(db: sqlite3.Connection, account: Account) -> 
       return access_token
 
   new_auth_result = oauth_fetch_access_token_with_refresh_token(account.auth, refresh_token)
-  _ = db.execute("""UPDATE oauth2_data SET access_token=?, refresh_token=?, expires_at=? WHERE account_key=?""",
+  _ = db.conn.execute("""UPDATE oauth2_data SET access_token=?, refresh_token=?, expires_at=? WHERE account_key=?""",
     (new_auth_result.access_token, new_auth_result.refresh_token or refresh_token, new_auth_result.expires_at.isoformat(), account.key))
-  db.commit()
+  db.conn.commit()
   return new_auth_result.access_token

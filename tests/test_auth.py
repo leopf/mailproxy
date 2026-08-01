@@ -1,7 +1,7 @@
-import logging, pathlib, sqlite3, tempfile, unittest, base64, hashlib, urllib.parse
+import logging, pathlib, tempfile, unittest, base64, hashlib, urllib.parse
 from typing import override
 from mailproxy.auth import authenticate, oauth_get_authorization_url, pkce_generate
-from mailproxy.db import db_account_add, db_open
+from mailproxy.db import DatabaseSession
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Config, TLSMode
 
 PASSWORD = "proxy-pw"
@@ -25,45 +25,46 @@ class TestAuthenticate(unittest.TestCase):
   def setUp(self):
     self._tmpdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory()
     self.db_path: pathlib.Path = pathlib.Path(self._tmpdir.name) / "test.sqlite"
-    self.db: sqlite3.Connection = db_open(self.db_path)
     self.config: Config = Config(
       domain="example.com", log_level=logging.DEBUG, host="127.0.0.1",
       imap_port=143, smtp_port=587, db_path=self.db_path, proxy_password=PASSWORD,
     )
+    self.db: DatabaseSession = DatabaseSession(self.config)
+    _ = self.db.__enter__()
 
   @override
   def tearDown(self):
-    self.db.close()
+    _ = self.db.__exit__(None, None, None)
     self._tmpdir.cleanup()
 
   def test_matching_address(self):
-    db_account_add(self.db, _make_account("a@example.com"))
+    self.db.account_add(_make_account("a@example.com"))
     account = authenticate(self.config, self.db, b"a@example.com", PASSWORD.encode())
     self.assertIsNotNone(account)
 
   def test_unknown_username_rejected(self):
-    db_account_add(self.db, _make_account("a@example.com"))
+    self.db.account_add(_make_account("a@example.com"))
     self.assertIsNone(authenticate(self.config, self.db, b"anything", PASSWORD.encode()))
 
   def test_wrong_password_rejected(self):
-    db_account_add(self.db, _make_account("a@example.com"))
+    self.db.account_add(_make_account("a@example.com"))
     self.assertIsNone(authenticate(self.config, self.db, b"a@example.com", b"wrong"))
     self.assertIsNone(authenticate(self.config, self.db, b"anything", b"wrong"))
 
   def test_unknown_username_with_multiple_accounts(self):
-    db_account_add(self.db, _make_account("a@example.com"))
-    db_account_add(self.db, _make_account("b@example.com"))
+    self.db.account_add(_make_account("a@example.com"))
+    self.db.account_add(_make_account("b@example.com"))
     self.assertIsNone(authenticate(self.config, self.db, b"anything", PASSWORD.encode()))
 
   def test_address_selects_account_with_multiple_accounts(self):
-    db_account_add(self.db, _make_account("a@example.com"))
-    db_account_add(self.db, _make_account("b@example.com"))
+    self.db.account_add(_make_account("a@example.com"))
+    self.db.account_add(_make_account("b@example.com"))
     account = authenticate(self.config, self.db, b"b@example.com", PASSWORD.encode())
     assert account is not None
     self.assertEqual(account.key, "b@example.com")
 
   def test_no_proxy_password_rejects(self):
-    db_account_add(self.db, _make_account("a@example.com"))
+    self.db.account_add(_make_account("a@example.com"))
     config = Config(
       domain="example.com", log_level=logging.DEBUG, host="127.0.0.1",
       imap_port=143, smtp_port=587, db_path=self.db_path, proxy_password="",

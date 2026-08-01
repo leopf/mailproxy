@@ -1,7 +1,7 @@
 import asyncio, logging, pathlib, re, tempfile, typing, unittest
 from typing import override
 from mailproxy import imap_backend
-from mailproxy.db import db_account_add, db_message_body_get, db_message_get_by_uid, db_message_list, db_mailbox_by_name, db_open
+from mailproxy.db import DatabaseSession
 from mailproxy.imap_backend import IMAPRemoteConnection, iter_uid_batches
 from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 
@@ -131,8 +131,8 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
       domain="localhost", log_level=logging.CRITICAL, host="127.0.0.1",
       imap_port=0, smtp_port=0, db_path=pathlib.Path(self._tmpdir.name) / "test.sqlite",
     )
-    with db_open(self.config.db_path) as db:
-      db_account_add(db, _make_account(0))
+    with DatabaseSession(self.config) as db:
+      db.account_add(_make_account(0))
     self._servers: list[_FakeIMAPServer] = []
 
   @override
@@ -152,16 +152,16 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     return server
 
   def _last_synced_uid(self) -> int:
-    with db_open(self.config.db_path) as db:
-      mailbox = db_mailbox_by_name(db, "test@example.com", "INBOX")
+    with DatabaseSession(self.config) as db:
+      mailbox = db.mailbox_by_name("test@example.com", "INBOX")
       assert mailbox is not None
       return mailbox.last_synced_uid
 
   def _message_count(self) -> int:
-    with db_open(self.config.db_path) as db:
-      mailbox = db_mailbox_by_name(db, "test@example.com", "INBOX")
+    with DatabaseSession(self.config) as db:
+      mailbox = db.mailbox_by_name("test@example.com", "INBOX")
       assert mailbox is not None
-      return len(list(db_message_list(db, mailbox.id)))
+      return len(list(db.message_list(mailbox.id)))
 
   async def test_batched_full_sync(self):
     messages = {u: b"Subject: msg %d\r\n\r\nbody %d" % (u, u) for u in range(1, 121)}
@@ -171,12 +171,12 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     await conn.shutdown()
     self.assertEqual(self._message_count(), 120)
     self.assertEqual(self._last_synced_uid(), 120)
-    with db_open(self.config.db_path) as db:
-      mailbox = db_mailbox_by_name(db, "test@example.com", "INBOX")
+    with DatabaseSession(self.config) as db:
+      mailbox = db.mailbox_by_name("test@example.com", "INBOX")
       assert mailbox is not None
-      msg = db_message_get_by_uid(db, mailbox.id, 77)
+      msg = db.message_get_by_uid(mailbox.id, 77)
       assert msg is not None
-      self.assertEqual(db_message_body_get(db, msg.body_hash), messages[77])
+      self.assertEqual(db.message_body_get(msg.body_hash), messages[77])
       self.assertEqual(msg.size, len(messages[77]))
 
   async def test_sync_resumes_after_connection_drop(self):
@@ -186,8 +186,10 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     with self.assertRaises(Exception):
       await conn.sync_mailbox("INBOX")
     await conn.shutdown()
-    self.assertEqual(self._last_synced_uid(), 50)
-    self.assertEqual(self._message_count(), 50)
+    # Per-message commits + per-message pointer: the 30 messages written before
+    # the drop survive and the sync pointer reflects the last stored uid.
+    self.assertEqual(self._last_synced_uid(), 80)
+    self.assertEqual(self._message_count(), 80)
 
     server2 = await self._start_server(messages)
     conn2 = await IMAPRemoteConnection.open(self.config, _make_account(server2.port))
