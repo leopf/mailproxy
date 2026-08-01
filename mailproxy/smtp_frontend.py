@@ -123,8 +123,8 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
         case _:
           reply(500, "unknown")
 
-  except Exception as e:
-    logging.error("connection closing because of an error: %s", e)
+  except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError) as e:
+    logging.debug("SMTP frontend: client disconnected (%s)", e)
   finally:
     logging.debug("SMTP frontend: connection closed")
     writer.close()

@@ -981,11 +981,14 @@ class IMAPServerConnection:
           logging.debug("command failed: %s", e)
           if self._last_tag is not None:
             self._write_response(b"NO", b"command failed with internal error")
-    except Exception as e:
-      logging.error("connection closing because of an error: %s", e)
+        except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError, IMAPReadError):
+          logging.debug("IMAP frontend: client disconnected")
+          break
     finally:
       logging.debug("IMAP frontend: connection closed")
-      self._writer.close()
+      try:
+        self._writer.close()
+      except Exception: pass
       if self._remote_connection is not None:
         try: await asyncio.wait_for(self._remote_connection.shutdown(), 1)
         except Exception: pass
