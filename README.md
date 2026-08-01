@@ -79,6 +79,10 @@ which configured account the connection uses.
   custom certificate configurable); DIRECT/STARTTLS/NONE toward the remote
   server
 - Presets for Gmail, Microsoft, and Yahoo; custom OAuth2 configs supported
+- Incremental sync fetches only new/changed messages by UID, so even mailboxes
+  with large UID gaps (e.g. Yahoo) sync quickly instead of crawling every UID
+- Stored message bodies are gzip-compressed and deduplicated by content hash,
+  reducing the on-disk cache size
 - Zero runtime dependencies (Python 3.13 standard library)
 
 ## Configuration
@@ -93,6 +97,8 @@ which configured account the connection uses.
 | `db_path`       | string | required    | Path to the SQLite database              |
 | `tls_cert_path` | string | unset       | TLS certificate for STARTTLS (bundled self-signed cert if unset) |
 | `tls_key_path`  | string | unset       | TLS private key for STARTTLS (must be set together with `tls_cert_path`) |
+| `log_file`      | string | unset       | Append logs to this file in addition to stderr |
+| `body_compression_level` | int | `6`  | gzip level (1–9) for stored message bodies; bodies are always hashed and compressed |
 
 The proxy password is read from the `MAILPROXY_PASSWORD` environment variable.
 
@@ -192,6 +198,10 @@ record is **soft-deleted** rather than removed from disk:
 - If the remote has lost the data, the soft-deleted record persists as a
   permanent local backup
 
+Locally, message bodies are stored gzip-compressed and deduplicated by hash
+(set the level via `body_compression_level`), so the cache uses substantially
+less space than the raw mail.
+
 `account remove` is the only operation that hard-deletes data.
 
 ## Usage examples
@@ -225,7 +235,7 @@ smtp.sendmail("you@example.com", "client@example.com", "Your invoice is ready")
 ## Testing
 
 ```
-python -m unittest discover -s tests    # 182 unit tests
+python -m unittest discover -s tests    # 229 unit tests
 python -m tests.e2e_test               # end-to-end protocol test
 python -m ruff check mailproxy/ tests/ # lint
 ```
