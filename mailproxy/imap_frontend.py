@@ -3,12 +3,12 @@ from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import db_mailbox_by_name, db_mailbox_count_deleted, db_mailbox_count_messages, db_mailbox_count_unseen, db_mailbox_delete, \
     db_mailbox_list, db_mailbox_max_uid, db_mailbox_rename, db_mailbox_size, db_mailbox_uid_next, db_mailbox_uid_validity, db_mailbox_update_sync, \
-    db_message_add, db_message_body_get, db_message_copy, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_open, \
+    db_message_add, db_message_body_get, db_message_copy, db_message_delete_by_uid, db_message_list, db_message_update_flags, db_session, \
     db_universe_count, db_universe_count_deleted, db_universe_count_unseen, db_universe_max_uid, db_universe_messages, db_universe_size
 from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, SYSTEM_FLAGS, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
     filter_headers, flags_to_s, format_internal_date, header_contains, body_contains, text_contains, parse_search_date, \
-    imap_to_quoted_string, parse_internal_date, parse_sequence_set, split_message
+    imap_to_quoted_string, parse_internal_date, parse_sequence_set, split_message, filter_headers_not
 from mailproxy.model import Account, Config, Mailbox, Message
 from mailproxy.utils import server_tls_context
 
@@ -67,10 +67,10 @@ class IMAPServerConnection:
     if self._mailbox is None:
       return
     if self._is_universe_mailbox:
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         n_messages = db_universe_count(db, self._mailbox.account_key)
     else:
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         n_messages = db_mailbox_count_messages(db, self._mailbox.id)
     self._write_line(b"* %d EXISTS" % (n_messages,))
 
@@ -142,7 +142,7 @@ class IMAPServerConnection:
     await self._reader.skip_sp()
     password = await self._reader.read_astring()
     await self._reader.read_crlf()
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       login_account = authenticate(self._config, db, userid, password)
     if login_account is None:
       self._write_response(b"NO", b"login failed")
@@ -162,7 +162,7 @@ class IMAPServerConnection:
       return
     self._write_line(b"+ ")
     auth_line = await self._reader.read_text_line()
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       login_account = authenticate_sasl(self._config, db, auth_line)
     if login_account is None:
       self._write_response(b"NO", b"auth failed")
@@ -184,14 +184,16 @@ class IMAPServerConnection:
   async def _command_idle(self):
     await self._reader.read_crlf()
     self._write_line(b"+ idling")
-    tasks: list[asyncio.Task[None]] = []
-    if self._mailbox is not None and not self._is_universe_mailbox:
+    idle_task: asyncio.Task[None] | None = None
+    if self._mailbox is not None and not self._is_universe_mailbox and self._mailbox.is_remote:
       mailbox = self._mailbox
       remote = self._require_remote()
       update_event = asyncio.Event()
-      async def _update_on_event():
+
+      async def _idle_loop():
+        # A single owner of the remote socket: enter IDLE, sync on change, re-enter.
         while True:
-          _ = await update_event.wait()
+          await remote.wait_for_update(mailbox.name, update_event)
           if self._mailbox is not None and self._mailbox.is_remote:
             try:
               await remote.sync_mailbox(self._mailbox.name)
@@ -199,7 +201,8 @@ class IMAPServerConnection:
               logging.warning("idle sync failed for '%s': %s", self._mailbox.name, e)
           self._write_mailbox_update()
           update_event.clear()
-      tasks.extend((asyncio.Task(remote.wait_for_update(mailbox.name, update_event)), asyncio.Task(_update_on_event())))
+
+      idle_task = asyncio.create_task(_idle_loop())
     try:
       done = await self._reader.read_atom()
       await self._reader.read_crlf()
@@ -207,8 +210,9 @@ class IMAPServerConnection:
         raise IMAPReadError(f"expected DONE, got {done!r}")
       self._write_response(b"OK", b"IDLE completed")
     finally:
-      for task in tasks: _ = task.cancel()
-      _ = await asyncio.wait(tasks)
+      if idle_task is not None:
+        _ = idle_task.cancel()
+        _ = await asyncio.wait([idle_task])
 
   async def _command_status(self):
     await self._reader.skip_sp()
@@ -226,7 +230,7 @@ class IMAPServerConnection:
     is_universe = mailbox_name == _UNIVERSE_MAILBOX or (mailbox_name is None and self._is_universe_mailbox)
     if is_universe:
       response: dict[bytes, int] = {}
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         if b"MESSAGES" in attrs: response[b"MESSAGES"] = db_universe_count(db, account.key)
         if b"UIDNEXT" in attrs: response[b"UIDNEXT"] = db_universe_max_uid(db, account.key) + 1
         if b"UIDVALIDITY" in attrs: response[b"UIDVALIDITY"] = 1
@@ -238,7 +242,7 @@ class IMAPServerConnection:
       self._write_response(b"OK", b"status completed")
       return
 
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       mailbox = self._mailbox if mailbox_name is None else db_mailbox_by_name(db, account.key, mailbox_name)
       if mailbox is None:
         return self._write_response(b"NO", b"invalid mailbox name")
@@ -264,7 +268,7 @@ class IMAPServerConnection:
 
     if mailbox_name == _UNIVERSE_MAILBOX:
       self._is_universe_mailbox = True
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         n_messages = db_universe_count(db, account.key)
         max_uid = db_universe_max_uid(db, account.key)
       logging.debug("SELECT Universe: n_messages=%d max_uid=%d uid_next=%d", n_messages, max_uid, max_uid + 1)
@@ -273,7 +277,7 @@ class IMAPServerConnection:
         is_remote=False, last_synced_uid=0)
     else:
       self._is_universe_mailbox = False
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
         needs_sync = mailbox is None or mailbox.is_remote
         logging.debug("SELECT: '%s' mailbox_in_db=%s needs_sync=%s", mailbox_name, mailbox is not None, needs_sync)
@@ -284,7 +288,7 @@ class IMAPServerConnection:
         except Exception as e:
           logging.warning("sync failed for '%s', serving cached data: %s", mailbox_name, e)
 
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
       if mailbox is None:
         raise IMAPCommandFailedError("mailbox unknown")
@@ -294,10 +298,10 @@ class IMAPServerConnection:
 
     self._write_line(b"* FLAGS (%s)" % (" ".join(mailbox.flags).encode("ascii"),))
     if self._is_universe_mailbox:
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         n_messages = db_universe_count(db, account.key)
     else:
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         n_messages = db_mailbox_count_messages(db, mailbox.id)
     self._write_line(b"* %d EXISTS" % (n_messages,))
     self._write_mailbox_list_response(mailbox)
@@ -330,7 +334,7 @@ class IMAPServerConnection:
 
     await remote.sync_mailbox_list()
 
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       for mailbox in db_mailbox_list(db, remote.account.key):
         full_name = reference_name + mailbox.name if reference_name else mailbox.name
         if list_match(full_name, pattern, mailbox.hierarchy_delimiter):
@@ -354,11 +358,11 @@ class IMAPServerConnection:
     mailbox = self._mailbox
     if mailbox is not None and not self._mailbox_read_only and not self._is_universe_mailbox:
       remote = self._require_remote()
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         deleted = [m.uid for m in db_message_list(db, mailbox.id) if "\\Deleted" in m.flags_s]
       if deleted and mailbox.is_remote:
         await remote.uid_expunge(deleted, mailbox.name)
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         for uid in deleted:
           db_message_delete_by_uid(db, mailbox.id, uid)
     self._mailbox = None
@@ -413,7 +417,7 @@ class IMAPServerConnection:
 
     logging.debug("FETCH: seq_set=%s items=%s uid_mode=%s", seq_set_s.decode(), [i.decode(errors="replace") for i in items], uid_mode)
 
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       if self._is_universe_mailbox:
         messages = db_universe_messages(db, mailbox.account_key)
         messages = [dataclasses.replace(m, flags_s=flags_set_to_s(
@@ -432,7 +436,7 @@ class IMAPServerConnection:
 
     seen_uids_to_update: list[tuple[int, int, str]] = []
 
-    with db_open(self._config.db_path) as body_db:
+    with db_session(self._config.db_path) as body_db:
       for seq, msg in matching:
         chunks: list[tuple[bytes, bytes | None]] = []
         should_set_seen = False
@@ -462,7 +466,13 @@ class IMAPServerConnection:
               should_set_seen = True
           elif item_u.startswith(b"BODY") or item_u.startswith(b"RFC822"):
             is_peek = item_u.startswith(b"BODY.PEEK")
-            if b"HEADER.FIELDS" in item_u:
+            if b"HEADER.FIELDS.NOT" in item_u:
+              field_list = self._parse_header_fields(item)
+              raw = db_message_body_get(body_db, msg.body_hash) or b""
+              filtered = filter_headers_not(raw, field_list)
+              tag = item.replace(b"PEEK", b"")
+              chunks.append((b"%s {%d}" % (tag, len(filtered),), filtered))
+            elif b"HEADER.FIELDS" in item_u:
               field_list = self._parse_header_fields(item)
               raw = db_message_body_get(body_db, msg.body_hash) or b""
               filtered = filter_headers(raw, field_list)
@@ -508,7 +518,7 @@ class IMAPServerConnection:
 
     if seen_uids_to_update:
       remote = self._require_remote()
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         for mb_id, uid, new_flags in seen_uids_to_update:
           db_message_update_flags(db, mb_id, uid, new_flags)
       if mailbox.is_remote:
@@ -550,7 +560,7 @@ class IMAPServerConnection:
     if tokens:
       tokens[0] = tokens[0].upper()
 
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       if self._is_universe_mailbox:
         messages = db_universe_messages(db, mailbox.account_key)
         messages = [dataclasses.replace(m, flags_s=flags_set_to_s(
@@ -561,7 +571,7 @@ class IMAPServerConnection:
 
     results: list[int] = []
 
-    with db_open(self._config.db_path) as search_db:
+    with db_session(self._config.db_path) as search_db:
       for i, msg in enumerate(messages):
         matched = self._evaluate_search_criteria(tokens, msg, messages, search_db)
         if matched:
@@ -701,7 +711,7 @@ class IMAPServerConnection:
 
     logging.debug("STORE: seq_set=%s op=%s flags=%s uid_mode=%s remote_flags=%s", seq_set_s.decode(), op_s.decode(), sorted(new_flags), uid_mode, remote_flags_s)
 
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       messages = list(db_message_list(db, mailbox.id))
     matching = self._match_messages(seq_set_s, uid_mode, messages)
 
@@ -717,7 +727,7 @@ class IMAPServerConnection:
         await remote.uid_store(msg.uid, op_s if not silent else op_s + b".SILENT", remote_flags_s)
         logging.debug("STORE: remote uid_store ok uid=%d op=%s flags=%s", msg.uid, op_s, remote_flags_s)
 
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         db_message_update_flags(db, msg.mailbox_id, msg.uid, flags_s)
 
       if not silent:
@@ -761,14 +771,16 @@ class IMAPServerConnection:
     remote = self._require_remote()
     account = remote.account
     logging.debug("APPEND: mailbox=%s flags=%s size=%d", mailbox_name, flags_s, len(data))
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
     if mailbox is None or mailbox.is_remote:
       await remote.uid_append(mailbox_name, flags_s, internal_date, data)
       if mailbox is not None and mailbox.is_remote:
         await remote.sync_mailbox(mailbox_name)
+        if self._mailbox is not None and self._mailbox.is_remote and self._mailbox.name != mailbox_name:
+          await remote.sync_mailbox(self._mailbox.name)
     else:
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         uid = db_mailbox_max_uid(db, mailbox.id) + 1
         db_message_add(db, uid, mailbox.id, int(datetime.datetime.now().timestamp()), flags_s, data, None)
         db_mailbox_update_sync(db, mailbox.id, uid_next=uid + 1, last_synced_uid=uid)
@@ -795,7 +807,7 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     remote = self._require_remote()
     account = remote.account
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       mailbox = db_mailbox_by_name(db, account.key, mailbox_name)
     if mailbox is None:
       if mailbox_name == _UNIVERSE_MAILBOX:
@@ -805,7 +817,7 @@ class IMAPServerConnection:
       return self._write_response(b"NO", b"cannot delete local mailbox via IMAP, use CLI")
     if mailbox.is_remote:
       await remote.delete_mailbox(mailbox_name)
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       db_mailbox_delete(db, mailbox.id)
     self._write_response(b"OK", b"DELETE completed")
 
@@ -817,7 +829,7 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     remote = self._require_remote()
     account = remote.account
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       mailbox = db_mailbox_by_name(db, account.key, old_name)
       if mailbox is not None and db_mailbox_by_name(db, account.key, new_name) is not None:
         return self._write_response(b"NO", b"mailbox already exists")
@@ -829,7 +841,7 @@ class IMAPServerConnection:
       return self._write_response(b"NO", b"cannot rename local mailbox via IMAP, use CLI")
     if mailbox.is_remote:
       await remote.rename_mailbox(old_name, new_name)
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       db_mailbox_rename(db, mailbox.id, new_name)
     self._write_response(b"OK", b"RENAME completed")
 
@@ -844,7 +856,7 @@ class IMAPServerConnection:
     remote = self._require_remote()
     account = remote.account
 
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       messages = list(db_message_list(db, mailbox.id))
       dest_mailbox = db_mailbox_by_name(db, account.key, dest_name)
 
@@ -856,16 +868,20 @@ class IMAPServerConnection:
     if mailbox.is_remote and dest_mailbox.is_remote:
       await remote.uid_copy([msg.uid for _, msg in matching], dest_name)
       await remote.sync_mailbox(dest_name)
+      if self._mailbox is not None and self._mailbox.is_remote and self._mailbox.name != dest_name:
+        await remote.sync_mailbox(self._mailbox.name)
+    elif dest_mailbox.is_remote:
+      with db_session(self._config.db_path) as db:
+        msg_bodies = [(msg, db_message_body_get(db, msg.body_hash) or b"") for _, msg in matching]
+      for msg, data in msg_bodies:
+        await remote.uid_append(dest_name, msg.flags_s, msg.received_date, data)
+      await remote.sync_mailbox(dest_name)
+      if self._mailbox is not None and self._mailbox.is_remote and self._mailbox.name != dest_name:
+        await remote.sync_mailbox(self._mailbox.name)
     else:
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         for _, msg in matching:
           _ = db_message_copy(db, mailbox.id, msg.uid, dest_mailbox.id)
-      if dest_mailbox.is_remote:
-        with db_open(self._config.db_path) as db:
-          msg_bodies = [(msg, db_message_body_get(db, msg.body_hash) or b"") for _, msg in matching]
-        for msg, data in msg_bodies:
-          await remote.uid_append(dest_name, msg.flags_s, msg.received_date, data)
-        await remote.sync_mailbox(dest_name)
 
     self._write_response(b"OK", b"COPY completed")
 
@@ -882,7 +898,7 @@ class IMAPServerConnection:
       return self._write_response(b"NO", b"universe mailbox is read-only")
     remote = self._require_remote()
 
-    with db_open(self._config.db_path) as db:
+    with db_session(self._config.db_path) as db:
       all_msgs = list(db_message_list(db, mailbox.id))
       if uid_mode:
         max_uid = db_mailbox_max_uid(db, mailbox.id)
@@ -899,7 +915,7 @@ class IMAPServerConnection:
     offset = 0
     for seq, msg in deleted:
       actual_seq = seq - offset
-      with db_open(self._config.db_path) as db:
+      with db_session(self._config.db_path) as db:
         db_message_delete_by_uid(db, msg.mailbox_id, msg.uid)
       self._write_line(b"* %d EXPUNGE" % (actual_seq,))
       offset += 1

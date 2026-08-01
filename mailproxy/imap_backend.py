@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from collections.abc import AsyncIterator, Iterator
 from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
-from mailproxy.db import db_message_add, db_message_delete_except, db_messages_merge_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_open
+from mailproxy.db import db_message_add, db_message_delete_except, db_messages_merge_flags, db_mailbox_add, db_mailbox_by_name, db_mailbox_update_sync, db_messages_clear, db_session
 from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, format_internal_date, imap_to_quoted_string, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
 from mailproxy.utils import KeyedLock, encode_7bit_mailbox_name
@@ -95,7 +95,7 @@ class IMAPRemoteConnection:
     uid_next = select_result.uid_next
     flags_s = select_result.flags_s
     logging.debug("sync_mailbox: '%s' uid_validity=%d uid_next=%d exists=%d", mailbox_name, uid_validity, uid_next, select_result.exists)
-    with db_open(self.config.db_path) as db:
+    with db_session(self.config.db_path) as db:
       mailbox = db_mailbox_by_name(db, self.account.key, mailbox_name)
       if mailbox is None:
         mailbox_id = db_mailbox_add(db, self.account.key, mailbox_name, uid_validity, uid_next, flags_s)
@@ -115,7 +115,7 @@ class IMAPRemoteConnection:
     for batch_lo, batch_hi in iter_uid_batches(state.last_synced_uid + 1, state.uid_next - 1, FETCH_BATCH_SIZE):
       count = 0
       self._start_command(b"UID FETCH %d:%d (UID FLAGS INTERNALDATE BODY.PEEK[])" % (batch_lo, batch_hi))
-      with db_open(self.config.db_path) as db:
+      with db_session(self.config.db_path) as db:
         async for rec in self._iter_message_records(range_filter=(batch_lo, batch_hi)):
           received_date = parse_internal_date(rec.internal_date) if rec.internal_date else int(datetime.datetime.now().timestamp())
           db_message_add(db, rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid))
@@ -131,7 +131,7 @@ class IMAPRemoteConnection:
     async for rec in self._iter_flag_records():
       seen_uids.add(rec.uid)
       flag_updates.append((rec.uid, rec.flags_s))
-    with db_open(self.config.db_path) as db:
+    with db_session(self.config.db_path) as db:
       if flag_updates:
         changed = db_messages_merge_flags(db, mailbox_id, flag_updates)
         logging.debug("sync_mailbox: '%s' updated flags for %d messages", mailbox_name, changed)
@@ -183,7 +183,7 @@ class IMAPRemoteConnection:
         if isinstance(flags_raw, bytes) and isinstance(delim, bytes) and isinstance(name, bytes):
           remote_mailboxes.append((flags_raw, delim, name))
 
-      with db_open(self.config.db_path) as db:
+      with db_session(self.config.db_path) as db:
         added = 0
         for flags, delim, name_b in remote_mailboxes:
           name_s = name_b.decode("utf-8")
@@ -241,6 +241,13 @@ class IMAPRemoteConnection:
     await self._read_until_response()
 
   async def wait_for_update(self, mailbox_name: str, update_event: asyncio.Event):
+    """Run one IDLE cycle: enter IDLE, wait for the first change, then exit IDLE.
+
+    Returns once the remote reports a change (setting ``update_event``) after
+    cleanly sending ``DONE`` and draining the tagged response, so the caller
+    can safely issue further commands on this connection without racing the
+    IDLE reader.
+    """
     logging.debug("wait_for_update: '%s' entering IDLE", mailbox_name)
     idle_started = False
     try:
@@ -261,6 +268,7 @@ class IMAPRemoteConnection:
         if resp.kind in (b"EXISTS", b"EXPUNGE", b"FETCH"):
           logging.debug("wait_for_update: '%s' got %s", mailbox_name, resp.kind)
           update_event.set()
+          break
     finally:
       if idle_started:
         try:
@@ -311,7 +319,7 @@ class IMAPRemoteConnection:
 
     if isinstance(self.account.auth, AuthenticationOAUTH2):
       logging.debug("IMAP: authenticating as OAUTH2 (XOAUTH2)")
-      with db_open(self.config.db_path) as db:
+      with db_session(self.config.db_path) as db:
         access_token = account_get_oauth_access_token(db, self.account)
       await self._command_authenticate(b"XOAUTH2", f"user={self.account.addresses[0]}\1auth=Bearer {access_token}\1\1".encode())
     else:

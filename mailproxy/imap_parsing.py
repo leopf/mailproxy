@@ -122,6 +122,23 @@ def filter_headers(data: bytes, field_names: list[bytes]) -> bytes:
     result.extend(current_fields)
   return b"\r\n".join(result) + (b"\r\n" if result else b"")
 
+def filter_headers_not(data: bytes, field_names: list[bytes]) -> bytes:
+  """Drop the given headers (used for ``BODY[HEADER.FIELDS.NOT (...)]``)."""
+  header, _ = split_message(data)
+  exclude = [f.lower() + b":" for f in field_names]
+  lines = header.split(b"\r\n")
+  result: list[bytes] = []
+  dropping = False
+  for line in lines:
+    if any(line.lower().startswith(x) for x in exclude):
+      dropping = True
+      continue
+    if dropping and (line[:1] in (b" ", b"\t")):
+      continue
+    dropping = False
+    result.append(line)
+  return b"\r\n".join(result) + (b"\r\n" if result else b"")
+
 def header_contains(data: bytes, name: str, needle: bytes) -> bool:
   value = get_header(data, name)
   return needle.lower() in value.lower()

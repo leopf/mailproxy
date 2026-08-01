@@ -1,5 +1,5 @@
 import asyncio, logging, re
-from mailproxy.db import db_open
+from mailproxy.db import db_session
 from mailproxy.auth import authenticate_sasl
 from mailproxy.model import Account, Config
 from mailproxy.smtp_backend import smtp_forward_mail
@@ -52,7 +52,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
           recipients.clear()
           reply(250, "OK")
         case "AUTH" if (m:=match_line(r"PLAIN (?P<data>\S+)", rest)):
-          with db_open(config.db_path) as db:
+          with db_session(config.db_path) as db:
             account = authenticate_sasl(config, db, m["data"].encode())
           if account is None:
             logging.debug("SMTP AUTH PLAIN failed")
@@ -63,7 +63,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
         case "AUTH" if match_line(r"PLAIN\s*", rest):
           write_line("334 ")
           auth_line = (await reader.readuntil(b"\r\n"))[:-2]
-          with db_open(config.db_path) as db:
+          with db_session(config.db_path) as db:
             account = authenticate_sasl(config, db, auth_line)
           if account is None:
             logging.debug("SMTP AUTH PLAIN (two-line) failed")

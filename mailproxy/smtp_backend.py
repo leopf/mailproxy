@@ -1,6 +1,6 @@
 import asyncio, base64, contextlib, logging, pathlib, re, ssl
 from mailproxy.auth import account_get_oauth_access_token
-from mailproxy.db import db_open
+from mailproxy.db import db_session
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, TLSMode
 
 
@@ -31,7 +31,7 @@ async def _smtp_authenticate(writer: asyncio.StreamWriter, reader: asyncio.Strea
   match account.auth:
     case AuthenticationOAUTH2():
       logging.debug("SMTP backend: authenticating as OAUTH2 (XOAUTH2)")
-      with db_open(db_path) as db:
+      with db_session(db_path) as db:
         access_token = account_get_oauth_access_token(db, account)
       auth_string = f"user={account.addresses[0]}\1auth=Bearer {access_token}\1\1"
       code, message = await _smtp_send(writer, reader, f"AUTH XOAUTH2 {base64.b64encode(auth_string.encode()).decode()}")
@@ -68,7 +68,9 @@ async def smtp_forward_mail(db_path: pathlib.Path, account: Account, sender: str
     _ = await _smtp_send(writer, reader, "DATA", expect_code=354)
     writer.write(_dot_stuff(mail_data) + b"\r\n.\r\n")
     await writer.drain()
-    _ = await _smtp_read_response(reader)
+    code, message = await _smtp_read_response(reader)
+    if code not in (250, 251):
+      raise RuntimeError(f"DATA failed: {code} {message}")
   finally:
     with contextlib.suppress(Exception):
       _ = await _smtp_send(writer, reader, "QUIT")

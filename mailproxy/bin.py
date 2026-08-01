@@ -1,7 +1,7 @@
 import functools, asyncio, logging, argparse, pathlib, os, dataclasses, secrets, webbrowser, urllib.parse, http.server, ssl, importlib.resources, typing
 from typing import TypeVar
 from mailproxy.config import config_from_dict, provider_config_from_dict
-from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_mailbox_add, db_mailbox_by_name, db_mailbox_delete, db_mailbox_list, db_mailbox_rename, db_open
+from mailproxy.db import db_account_add, db_account_get_by_address, db_account_list, db_account_remove, db_mailbox_add, db_mailbox_by_name, db_mailbox_delete, db_mailbox_list, db_mailbox_rename, db_session
 from mailproxy.imap_frontend import handle_imap
 from mailproxy.auth import account_get_oauth_access_token, oauth_get_authorization_url, oauth_fetch_access_token_with_authorization_code, pkce_generate
 from mailproxy.smtp_frontend import smtp_server_handle_client
@@ -18,6 +18,11 @@ def _load_config(config_path: pathlib.Path) -> Config:
   config = config_from_dict(raw)
   config = dataclasses.replace(config, proxy_password=os.environ.get("MAILPROXY_PASSWORD", ""))
   logging.basicConfig(level=config.log_level)
+  if config.log_file is not None:
+    config.log_file.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(config.log_file)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(handler)
   return config
 
 def _load_provider_config(preset: str | None, provider_config_path: pathlib.Path | None) -> ProviderConfig:
@@ -131,13 +136,13 @@ def exec_account_add(config: Config, addresses: list[str], preset: str | None, p
     smtp_host=sm_host, smtp_port=sm_port, smtp_tlsmode=sm_tls,
     auth=auth,
   )
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     db_account_add(db, account, refresh_token)
 
   print(f"added account '{account.key}' ({', '.join(account.addresses)})")
 
 def exec_account_list(config: Config):
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     accounts = db_account_list(db)
 
   if not accounts:
@@ -150,7 +155,7 @@ def exec_account_list(config: Config):
     print(f"{a.key}\t{', '.join(a.addresses)}\t{a.imap_host}:{a.imap_port}\t{auth_type}\t{created}")
 
 def exec_account_remove(config: Config, address: str):
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     account = db_account_get_by_address(db, address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
@@ -158,7 +163,7 @@ def exec_account_remove(config: Config, address: str):
   print(f"removed account '{account.key}'")
 
 def exec_mailbox_add(config: Config, address: str, name: str):
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     account = db_account_get_by_address(db, address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
@@ -168,7 +173,7 @@ def exec_mailbox_add(config: Config, address: str, name: str):
   print(f"added local mailbox '{name}' for account '{account.key}'")
 
 def exec_mailbox_list(config: Config, address: str):
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     account = db_account_get_by_address(db, address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
@@ -181,7 +186,7 @@ def exec_mailbox_list(config: Config, address: str):
     print(f"{mb.name}\t{kind}")
 
 def exec_mailbox_remove(config: Config, address: str, name: str):
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     account = db_account_get_by_address(db, address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
@@ -194,7 +199,7 @@ def exec_mailbox_remove(config: Config, address: str, name: str):
   print(f"removed local mailbox '{name}'")
 
 def exec_mailbox_rename(config: Config, address: str, old_name: str, new_name: str):
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     account = db_account_get_by_address(db, address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")
@@ -209,7 +214,7 @@ def exec_mailbox_rename(config: Config, address: str, old_name: str, new_name: s
   print(f"renamed local mailbox '{old_name}' to '{new_name}'")
 
 def exec_get_access_token(config: Config, address: str):
-  with db_open(config.db_path) as db:
+  with db_session(config.db_path) as db:
     account = db_account_get_by_address(db, address)
     if account is None:
       raise RuntimeError(f"no account for address '{address}'")

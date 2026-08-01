@@ -1,5 +1,5 @@
-import sqlite3, pathlib, datetime, json, typing
-from collections.abc import Iterator
+import sqlite3, pathlib, datetime, json, typing, contextlib
+from collections.abc import Generator, Iterator
 from typing import TypeVar
 from mailproxy.imap_parsing import SYSTEM_FLAGS, flags_s_to_set, flags_set_to_s
 from mailproxy.model import Account, AuthenticationOAUTH2, AuthenticationPLAIN, Mailbox, Message, TLSMode
@@ -111,6 +111,26 @@ def db_open(db_path: pathlib.Path) -> sqlite3.Connection:
     _migrate(conn)
 
   return conn
+
+@contextlib.contextmanager
+def db_session(db_path: pathlib.Path) -> Generator[sqlite3.Connection, None, None]:
+  """Context manager that opens and, on exit, closes a database connection.
+
+  ``db_open`` returns a bare ``sqlite3.Connection`` whose ``__exit__`` only
+  commits/rolls back and does not close. Long-running servers open a connection
+  per command, so relying on ``with db_open(...) as db:`` alone leaks a file
+  descriptor + memory every call. ``db_session`` yields the same connection but
+  always closes it on exit.
+  """
+  conn = db_open(db_path)
+  try:
+    yield conn
+    conn.commit()
+  except BaseException:
+    conn.rollback()
+    raise
+  finally:
+    conn.close()
 
 def fetchone(db: sqlite3.Connection, query: str, params: tuple[object, ...] = ()) -> sqlite3.Row | None:
   cursor: sqlite3.Cursor = db.execute(query, params)
@@ -276,7 +296,7 @@ def db_mailbox_add(db: sqlite3.Connection, account_key: str, name: str, uid_vali
   row = typing.cast(sqlite3.Row | None, cur.fetchone())
   assert row is not None
   row_id = row_field(row, "id", int)
-  _ = db.execute("UPDATE messages SET is_deleted=0 WHERE mailbox_id=?", (row_id,))
+  _ = db.execute("UPDATE messages SET is_deleted=0 WHERE mailbox_id=? AND remote_uid IS NOT NULL", (row_id,))
   return row_id
 
 def db_mailbox_update_sync(db: sqlite3.Connection, mailbox_id: int, *, uid_next: int | None = None, \
