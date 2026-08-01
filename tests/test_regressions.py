@@ -138,6 +138,26 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
     await h.run()
     self.assertIn(b"A3 OK IDLE completed", h.output())
 
+  async def test_noop_without_mailbox_ok(self):
+    h = self._h()
+    h.login()
+    h.cmd("A2", "NOOP")
+    h.finish()
+    await h.run()
+    self.assertIn(b"A2 OK NOOP completed", h.output())
+
+  async def test_list_lists_mailboxes(self):
+    seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
+    seed_mailbox(self.config, self.account, "Archive", is_remote=False)
+    h = self._h()
+    h.login()
+    h.cmd("A2", "LIST \"\" \"*\"")
+    h.finish()
+    await h.run()
+    out = h.output()
+    self.assertIn(b"INBOX", out)
+    self.assertIn(b"Archive", out)
+
 
 def seed_account_remote(config, address):
   from tests.helpers import make_account

@@ -1,11 +1,18 @@
 import asyncio, logging, re
+from collections.abc import Awaitable, Callable
 from mailproxy.db import DatabaseSession
 from mailproxy.auth import authenticate_sasl
 from mailproxy.model import Account, Config
-from mailproxy.smtp_backend import smtp_forward_mail
 from mailproxy.utils import match_line, server_tls_context
 
-async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+
+async def _default_forward(config: Config, account: Account, sender: str, recipients: tuple[str, ...], mail_data: bytes):
+  from mailproxy.smtp_backend import smtp_forward_mail
+  await smtp_forward_mail(config, account, sender, recipients, mail_data)
+
+
+async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+    forward_mail: Callable[..., Awaitable[None]] | None = None):
   def write_line(line: str):
     writer.write(line.encode("ascii"))
     writer.write(b"\r\n")
@@ -99,7 +106,9 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
                 mail_buf.extend(data_line)
             mail_data = bytes(mail_buf)
             try:
-              await smtp_forward_mail(config, account, sender, tuple(recipients), mail_data)
+              if forward_mail is None:
+                forward_mail = _default_forward
+              await forward_mail(config, account, sender, tuple(recipients), mail_data)
               reply(250, "OK")
             except Exception as e:
               logging.error("failed to send message: %s", e)
