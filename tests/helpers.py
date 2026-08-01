@@ -1,4 +1,5 @@
 import asyncio, pathlib, tempfile
+from collections.abc import Iterable
 from mailproxy.db import DatabaseSession
 from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 
@@ -39,7 +40,7 @@ class MemoryWriter:
       raise BrokenPipeError("write on closed writer")
     self._buf.extend(data)
 
-  def writelines(self, lines) -> None:
+  def writelines(self, lines: Iterable[bytes]) -> None:
     for line in lines:
       self.write(line)
 
@@ -52,7 +53,7 @@ class MemoryWriter:
   def is_closing(self) -> bool:
     return self._closed
 
-  def get_extra_info(self, name, default=None):
+  def get_extra_info(self, _name: str, default: object | None = None) -> object | None:
     return default
 
 
@@ -99,15 +100,15 @@ class BidiPipe:
 
 
 class LinkedWriter:
-  """A writer that delivers every write plus a copy to a given StreamReader."""
+  """A writer that delivers every write to a given StreamReader."""
 
   def __init__(self, target: asyncio.StreamReader) -> None:
-    self._target = target
+    self._target: asyncio.StreamReader = target
 
   def write(self, data: bytes) -> None:
     self._target.feed_data(data)
 
-  def writelines(self, lines) -> None:
+  def writelines(self, lines: Iterable[bytes]) -> None:
     for line in lines:
       self.write(line)
 
@@ -120,8 +121,9 @@ class LinkedWriter:
   def is_closing(self) -> bool:
     return False
 
-  def get_extra_info(self, name, default=None):
+  def get_extra_info(self, _name: str, default: object | None = None) -> object | None:
     return default
+
 
 
 def make_config(db_path: pathlib.Path | None = None, *, proxy_password: str = "pw") -> Config:

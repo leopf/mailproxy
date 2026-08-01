@@ -1,54 +1,24 @@
 import pathlib, tempfile, unittest
+from typing import override
 
 from mailproxy.db import DatabaseSession
-from mailproxy.imap_frontend import IMAPServerConnection
 
 from tests.fake_remote import FakeRemoteConnection
-from tests.helpers import (MemoryPipe, make_config, seed_account, seed_mailbox,
-                         seed_message)
-
-
-class IMAPHarness:
-  def __init__(self, config, address: str = "test@example.com", remote=None):
-    self.config = config
-    self.address = address
-    self.pipe = MemoryPipe()
-    self.remote = remote
-    self.conn = IMAPServerConnection(config, self.pipe.reader, self.pipe.writer, remote_factory=self._factory)  # pyright: ignore[reportArgumentType]
-
-  async def _factory(self, config, account):
-    if self.remote is None:
-      self.remote = FakeRemoteConnection(config, account)
-    return self.remote
-
-  def login(self):
-    self.pipe.feed(("A1 LOGIN %s pw\r\n" % self.address).encode())
-
-  def cmd(self, tag: str, line: str):
-    self.pipe.feed(("%s %s\r\n" % (tag, line)).encode())
-
-  def finish(self):
-    self.pipe.feed_eof()
-
-  async def run(self):
-    await self.conn.run()
-
-  def output(self) -> bytes:
-    return self.pipe.output()
-
-
-def db(config):
-  return DatabaseSession(config)
+from tests.harness import IMAPHarness
+from tests.helpers import make_config, seed_account, seed_mailbox, seed_message
+from mailproxy.model import Config
 
 
 class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
+  @override
   def setUp(self):
-    self._tmpdir = tempfile.TemporaryDirectory()
-    self.config = make_config(pathlib.Path(self._tmpdir.name) / "test.sqlite")
-    self.account = "test@example.com"
-    seed_account(self.config, self.account)
-    self.remote = FakeRemoteConnection(self.config, seed_account_remote(self.config, self.account))
+    self._tmpdir: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory()
+    self.config: Config = make_config(pathlib.Path(self._tmpdir.name) / "test.sqlite")
+    self.account: str = "test@example.com"
+    _ = seed_account(self.config, self.account)
+    self.remote: FakeRemoteConnection = FakeRemoteConnection(self.config, _make_account(self.account))
 
+  @override
   def tearDown(self):
     self._tmpdir.cleanup()
 
@@ -60,7 +30,7 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
   async def test_header_fields_not_excludes_listed_fields(self):
     mid = seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
     body = b"From: a@b\r\nTo: c@d\r\nSubject: hi\r\nX-Large: y\r\n\r\nhello"
-    seed_message(self.config, mid, body)
+    _ = seed_message(self.config, mid, body)
     h = self._h()
     h.login()
     h.cmd("A2", "SELECT INBOX")
@@ -80,7 +50,7 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
     local_mid = seed_mailbox(self.config, self.account, "Archive", is_remote=False)
     remote_mid = seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
     body = b"Subject: copy me\r\n\r\ncontent"
-    seed_message(self.config, local_mid, body)
+    _ = seed_message(self.config, local_mid, body)
     h = self._h()
     h.login()
     h.cmd("A2", "SELECT Archive")
@@ -102,7 +72,7 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
   # --- Bug 8: IDLE on a LOCAL mailbox must not contact the remote ---
 
   async def test_idle_on_local_mailbox_does_not_contact_remote(self):
-    seed_mailbox(self.config, self.account, "Archive", is_remote=False)
+    _ = seed_mailbox(self.config, self.account, "Archive", is_remote=False)
     h = self._h()
     h.login()
     h.cmd("A2", "SELECT Archive")
@@ -116,7 +86,7 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
 
   async def test_store_sets_flags_on_remote(self):
     mid = seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
-    seed_message(self.config, mid, b"Subject: x\r\n\r\nbody")
+    _ = seed_message(self.config, mid, b"Subject: x\r\n\r\nbody")
     h = self._h()
     h.login()
     h.cmd("A2", "SELECT INBOX")
@@ -128,7 +98,7 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
   # --- Bug 1: IDLE on remote drives a single-socket loop (no duplicate sync while idling) ---
 
   async def test_idle_on_remote_contacts_remote(self):
-    seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
+    _ = seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
     h = self._h()
     h.login()
     h.cmd("A2", "SELECT INBOX")
@@ -147,8 +117,8 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
     self.assertIn(b"A2 OK NOOP completed", h.output())
 
   async def test_list_lists_mailboxes(self):
-    seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
-    seed_mailbox(self.config, self.account, "Archive", is_remote=False)
+    _ = seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
+    _ = seed_mailbox(self.config, self.account, "Archive", is_remote=False)
     h = self._h()
     h.login()
     h.cmd("A2", "LIST \"\" \"*\"")
@@ -159,10 +129,10 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
     self.assertIn(b"Archive", out)
 
 
-def seed_account_remote(config, address):
+def _make_account(address: str):
   from tests.helpers import make_account
   return make_account(address)
 
 
 if __name__ == "__main__":
-  unittest.main()
+  _ = unittest.main()
