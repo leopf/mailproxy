@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
 from mailproxy.db import DatabaseSession
-from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_s, format_internal_date, imap_to_quoted_string, parse_internal_date
+from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, flags_to_b, flags_to_s, format_internal_date, imap_to_quoted_string, parse_internal_date
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, TLSMode
 from mailproxy.utils import KeyedLock, encode_7bit_mailbox_name
 
@@ -210,12 +210,12 @@ class IMAPRemoteConnection:
       logging.debug("sync_mailbox_list: %d remote mailboxes, %d new", len(remote_mailboxes), added)
 
   async def uid_store(self, uid: int, op: bytes, flags_s: str):
-    flags_b = b" ".join(b"\\" + f.encode("ascii") for f in flags_s.strip("\\").split("\\") if f) if flags_s != "\\" else b""
+    flags_b = flags_to_b(flags_s) if flags_s != "\\" else b""
     self._start_command(b"UID STORE %d %s (%s)" % (uid, op, flags_b))
     await self._read_until_response()
 
   async def uid_append(self, mailbox_name: str, flags_s: str, internal_date: int | None, data: bytes):
-    flags_b = b"" if flags_s == "\\" else b" (" + b" ".join(b"\\" + f.encode("ascii") for f in flags_s.strip("\\").split("\\") if f) + b")"
+    flags_b = b"" if flags_s == "\\" else b" (" + flags_to_b(flags_s) + b")"
     date_b = b" \"" + format_internal_date(internal_date) + b"\"" if internal_date is not None else b""
     self._start_command(b"APPEND %s%s%s {%d}" % (self._encode_mailbox(mailbox_name), flags_b, date_b, len(data)))
     if await self._imap.peek(1) != b"+":
@@ -337,7 +337,7 @@ class IMAPRemoteConnection:
     if isinstance(self.account.auth, AuthenticationOAUTH2):
       logging.debug("IMAP: authenticating as OAUTH2 (XOAUTH2)")
       with DatabaseSession(self.config) as db:
-        access_token = account_get_oauth_access_token(db, self.account)
+        access_token = await account_get_oauth_access_token(db, self.account)
       await self._command_authenticate(b"XOAUTH2", f"user={self.account.addresses[0]}\1auth=Bearer {access_token}\1\1".encode())
     else:
       logging.debug("IMAP: authenticating as PLAIN (LOGIN)")

@@ -63,6 +63,12 @@ class IMAPServerConnection:
       raise IMAPCommandFailedError("No mailbox selected!")
     return self._mailbox
 
+  def _reject_if_universe(self) -> bool:
+    if self._is_universe_mailbox:
+      self._write_response(b"NO", b"universe mailbox is read-only")
+      return True
+    return False
+
   def _write_mailbox_update(self):
     if self._mailbox is None:
       return
@@ -369,6 +375,17 @@ class IMAPServerConnection:
     self._is_universe_mailbox = False
     self._write_response(b"OK", b"CLOSE completed")
 
+  def _load_messages(self, mailbox: Mailbox) -> list[Message]:
+    with DatabaseSession(self._config) as db:
+      if self._is_universe_mailbox:
+        messages = db.universe_messages(mailbox.account_key)
+        messages = [dataclasses.replace(m, flags_s=flags_set_to_s(
+          flags_s_to_set(m.flags_s) - {"Deleted", "Recent"}
+        )) for m in messages]
+      else:
+        messages = list(db.message_list(mailbox.id))
+    return messages
+
   def _match_messages(self, seq_set_s: bytes, uid_mode: bool, messages: list[Message]) -> list[tuple[int, Message]]:
     n = len(messages)
     if uid_mode:
@@ -416,20 +433,12 @@ class IMAPServerConnection:
 
     logging.debug("FETCH: seq_set=%s items=%s uid_mode=%s", seq_set_s.decode(), [i.decode(errors="replace") for i in items], uid_mode)
 
-    with DatabaseSession(self._config) as db:
-      if self._is_universe_mailbox:
-        messages = db.universe_messages(mailbox.account_key)
-        messages = [dataclasses.replace(m, flags_s=flags_set_to_s(
-          flags_s_to_set(m.flags_s) - {"Deleted", "Recent"}
-        )) for m in messages]
-      else:
-        messages = list(db.message_list(mailbox.id))
+    messages = self._load_messages(mailbox)
 
     if not messages:
       logging.debug("FETCH: no messages in mailbox %s", mailbox.name)
       self._write_response(b"OK", b"FETCH completed")
       return
-
     matching = self._match_messages(seq_set_s, uid_mode, messages)
     logging.debug("FETCH: %d messages, %d matched", len(messages), len(matching))
 
@@ -561,14 +570,7 @@ class IMAPServerConnection:
     if tokens:
       tokens[0] = tokens[0].upper()
 
-    with DatabaseSession(self._config) as db:
-      if self._is_universe_mailbox:
-        messages = db.universe_messages(mailbox.account_key)
-        messages = [dataclasses.replace(m, flags_s=flags_set_to_s(
-          flags_s_to_set(m.flags_s) - {"Deleted", "Recent"}
-        )) for m in messages]
-      else:
-        messages = list(db.message_list(mailbox.id))
+    messages = self._load_messages(mailbox)
 
     results: list[int] = []
 
@@ -707,8 +709,8 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
-    if self._is_universe_mailbox:
-      return self._write_response(b"NO", b"universe mailbox is read-only")
+    if self._reject_if_universe():
+      return
     remote = self._require_remote()
 
     new_flags = set(f.decode("ascii").lstrip("\\") for f in flags_s_raw.strip().split(b" ") if f)
@@ -741,7 +743,7 @@ class IMAPServerConnection:
         db.message_update_flags(msg.mailbox_id, msg.uid, flags_s)
 
       if not silent:
-        flags_b = b" ".join(b"\\" + f.encode("ascii") for f in sorted(result_flags))
+        flags_b = flags_to_b(flags_set_to_s(result_flags))
         fetch_data = b"UID %d FLAGS (%s)" % (msg.uid, flags_b) if uid_mode else b"FLAGS (%s)" % (flags_b,)
         self._write_line(b"* %d FETCH (%s)" % (seq, fetch_data))
 
@@ -862,7 +864,8 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     mailbox = self._require_mailbox()
     if self._is_universe_mailbox or dest_name == _UNIVERSE_MAILBOX:
-      return self._write_response(b"NO", b"universe mailbox is read-only")
+      self._write_response(b"NO", b"universe mailbox is read-only")
+      return
     remote = self._require_remote()
     account = remote.account
 
@@ -904,8 +907,8 @@ class IMAPServerConnection:
       await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
-    if self._is_universe_mailbox:
-      return self._write_response(b"NO", b"universe mailbox is read-only")
+    if self._reject_if_universe():
+      return
     remote = self._require_remote()
 
     with DatabaseSession(self._config) as db:

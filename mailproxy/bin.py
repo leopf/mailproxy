@@ -220,7 +220,7 @@ def exec_get_access_token(config: Config, address: str):
       raise RuntimeError(f"no account for address '{address}'")
     if not isinstance(account.auth, AuthenticationOAUTH2):
       raise RuntimeError(f"account '{address}' is not OAUTH2")
-    access_token = account_get_oauth_access_token(db, account)
+    access_token = asyncio.run(account_get_oauth_access_token(db, account))
 
   print("success, we have an access token :)")
   print("access token:", access_token)
@@ -298,7 +298,7 @@ def exec_login(provider: OAuthProviderConfig):
 
     code = authorization_code[0]
 
-  access_token_result = oauth_fetch_access_token_with_authorization_code(auth, code, code_verifier)
+  access_token_result = asyncio.run(oauth_fetch_access_token_with_authorization_code(auth, code, code_verifier))
 
   print("success, we have an access and refresh token :)")
   print("expires at: ", str(access_token_result.expires_at))

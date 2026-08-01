@@ -1,13 +1,15 @@
-import http.client, urllib.parse, datetime, base64, hashlib, secrets, hmac
+import asyncio, http.client, urllib.parse, datetime, base64, hashlib, secrets, hmac
 from mailproxy.config import oauth_token_response_from_dict
 from mailproxy.db import DatabaseSession, row_field, row_optional
 from mailproxy.model import Account, AuthenticationOAUTH2, Config, OAUTHAccessTokenResult
-from mailproxy.utils import json_loads_object
+from mailproxy.utils import KeyedLock, json_loads_object
 
 class AuthenticationError(Exception):
   pass
 
-def _fetch_access_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]) -> OAUTHAccessTokenResult:
+_token_refresh_locks: KeyedLock[str] = KeyedLock()
+
+def _http_post_token_blocking(auth: AuthenticationOAUTH2, extra_data: dict[str, str]) -> OAUTHAccessTokenResult:
   data = { "client_id": auth.client_id } | extra_data
   if auth.client_secret is not None:
     data["client_secret"] = auth.client_secret
@@ -40,14 +42,17 @@ def _fetch_access_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]) 
   finally:
     conn.close()
 
-def oauth_fetch_access_token_with_refresh_token(auth: AuthenticationOAUTH2, refresh_token: str) -> OAUTHAccessTokenResult:
-  return _fetch_access_token(auth, { "grant_type": "refresh_token", "refresh_token": refresh_token })
+async def _http_post_token(auth: AuthenticationOAUTH2, extra_data: dict[str, str]) -> OAUTHAccessTokenResult:
+  return await asyncio.to_thread(_http_post_token_blocking, auth, extra_data)
 
-def oauth_fetch_access_token_with_authorization_code(auth: AuthenticationOAUTH2, authorization_code: str, code_verifier: str | None = None) -> OAUTHAccessTokenResult:
+async def oauth_fetch_access_token_with_refresh_token(auth: AuthenticationOAUTH2, refresh_token: str) -> OAUTHAccessTokenResult:
+  return await _http_post_token(auth, { "grant_type": "refresh_token", "refresh_token": refresh_token })
+
+async def oauth_fetch_access_token_with_authorization_code(auth: AuthenticationOAUTH2, authorization_code: str, code_verifier: str | None = None) -> OAUTHAccessTokenResult:
   extra_data = { "grant_type": "authorization_code", "code": authorization_code, "redirect_uri": auth.redirect_url }
   if code_verifier is not None:
     extra_data["code_verifier"] = code_verifier
-  return _fetch_access_token(auth, extra_data)
+  return await _http_post_token(auth, extra_data)
 
 def pkce_generate() -> tuple[str, str]:
   verifier = secrets.token_urlsafe(64)
@@ -84,22 +89,23 @@ def authenticate(config: Config, db: DatabaseSession, username: bytes, password:
     return None
   return account
 
-def account_get_oauth_access_token(db: DatabaseSession, account: Account) -> str:
+async def account_get_oauth_access_token(db: DatabaseSession, account: Account) -> str:
   assert isinstance(account.auth, AuthenticationOAUTH2)
-  row = db.fetchone("SELECT access_token, refresh_token, expires_at FROM oauth2_data WHERE account_key=?", (account.key,))
-  if row is None:
-    raise AuthenticationError(f"no oauth2 data for account '{account.key}'")
+  async with _token_refresh_locks.acquire(account.key):
+    row = db.fetchone("SELECT access_token, refresh_token, expires_at FROM oauth2_data WHERE account_key=?", (account.key,))
+    if row is None:
+      raise AuthenticationError(f"no oauth2 data for account '{account.key}'")
 
-  access_token = row_optional(row, "access_token", str)
-  refresh_token = row_field(row, "refresh_token", str)
-  expires_at_str = row_optional(row, "expires_at", str)
-  if access_token is not None and expires_at_str is not None:
-    expires_at = datetime.datetime.fromisoformat(expires_at_str)
-    if datetime.datetime.now() < expires_at:
-      return access_token
+    access_token = row_optional(row, "access_token", str)
+    refresh_token = row_field(row, "refresh_token", str)
+    expires_at_str = row_optional(row, "expires_at", str)
+    if access_token is not None and expires_at_str is not None:
+      expires_at = datetime.datetime.fromisoformat(expires_at_str)
+      if datetime.datetime.now() < expires_at:
+        return access_token
 
-  new_auth_result = oauth_fetch_access_token_with_refresh_token(account.auth, refresh_token)
-  _ = db.conn.execute("""UPDATE oauth2_data SET access_token=?, refresh_token=?, expires_at=? WHERE account_key=?""",
-    (new_auth_result.access_token, new_auth_result.refresh_token or refresh_token, new_auth_result.expires_at.isoformat(), account.key))
-  db.conn.commit()
-  return new_auth_result.access_token
+    new_auth_result = await oauth_fetch_access_token_with_refresh_token(account.auth, refresh_token)
+    _ = db.conn.execute("""UPDATE oauth2_data SET access_token=?, refresh_token=?, expires_at=? WHERE account_key=?""",
+      (new_auth_result.access_token, new_auth_result.refresh_token or refresh_token, new_auth_result.expires_at.isoformat(), account.key))
+    db.conn.commit()
+    return new_auth_result.access_token

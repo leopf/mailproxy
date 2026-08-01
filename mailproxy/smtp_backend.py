@@ -33,7 +33,7 @@ async def _smtp_authenticate(writer: asyncio.StreamWriter, reader: asyncio.Strea
     case AuthenticationOAUTH2():
       logging.debug("SMTP backend: authenticating as OAUTH2 (XOAUTH2)")
       with DatabaseSession(config) as db:
-        access_token = account_get_oauth_access_token(db, account)
+        access_token = await account_get_oauth_access_token(db, account)
       auth_string = f"user={account.addresses[0]}\1auth=Bearer {access_token}\1\1"
       code, message = await _smtp_send(writer, reader, f"AUTH XOAUTH2 {base64.b64encode(auth_string.encode()).decode()}")
       if code == 334:

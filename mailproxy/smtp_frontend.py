@@ -11,6 +11,12 @@ async def _default_forward(config: Config, account: Account, sender: str, recipi
   await smtp_forward_mail(config, account, sender, recipients, mail_data)
 
 
+def _auth_reply(account: Account | None) -> tuple[int, str]:
+  if account is None:
+    return 535, "5.7.8  Authentication credentials invalid"
+  return 235, "2.7.0  Authentication Succeeded"
+
+
 async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     forward_mail: Callable[..., Awaitable[None]] | None = None):
   def write_line(line: str):
@@ -61,23 +67,13 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
         case "AUTH" if (m:=match_line(r"PLAIN (?P<data>\S+)", rest)):
           with DatabaseSession(config) as db:
             account = authenticate_sasl(config, db, m["data"].encode())
-          if account is None:
-            logging.debug("SMTP AUTH PLAIN failed")
-            reply(535, "5.7.8  Authentication credentials invalid")
-          else:
-            logging.debug("SMTP AUTH PLAIN success for %s", account.key)
-            reply(235, "2.7.0  Authentication Succeeded")
+          reply(*_auth_reply(account))
         case "AUTH" if match_line(r"PLAIN\s*", rest):
           write_line("334 ")
           auth_line = (await reader.readuntil(b"\r\n"))[:-2]
           with DatabaseSession(config) as db:
             account = authenticate_sasl(config, db, auth_line)
-          if account is None:
-            logging.debug("SMTP AUTH PLAIN (two-line) failed")
-            reply(535, "5.7.8  Authentication credentials invalid")
-          else:
-            logging.debug("SMTP AUTH PLAIN (two-line) success for %s", account.key)
-            reply(235, "2.7.0  Authentication Succeeded")
+          reply(*_auth_reply(account))
         case "MAIL" if account is not None and (m:=match_line(r"FROM:<(?P<mailbox>.*)>( .*)?", rest)):
           logging.debug("sending mail from mailbox: " + m["mailbox"])
           sender = m["mailbox"]
