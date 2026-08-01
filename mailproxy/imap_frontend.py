@@ -533,7 +533,8 @@ class IMAPServerConnection:
     return [f.strip() for f in m.group("fields").split(b" ") if f.strip()]
 
   async def _read_search_tokens(self) -> list[bytes]:
-    """Read SEARCH criteria tokens until CRLF, respecting quoted strings and literals."""
+    """Read SEARCH criteria tokens until CRLF, respecting quoted strings, literals,
+    and parenthesised grouping (parens become standalone tokens)."""
     tokens: list[bytes] = []
     while True:
       await self._reader.skip_wsp()
@@ -544,6 +545,8 @@ class IMAPServerConnection:
         tokens.append(await self._reader.read_quoted())
       elif c == b"{":
         tokens.append(await self._reader.read_literal())
+      elif c in (b"(", b")"):
+        tokens.append(await self._reader.readexactly(1))
       else:
         tokens.append(await self._reader.read_token())
     await self._reader.read_crlf()
@@ -594,97 +597,106 @@ class IMAPServerConnection:
     return 1
 
   def _evaluate_search_criteria(self, tokens: list[bytes], msg: Message, all_messages: list[Message], db: DatabaseSession) -> bool:
-    j = 0
+    matched, _consumed = self._eval_search_sequence(tokens, 0, msg, all_messages, db)
+    return matched
+
+  def _eval_search_sequence(self, tokens: list[bytes], start: int, msg: Message, all_messages: list[Message], db: DatabaseSession) -> tuple[bool, int]:
+    j = start
     matched = True
     while j < len(tokens):
-      c = tokens[j].upper()
-      if c in _SEARCH_FLAGS:
-        flag = _SEARCH_FLAGS[c].decode("ascii")
-        present = flag in msg.flags_s
-        matched = matched and (not present if _SEARCH_NEGATE_RE.match(c) else present)
-      elif c == b"NEW":
-        matched = matched and "\\Recent" in msg.flags_s and "\\Seen" not in msg.flags_s
-      elif c == b"ALL":
-        pass
-      elif c == b"UID" and j + 1 < len(tokens):
-        j += 1
-        uid_set = set(parse_sequence_set(tokens[j], max(m.uid for m in all_messages) if all_messages else 0))
-        matched = matched and msg.uid in uid_set
-      elif c == b"CHARSET":
-        j += 1
-      elif c in (b"SUBJECT", b"FROM", b"TO", b"CC", b"BCC") and j + 1 < len(tokens):
-        j += 1
-        data = db.message_body_get(msg.body_hash) or b""
-        matched = matched and header_contains(data, c.decode("ascii"), tokens[j])
-      elif c == b"HEADER" and j + 2 < len(tokens):
-        j += 2
-        data = db.message_body_get(msg.body_hash) or b""
-        matched = matched and header_contains(data, tokens[j-1].decode("ascii"), tokens[j])
-      elif c == b"BODY" and j + 1 < len(tokens):
-        j += 1
-        data = db.message_body_get(msg.body_hash) or b""
-        matched = matched and body_contains(data, tokens[j])
-      elif c == b"TEXT" and j + 1 < len(tokens):
-        j += 1
-        data = db.message_body_get(msg.body_hash) or b""
-        matched = matched and text_contains(data, tokens[j])
-      elif c in (b"SINCE", b"BEFORE", b"ON") and j + 1 < len(tokens):
-        j += 1
-        try:
-          target_ts = parse_search_date(tokens[j])
-          msg_date = datetime.datetime.fromtimestamp(msg.received_date, tz=datetime.timezone.utc)
-          target_date = datetime.datetime.fromtimestamp(target_ts, tz=datetime.timezone.utc)
-          if c == b"SINCE":
-            matched = matched and msg_date.date() >= target_date.date()
-          elif c == b"BEFORE":
-            matched = matched and msg_date.date() < target_date.date()
-          else:
-            matched = matched and msg_date.date() == target_date.date()
-        except (ValueError, OverflowError):
-          matched = False
-      elif c == b"LARGER" and j + 1 < len(tokens):
-        j += 1
-        try: matched = matched and msg.size > int(tokens[j])
-        except ValueError: matched = False
-      elif c == b"SMALLER" and j + 1 < len(tokens):
-        j += 1
-        try: matched = matched and msg.size < int(tokens[j])
-        except ValueError: matched = False
-      elif c == b"NOT" and j + 1 < len(tokens):
-        sub_key = tokens[j + 1].upper()
-        arity = self._search_key_arity(sub_key)
-        if j + arity + 1 > len(tokens):
-          matched = False
-        else:
-          sub_tokens = tokens[j + 1:j + arity + 1]
-          sub_matched = self._evaluate_search_criteria(sub_tokens, msg, all_messages, db)
-          matched = matched and not sub_matched
-          j += arity
-      elif c == b"OR" and j + 2 < len(tokens):
-        left_key = tokens[j + 1].upper()
-        left_arity = self._search_key_arity(left_key)
-        if j + 1 + left_arity >= len(tokens):
-          matched = False
-          j += 1
-        else:
-          right_start = j + 1 + left_arity
-          right_key = tokens[right_start].upper()
-          right_arity = self._search_key_arity(right_key)
-          if right_start + right_arity > len(tokens):
-            matched = False
-            j = right_start
-          else:
-            left_tokens = tokens[j + 1:right_start]
-            right_tokens = tokens[right_start:right_start + right_arity]
-            left_matched = self._evaluate_search_criteria(left_tokens, msg, all_messages, db)
-            right_matched = self._evaluate_search_criteria(right_tokens, msg, all_messages, db)
-            matched = matched and (left_matched or right_matched)
-            j = right_start + right_arity - 1
+      if tokens[j] == b")":
+        break
+      key_result = self._eval_search_key(tokens[j], j, tokens, msg, all_messages, db)
+      key_matched, consumed = key_result
+      if consumed <= 0:
+        consumed = 1
+      matched = matched and key_matched
+      j += consumed
+    return matched, j - start
+
+  def _eval_search_key(self, tok: bytes, j: int, tokens: list[bytes], msg: Message, all_messages: list[Message], db: DatabaseSession) -> tuple[bool, int]:
+    if tok == b"(":
+      inner_matched, inner_consumed = self._eval_search_sequence(tokens, j + 1, msg, all_messages, db)
+      if j + 1 + inner_consumed < len(tokens) and tokens[j + 1 + inner_consumed] == b")":
+        consumed = inner_consumed + 2
       else:
-        matched = False
-      j += 1
-      if not matched: break
-    return matched
+        consumed = inner_consumed + 1
+      return inner_matched, consumed
+    if tok == b")":
+      return False, 1
+    c = tok.upper()
+    if c in (b"OR", b"NOT"):
+      if j + 1 >= len(tokens):
+        return False, 1
+      return self._eval_search_bool(c, j, tokens, msg, all_messages, db)
+    count = self._search_key_arity(tok)
+    consumed = min(count, len(tokens) - j)
+    sub = tokens[j + 1:j + consumed] if consumed > 1 else []
+    matched = self._eval_search_atom(tok, sub, msg, all_messages, db)
+    return matched, consumed
+
+  def _eval_search_bool(self, op: bytes, j: int, tokens: list[bytes], msg: Message, all_messages: list[Message], db: DatabaseSession) -> tuple[bool, int]:
+    if op == b"NOT":
+      sub_matched, sub_consumed = self._eval_search_key(tokens[j + 1], j + 1, tokens, msg, all_messages, db)
+      return not sub_matched, 1 + sub_consumed
+    # OR: consume two operands
+    left_matched, left_consumed = self._eval_search_key(tokens[j + 1], j + 1, tokens, msg, all_messages, db)
+    right_start = j + 1 + left_consumed
+    if right_start >= len(tokens):
+      return False, 1 + left_consumed
+    right_matched, right_consumed = self._eval_search_key(tokens[right_start], right_start, tokens, msg, all_messages, db)
+    return left_matched or right_matched, 1 + left_consumed + right_consumed
+
+  def _eval_search_atom(self, tok: bytes, sub: list[bytes], msg: Message, all_messages: list[Message], db: DatabaseSession) -> bool:
+    c = tok.upper()
+    if c in _SEARCH_FLAGS:
+      flag = _SEARCH_FLAGS[c].decode("ascii")
+      present = flag in msg.flags_s
+      return not present if _SEARCH_NEGATE_RE.match(c) else present
+    if c == b"NEW":
+      return "\\Recent" in msg.flags_s and "\\Seen" not in msg.flags_s
+    if c == b"ALL":
+      return True
+    if c == b"UID" and len(sub) >= 1:
+      uid_set = set(parse_sequence_set(sub[0], max(m.uid for m in all_messages) if all_messages else 0))
+      return msg.uid in uid_set
+    if c == b"CHARSET" and len(sub) >= 1:
+      return True
+    if c in (b"SUBJECT", b"FROM", b"TO", b"CC", b"BCC") and len(sub) >= 1:
+      data = db.message_body_get(msg.body_hash) or b""
+      return header_contains(data, c.decode("ascii"), sub[0])
+    if c == b"HEADER" and len(sub) >= 2:
+      data = db.message_body_get(msg.body_hash) or b""
+      return header_contains(data, sub[0].decode("ascii"), sub[1])
+    if c == b"BODY" and len(sub) >= 1:
+      data = db.message_body_get(msg.body_hash) or b""
+      return body_contains(data, sub[0])
+    if c == b"TEXT" and len(sub) >= 1:
+      data = db.message_body_get(msg.body_hash) or b""
+      return text_contains(data, sub[0])
+    if c in (b"SINCE", b"BEFORE", b"ON") and len(sub) >= 1:
+      try:
+        target_ts = parse_search_date(sub[0])
+        msg_date = datetime.datetime.fromtimestamp(msg.received_date, tz=datetime.timezone.utc)
+        target_date = datetime.datetime.fromtimestamp(target_ts, tz=datetime.timezone.utc)
+        if c == b"SINCE":
+          return msg_date.date() >= target_date.date()
+        if c == b"BEFORE":
+          return msg_date.date() < target_date.date()
+        return msg_date.date() == target_date.date()
+      except (ValueError, OverflowError):
+        return False
+    if c == b"LARGER" and len(sub) >= 1:
+      try:
+        return msg.size > int(sub[0])
+      except ValueError:
+        return False
+    if c == b"SMALLER" and len(sub) >= 1:
+      try:
+        return msg.size < int(sub[0])
+      except ValueError:
+        return False
+    return False
 
   async def _command_store(self, uid_mode: bool):
     await self._reader.skip_sp()
