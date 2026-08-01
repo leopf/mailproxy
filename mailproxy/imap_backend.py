@@ -1,6 +1,6 @@
 import asyncio, base64, datetime, logging, ssl
 from dataclasses import dataclass
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from typing import TypeGuard, cast
 from mailproxy.auth import account_get_oauth_access_token
 from mailproxy.db import DatabaseSession
@@ -21,12 +21,6 @@ FETCH_BATCH_SIZE = 500
 
 _sync_locks: KeyedLock[tuple[str, str]] = KeyedLock()
 _mailbox_list_locks: KeyedLock[str] = KeyedLock()
-
-def iter_uid_batches(uid_low: int, uid_high: int, batch_size: int) -> Iterator[tuple[int, int]]:
-  if uid_low > uid_high:
-    return
-  for start in range(uid_low, uid_high + 1, batch_size):
-    yield start, min(start + batch_size - 1, uid_high)
 
 @dataclass(frozen=True)
 class SelectResult:
@@ -111,18 +105,41 @@ class IMAPRemoteConnection:
           db.mailbox_update_sync(mailbox.id, uid_next=uid_next, flags_s=flags_s)
     return _SyncState(mailbox_id=mailbox_id, last_synced_uid=last_synced, uid_next=uid_next)
 
+  async def _search_uids(self, min_uid: int) -> set[int]:
+    self._start_command(b"UID SEARCH UID %d:*" % (min_uid,))
+    uids: set[int] = set()
+    async for resp in self._read_responses():
+      if resp.kind != b"SEARCH":
+        continue
+      text = resp.args[0]
+      if isinstance(text, bytes):
+        for tok in text.split():
+          try:
+            uids.add(int(tok))
+          except ValueError:
+            pass
+    return uids
+
   async def _fetch_new_messages(self, mailbox_name: str, state: _SyncState) -> None:
+    existing = await self._search_uids(state.last_synced_uid + 1)
+    new_uids = sorted(existing)
+    if not new_uids:
+      return
     with DatabaseSession(self.config) as db:
-      for batch_lo, batch_hi in iter_uid_batches(state.last_synced_uid + 1, state.uid_next - 1, FETCH_BATCH_SIZE):
+      for i in range(0, len(new_uids), FETCH_BATCH_SIZE):
+        batch = new_uids[i:i + FETCH_BATCH_SIZE]
+        batch_uids = set(batch)
+        uid_list = b",".join(b"%d" % (u,) for u in batch)
         count = 0
-        self._start_command(b"UID FETCH %d:%d (UID FLAGS INTERNALDATE BODY.PEEK[])" % (batch_lo, batch_hi))
-        async for rec in self._iter_message_records(range_filter=(batch_lo, batch_hi)):
+        self._start_command(b"UID FETCH %s (UID FLAGS INTERNALDATE BODY.PEEK[])" % (uid_list,))
+        async for rec in self._iter_message_records(uids=batch_uids):
           received_date = parse_internal_date(rec.internal_date) if rec.internal_date else int(datetime.datetime.now().timestamp())
           db.message_add(rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid))
           db.mailbox_update_sync(state.mailbox_id, last_synced_uid=rec.uid)
           db.conn.commit()
           count += 1
-        logging.debug("sync_mailbox: '%s' batch %d:%d done (%d messages, %d remaining)", mailbox_name, batch_lo, batch_hi, count, max(state.uid_next - 1 - batch_hi, 0))
+        logging.debug("sync_mailbox: '%s' batch %s done (%d messages, %d remaining)",
+          mailbox_name, uid_list.decode(), count, len(new_uids) - (i + len(batch)))
 
   async def _sync_flag_changes_and_deletions(self, mailbox_name: str, mailbox_id: int, last_synced_uid: int) -> None:
     self._start_command(b"UID FETCH 1:%d (UID FLAGS)" % (last_synced_uid,))
@@ -139,14 +156,14 @@ class IMAPRemoteConnection:
       if deleted_count > 0:
         logging.debug("sync_mailbox: '%s' soft-deleted %d messages (removed on remote)", mailbox_name, deleted_count)
 
-  async def _iter_message_records(self, range_filter: tuple[int, int] | None = None) -> AsyncIterator[_MessageRecord]:
+  async def _iter_message_records(self, uids: set[int] | None = None) -> AsyncIterator[_MessageRecord]:
     async for resp in self._read_responses():
       if resp.kind != b"FETCH": continue
       items = resp.args[1]
       if not _is_fetch_items(items): continue
       uid = items.get(b"UID")
       if not isinstance(uid, int): continue
-      if range_filter is not None and not (range_filter[0] <= uid <= range_filter[1]): continue
+      if uids is not None and uid not in uids: continue
       flags = items.get(b"FLAGS", b"")
       internal_date = items.get(b"INTERNALDATE")
       body = items.get(b"BODY[]")

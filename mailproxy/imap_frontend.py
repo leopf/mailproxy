@@ -188,7 +188,6 @@ class IMAPServerConnection:
       update_event = asyncio.Event()
 
       async def _idle_loop():
-        # A single owner of the remote socket: enter IDLE, sync on change, re-enter.
         while True:
           await remote.wait_for_update(mailbox.name, update_event)
           if self._mailbox is not None and self._mailbox.is_remote:

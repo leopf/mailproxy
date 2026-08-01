@@ -2,7 +2,7 @@ import asyncio, logging, pathlib, re, tempfile, typing, unittest
 from typing import override
 from mailproxy import imap_backend
 from mailproxy.db import DatabaseSession
-from mailproxy.imap_backend import IMAPRemoteConnection, iter_uid_batches
+from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 
 
@@ -71,12 +71,24 @@ class _FakeIMAPServer:
           writer.write(b"* OK [UIDVALIDITY 1]\r\n")
           writer.write(b"* OK [UIDNEXT %d]\r\n" % (max(self._messages) + 1 if self._messages else 1))
           writer.write(tag + b" OK [READ-WRITE]\r\n")
+        elif cmd == b"UID" and args.upper().startswith(b"SEARCH UID "):
+          m = re.match(rb"SEARCH UID (\d+):(\*)", args, re.I)
+          assert m is not None
+          min_uid = int(m.group(1))
+          uids = [u for u in sorted(self._messages) if u >= min_uid]
+          writer.write(b"* SEARCH %s\r\n" % (b" ".join(b"%d" % u for u in uids),))
+          writer.write(tag + b" OK SEARCH completed\r\n")
         elif cmd == b"UID" and args.upper().startswith(b"FETCH"):
           fetch_cmd_count += 1
           m = re.match(rb"FETCH (\d+):(\d+)", args, re.I)
-          assert m is not None
-          lo, hi = int(m.group(1)), int(m.group(2))
-          uids = [u for u in sorted(self._messages) if lo <= u <= hi]
+          if m is not None:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            uids = [u for u in sorted(self._messages) if lo <= u <= hi]
+          else:
+            m2 = re.match(rb"FETCH ([0-9,]+)", args, re.I)
+            assert m2 is not None
+            want = set(int(x) for x in m2.group(1).split(b","))
+            uids = [u for u in sorted(self._messages) if u in want]
           with_body = b"BODY" in args.upper()
           if self._drop_on_fetch is not None and fetch_cmd_count == self._drop_on_fetch:
             uids = uids[:self._drop_after_items]
@@ -206,6 +218,7 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     await conn.shutdown()
     self.assertEqual(self._message_count(), 3)
     self.assertEqual(self._last_synced_uid(), 1000)
+    self.assertEqual(server.body_fetch_count, 3)
 
   async def test_concurrent_sync_serializes_and_avoids_duplicate_fetch(self):
     messages = {u: b"Subject: msg %d\r\n\r\nbody %d" % (u, u) for u in range(1, 121)}
@@ -234,22 +247,6 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     await conn.shutdown()
     self.assertEqual(self._message_count(), 1)
 
-
-class TestIterUidBatches(unittest.TestCase):
-  def test_empty_when_low_exceeds_high(self):
-    self.assertEqual(list(iter_uid_batches(1, 0, 50)), [])
-
-  def test_single_batch_smaller_than_size(self):
-    self.assertEqual(list(iter_uid_batches(1, 120, 500)), [(1, 120)])
-
-  def test_exact_multiple(self):
-    self.assertEqual(list(iter_uid_batches(1, 100, 50)), [(1, 50), (51, 100)])
-
-  def test_final_short_batch(self):
-    self.assertEqual(list(iter_uid_batches(1, 120, 50)), [(1, 50), (51, 100), (101, 120)])
-
-  def test_single_uid_batch(self):
-    self.assertEqual(list(iter_uid_batches(77, 77, 50)), [(77, 77)])
 
 
 if __name__ == "__main__":
