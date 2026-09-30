@@ -162,12 +162,17 @@ def parse_search_date(date_s: bytes) -> int:
 class IMAPCommandFailedError(Exception):
   pass
 
+class IMAPConnectionLostError(IMAPReadError):
+  pass
+
 # RFC 9051 §9 formal syntax — byte sets for atom/astring termination.
 # atom-specials = "(" / ")" / "{" / SP / CTL / list-wildcards / quoted-specials / resp-specials
 # list-wildcards = "*" / "%"   quoted-specials = DQUOTE / "\"   resp-specials = "]" / "^"
 _ATOM_TERM = frozenset(b'(){} \t\r\n*%"\\]^')
 # astring-char = atom-char / resp-specials  (includes "]" and "^")
 _ASTRING_TERM = frozenset(b'(){} \t\r\n*%"\\')
+# list-char = atom-char / list-wildcards / resp-specials  (wildcards allowed)
+_LIST_TERM = frozenset(b'(){} \t\r\n"\\')
 
 class _StreamReaderLike(Protocol):
   """Protocol for the underlying reader IMAPReader wraps."""
@@ -318,6 +323,17 @@ class IMAPReader:
     result = await self._gather_while(lambda b: b not in _ASTRING_TERM)
     if not result:
       raise IMAPReadError("expected astring")
+    return result
+
+  async def read_list_mailbox(self) -> bytes:
+    c = await self.peek(1)
+    if c == b'"':
+      return await self.read_quoted()
+    if c == b'{':
+      return await self.read_literal()
+    result = await self._gather_while(lambda b: b not in _LIST_TERM)
+    if not result:
+      raise IMAPReadError("expected list-mailbox")
     return result
 
   async def read_nstring(self) -> bytes | None:

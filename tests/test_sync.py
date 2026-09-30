@@ -2,7 +2,7 @@ import asyncio, logging, pathlib, re, tempfile, typing, unittest
 from typing import override
 from mailproxy import imap_backend
 from mailproxy.db import DatabaseSession
-from mailproxy.imap_backend import IMAPRemoteConnection
+from mailproxy.imap_backend import IMAPRemoteConnection, IdleSession
 from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 
 
@@ -23,13 +23,18 @@ class _FakeIMAPServer:
   """Minimal fake remote IMAP server. Can drop the connection mid UID FETCH
   to simulate a timeout (drop_on_fetch = 1-based UID FETCH command index)."""
 
-  def __init__(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0):
+  def __init__(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0, delay_on: bytes | None = None, delay: float = 0):
     self._messages: dict[int, bytes] = messages
     self._drop_on_fetch: int | None = drop_on_fetch
     self._drop_after_items: int = drop_after_items
     self._idle_delay: float = idle_delay
+    self._delay_on: bytes | None = delay_on
+    self._delay: float = delay
     self._server: asyncio.Server | None = None
     self._body_fetch_count: int = 0
+    self.delayed_command_seen: asyncio.Event = asyncio.Event()
+    self.idle_started: asyncio.Event = asyncio.Event()
+    self.idle_ready: asyncio.Event = asyncio.Event()
 
   @property
   def port(self) -> int:
@@ -59,6 +64,9 @@ class _FakeIMAPServer:
         tag, _, rest = line[:-2].partition(b" ")
         cmd, _, args = rest.partition(b" ")
         cmd = cmd.upper()
+        if self._delay_on is not None and cmd == self._delay_on.upper() and self._delay:
+          self.delayed_command_seen.set()
+          await asyncio.sleep(self._delay)
         if cmd == b"CAPABILITY":
           writer.write(b"* CAPABILITY IMAP4rev1\r\n" + tag + b" OK\r\n")
         elif cmd == b"LOGIN":
@@ -102,10 +110,12 @@ class _FakeIMAPServer:
             if with_body: self._body_fetch_count += 1
           writer.write(tag + b" OK\r\n")
         elif cmd == b"IDLE":
+          self.idle_started.set()
           if self._idle_delay:
             await asyncio.sleep(self._idle_delay)
           writer.write(b"+ idling\r\n")
           await writer.drain()
+          self.idle_ready.set()
           while True:
             idle_line = await reader.readuntil(b"\r\n")
             if idle_line.strip().upper() == b"DONE":
@@ -157,8 +167,8 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     for server in self._servers:
       await server.stop()
 
-  async def _start_server(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0) -> _FakeIMAPServer:
-    server = _FakeIMAPServer(messages, drop_on_fetch, drop_after_items, idle_delay)
+  async def _start_server(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0, delay_on: bytes | None = None, delay: float = 0) -> _FakeIMAPServer:
+    server = _FakeIMAPServer(messages, drop_on_fetch, drop_after_items, idle_delay, delay_on, delay)
     await server.start()
     self._servers.append(server)
     return server
@@ -233,19 +243,74 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self._last_synced_uid(), 120)
     self.assertEqual(server.body_fetch_count, 120)
 
-  async def test_idle_cancellation_during_plus_wait_recovers(self):
-    messages = {1: b"one"}
-    server = await self._start_server(messages, idle_delay=1.0)
+  async def test_cancelled_sync_invalidates_connection(self):
+    messages = {u: b"body %d" % u for u in range(1, 6)}
+    server = await self._start_server(messages, delay_on=b"UID", delay=1)
     conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
-    update_event = asyncio.Event()
-    task = asyncio.create_task(conn.wait_for_update("INBOX", update_event))
-    await asyncio.sleep(0.2)
+    task = asyncio.create_task(conn.sync_mailbox("INBOX"))
+    _ = await asyncio.wait_for(server.delayed_command_seen.wait(), 5)
     _ = task.cancel()
     with self.assertRaises(asyncio.CancelledError):
       await task
+    self.assertTrue(conn.broken)
+    await conn.shutdown()
+
+    server2 = await self._start_server(messages)
+    conn2 = await IMAPRemoteConnection.open(self.config, _make_account(server2.port))
+    await conn2.sync_mailbox("INBOX")
+    await conn2.shutdown()
+    self.assertEqual(self._message_count(), 5)
+
+  async def test_cancelled_command_invalidates_connection(self):
+    messages = {1: b"one"}
+    server = await self._start_server(messages, idle_delay=1)
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+
+    async def run_idle():
+      async with conn.idle("INBOX") as idle:
+        _ = await idle.wait()
+
+    task = asyncio.create_task(run_idle())
+    _ = await asyncio.wait_for(server.idle_started.wait(), 5)
+    _ = task.cancel()
+    with self.assertRaises(asyncio.CancelledError):
+      await task
+    self.assertTrue(conn.broken)
+    await conn.shutdown()
+
+  async def test_idle_exit_request_leaves_connection_usable(self):
+    messages = {1: b"one"}
+    server = await self._start_server(messages)
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+    holder: list[object] = []
+    result: list[bool] = []
+
+    async def run_idle():
+      async with conn.idle("INBOX") as idle:
+        holder.append(idle)
+        result.append(await idle.wait())
+
+    task = asyncio.create_task(run_idle())
+    _ = await asyncio.wait_for(server.idle_ready.wait(), 5)
+    for _ in range(100):
+      if holder:
+        break
+      await asyncio.sleep(0)
+    typing.cast(IdleSession, holder[0]).request_exit()
+    _ = await asyncio.wait_for(task, 5)
+    self.assertEqual(result, [False])
     await conn.sync_mailbox("INBOX")
     await conn.shutdown()
     self.assertEqual(self._message_count(), 1)
+
+  async def test_concurrent_commands_are_serialized(self):
+    messages = {u: b"msg %d" % u for u in range(1, 6)}
+    server = await self._start_server(messages)
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+    _ = await asyncio.gather(conn.sync_mailbox_list(), conn.sync_mailbox_list())
+    await conn.sync_mailbox("INBOX")
+    await conn.shutdown()
+    self.assertEqual(self._message_count(), 5)
 
 
 

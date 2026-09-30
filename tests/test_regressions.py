@@ -80,7 +80,7 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
     h.pipe.feed(b"DONE\r\n")
     h.finish()
     await h.run()
-    self.assertNotIn("wait_for_update", [c[0] for c in self.remote.calls])
+    self.assertNotIn("idle", [c[0] for c in self.remote.calls])
 
   # --- Bug 5: seen-flag STORE after COPY/APPEND must target the source mailbox ---
 

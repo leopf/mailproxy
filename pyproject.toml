@@ -35,6 +35,7 @@ lint.select = ["F", "W293", "W291", "W191", "W292", "W391", "E703"]
 include = [
     "mailproxy/*.py",
     "tests/**.py",
+    "tests/e2e/**.py",
     "extra/**.py",
     "examples/**.py",
     "setup.py",

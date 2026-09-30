@@ -1,7 +1,7 @@
-import asyncio
-from collections.abc import Awaitable, Callable
+import asyncio, contextlib
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import cast, override
-from mailproxy.imap_backend import IMAPRemoteConnection
+from mailproxy.imap_backend import CommandContext, IdleSession, IMAPRemoteConnection
 from mailproxy.model import Account, Config
 from .helpers import MemoryWriter
 
@@ -10,6 +10,24 @@ class _DummyReader(asyncio.StreamReader):
   def __init__(self) -> None:
     asyncio.StreamReader.__init__(self)
     self.feed_eof()
+
+
+class _FakeIdleSession(IdleSession):
+  def __init__(self) -> None:
+    super().__init__(cast("CommandContext", cast("object", None)), cast("asyncio.StreamWriter", cast("object", None)))
+    self.finished: bool = False
+
+  @override
+  def request_exit(self) -> None:
+    self.finished = True
+
+  @override
+  async def wait(self) -> bool:
+    return False
+
+  @override
+  async def close(self) -> None:
+    self.finished = True
 
 
 class FakeRemoteConnection(IMAPRemoteConnection):
@@ -44,9 +62,10 @@ class FakeRemoteConnection(IMAPRemoteConnection):
     _ = self._record("sync_mailbox_list")
 
   @override
-  async def wait_for_update(self, mailbox_name: str, update_event: asyncio.Event) -> None:
-    _ = self._record("wait_for_update", mailbox_name)
-    update_event.set()
+  @contextlib.asynccontextmanager
+  async def idle(self, mailbox_name: str) -> AsyncGenerator[IdleSession, None]:
+    _ = self._record("idle", mailbox_name)
+    yield _FakeIdleSession()
 
   @override
   async def shutdown(self) -> None:

@@ -3,8 +3,8 @@ from collections.abc import Awaitable, Callable
 from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import DatabaseSession
-from mailproxy.imap_backend import IMAPRemoteConnection
-from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPReadError, IMAPReader, SYSTEM_FLAGS, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
+from mailproxy.imap_backend import IdleSession, IMAPRemoteConnection
+from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPConnectionLostError, IMAPReadError, IMAPReader, SYSTEM_FLAGS, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
     filter_headers, flags_to_s, format_internal_date, header_contains, body_contains, text_contains, parse_search_date, \
     imap_to_quoted_string, parse_internal_date, parse_sequence_set, split_message, filter_headers_not
 from mailproxy.model import Account, Config, Mailbox, Message
@@ -38,25 +38,55 @@ class IMAPServerConnection:
     self._remote_factory: Callable[[Config, Account], Awaitable[IMAPRemoteConnection]] | None = remote_factory
     self._last_tag: bytes | None = None
     self._remote_connection: IMAPRemoteConnection | None = None
+    self._remote_account: Account | None = None
     self._mailbox: Mailbox | None = None
     self._mailbox_read_only: bool = False
     self._capabilities: list[bytes] = [b"IMAP4rev1", b"AUTH=PLAIN", b"STARTTLS", b"ENABLE", b"IDLE", b"UIDPLUS"]
     self._tls_active: bool = False
     self._is_universe_mailbox: bool = False
+    self._wrote_response: bool = False
 
   def _write_response(self, code: Literal[b"OK"] | Literal[b"NO"] | Literal[b"BAD"], message: bytes):
     assert self._last_tag is not None
     self._writer.write(b"%s %s %s\r\n" % (self._last_tag, code, message))
     self._last_tag = None
+    self._wrote_response = True
 
   def _write_line(self, line: bytes):
     self._writer.write(line)
     self._writer.write(b"\r\n")
+    self._wrote_response = True
 
-  def _require_remote(self) -> IMAPRemoteConnection:
-    if self._remote_connection is None:
+  async def _get_remote(self) -> IMAPRemoteConnection:
+    conn = self._remote_connection
+    if conn is not None and not conn.broken:
+      return conn
+    account = self._remote_account
+    if account is None:
       raise IMAPCommandFailedError("must be logged in")
-    return self._remote_connection
+    logging.warning("IMAP: remote connection lost, reconnecting")
+    try:
+      await self._open_remote(account)
+    except Exception as e:
+      raise IMAPConnectionLostError(f"remote reconnect failed: {e}") from e
+    conn = self._remote_connection
+    assert conn is not None
+    mailbox = self._mailbox
+    if mailbox is not None and mailbox.is_remote and not self._is_universe_mailbox:
+      try:
+        await conn.sync_mailbox(mailbox.name)
+      except Exception as e:
+        logging.warning("IMAP: failed to restore mailbox '%s' after reconnect: %s", mailbox.name, e)
+    return conn
+
+  async def _invalidate_remote(self):
+    conn = self._remote_connection
+    self._remote_connection = None
+    if conn is not None:
+      try:
+        await conn.shutdown()
+      except Exception:
+        pass
 
   def _require_mailbox(self) -> Mailbox:
     if self._mailbox is None:
@@ -88,7 +118,7 @@ class IMAPServerConnection:
 
   async def _sync_mailbox(self):
     mailbox = self._require_mailbox()
-    remote = self._require_remote()
+    remote = await self._get_remote()
     if mailbox.is_remote:
       await remote.sync_mailbox(mailbox.name)
 
@@ -102,7 +132,7 @@ class IMAPServerConnection:
     if self._mailbox is not None:
       mailbox = self._mailbox
       if not self._is_universe_mailbox:
-        remote = self._require_remote()
+        remote = await self._get_remote()
         if mailbox.is_remote:
           try:
             await remote.sync_mailbox(mailbox.name)
@@ -135,6 +165,7 @@ class IMAPServerConnection:
       try: await asyncio.wait_for(self._remote_connection.shutdown(), 1)
       except Exception: pass
       self._remote_connection = None
+    self._remote_account = None
     logging.debug("STARTTLS: TLS upgrade complete")
 
   async def _command_logout(self):
@@ -191,21 +222,31 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     self._write_line(b"+ idling")
     idle_task: asyncio.Task[None] | None = None
+    stop_event = asyncio.Event()
+    idle_holder: list[IdleSession] = []
     if self._mailbox is not None and not self._is_universe_mailbox and self._mailbox.is_remote:
       mailbox = self._mailbox
-      remote = self._require_remote()
-      update_event = asyncio.Event()
+      remote = await self._get_remote()
 
       async def _idle_loop():
-        while True:
-          await remote.wait_for_update(mailbox.name, update_event)
+        while not stop_event.is_set():
+          async with remote.idle(mailbox.name) as idle:
+            idle_holder.clear()
+            idle_holder.append(idle)
+            try:
+              if stop_event.is_set():
+                idle.request_exit()
+              changed = await idle.wait()
+            finally:
+              idle_holder.clear()
+          if stop_event.is_set() or not changed:
+            break
           if self._mailbox is not None and self._mailbox.is_remote:
             try:
               await remote.sync_mailbox(self._mailbox.name)
             except Exception as e:
               logging.warning("idle sync failed for '%s': %s", self._mailbox.name, e)
           self._write_mailbox_update()
-          update_event.clear()
 
       idle_task = asyncio.create_task(_idle_loop())
     try:
@@ -213,11 +254,18 @@ class IMAPServerConnection:
       await self._reader.read_crlf()
       if done.upper() != b"DONE":
         raise IMAPReadError(f"expected DONE, got {done!r}")
-      self._write_response(b"OK", b"IDLE completed")
     finally:
       if idle_task is not None:
-        _ = idle_task.cancel()
-        _ = await asyncio.wait([idle_task])
+        stop_event.set()
+        if idle_holder:
+          idle_holder[0].request_exit()
+        try:
+          await asyncio.wait_for(idle_task, 30)
+        except asyncio.TimeoutError:
+          logging.warning("IDLE: timed out waiting for the remote idle loop to stop")
+        except Exception as e:
+          logging.debug("IDLE: idle loop raised: %s", e)
+    self._write_response(b"OK", b"IDLE completed")
 
   async def _command_status(self):
     await self._reader.skip_sp()
@@ -229,7 +277,7 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     attrs = attrs_raw.strip().split(b" ")
 
-    remote = self._require_remote()
+    remote = await self._get_remote()
     account = remote.account
 
     is_universe = mailbox_name == _UNIVERSE_MAILBOX or (mailbox_name is None and self._is_universe_mailbox)
@@ -268,7 +316,7 @@ class IMAPServerConnection:
     await self._reader.skip_sp()
     mailbox_name = (await self._reader.read_astring()).decode()
     await self._reader.read_crlf()
-    remote = self._require_remote()
+    remote = await self._get_remote()
     account = remote.account
 
     if mailbox_name == _UNIVERSE_MAILBOX:
@@ -324,9 +372,9 @@ class IMAPServerConnection:
     await self._reader.skip_sp()
     reference_name_raw = await self._reader.read_astring()
     await self._reader.skip_sp()
-    pattern_raw = await self._reader.read_astring()
+    pattern_raw = await self._reader.read_list_mailbox()
     await self._reader.read_crlf()
-    remote = self._require_remote()
+    remote = await self._get_remote()
 
     reference_name = reference_name_raw.decode()
     pattern = pattern_raw.decode()
@@ -362,7 +410,7 @@ class IMAPServerConnection:
   async def _command_close(self):
     mailbox = self._mailbox
     if mailbox is not None and not self._mailbox_read_only and not self._is_universe_mailbox:
-      remote = self._require_remote()
+      remote = await self._get_remote()
       with DatabaseSession(self._config) as db:
         deleted = [m.uid for m in db.message_list(mailbox.id) if "\\Deleted" in m.flags_s]
       if deleted and mailbox.is_remote:
@@ -422,7 +470,7 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
 
     mailbox = self._require_mailbox()
-    _ = self._require_remote()
+    _ = await self._get_remote()
 
     items: list[bytes] = []
     for item in raw_items:
@@ -525,7 +573,7 @@ class IMAPServerConnection:
         self._writer.write(b")\r\n")
 
     if seen_uids_to_update:
-      remote = self._require_remote()
+      remote = await self._get_remote()
       with DatabaseSession(self._config) as db:
         for mb_id, uid, new_flags in seen_uids_to_update:
           db.message_update_flags(mb_id, uid, new_flags)
@@ -564,7 +612,7 @@ class IMAPServerConnection:
   async def _command_search(self, uid_mode: bool):
     await self._reader.skip_sp()
     mailbox = self._require_mailbox()
-    _ = self._require_remote()
+    _ = await self._get_remote()
 
     tokens = await self._read_search_tokens()
     if tokens:
@@ -711,7 +759,7 @@ class IMAPServerConnection:
     mailbox = self._require_mailbox()
     if self._reject_if_universe():
       return
-    remote = self._require_remote()
+    remote = await self._get_remote()
 
     new_flags = set(f.decode("ascii").lstrip("\\") for f in flags_s_raw.strip().split(b" ") if f)
     silent = op_s.endswith(b".SILENT")
@@ -780,7 +828,7 @@ class IMAPServerConnection:
 
     if mailbox_name == _UNIVERSE_MAILBOX:
       return self._write_response(b"NO", b"universe mailbox is read-only")
-    remote = self._require_remote()
+    remote = await self._get_remote()
     account = remote.account
     logging.debug("APPEND: mailbox=%s flags=%s size=%d", mailbox_name, flags_s, len(data))
     with DatabaseSession(self._config) as db:
@@ -805,7 +853,7 @@ class IMAPServerConnection:
     await self._reader.read_crlf()
     if mailbox_name == _UNIVERSE_MAILBOX:
       return self._write_response(b"NO", b"cannot create universe mailbox")
-    remote = self._require_remote()
+    remote = await self._get_remote()
     try:
       await remote.create_mailbox(mailbox_name)
     except IMAPCommandFailedError as e:
@@ -817,7 +865,7 @@ class IMAPServerConnection:
     await self._reader.skip_sp()
     mailbox_name = (await self._reader.read_astring()).decode()
     await self._reader.read_crlf()
-    remote = self._require_remote()
+    remote = await self._get_remote()
     account = remote.account
     with DatabaseSession(self._config) as db:
       mailbox = db.mailbox_by_name(account.key, mailbox_name)
@@ -839,7 +887,7 @@ class IMAPServerConnection:
     await self._reader.skip_sp()
     new_name = (await self._reader.read_astring()).decode()
     await self._reader.read_crlf()
-    remote = self._require_remote()
+    remote = await self._get_remote()
     account = remote.account
     with DatabaseSession(self._config) as db:
       mailbox = db.mailbox_by_name(account.key, old_name)
@@ -866,7 +914,7 @@ class IMAPServerConnection:
     if self._is_universe_mailbox or dest_name == _UNIVERSE_MAILBOX:
       self._write_response(b"NO", b"universe mailbox is read-only")
       return
-    remote = self._require_remote()
+    remote = await self._get_remote()
     account = remote.account
 
     with DatabaseSession(self._config) as db:
@@ -909,7 +957,7 @@ class IMAPServerConnection:
     mailbox = self._require_mailbox()
     if self._reject_if_universe():
       return
-    remote = self._require_remote()
+    remote = await self._get_remote()
 
     with DatabaseSession(self._config) as db:
       all_msgs = list(db.message_list(mailbox.id))
@@ -937,13 +985,18 @@ class IMAPServerConnection:
 
   async def _open_remote(self, account: Account):
     if self._remote_connection is not None:
-      await self._remote_connection.shutdown()
+      try:
+        await self._remote_connection.shutdown()
+      except Exception:
+        pass
     if self._remote_factory is not None:
       self._remote_connection = await self._remote_factory(self._config, account)
     else:
       self._remote_connection = await IMAPRemoteConnection.open(self._config, account)
+    self._remote_account = account
 
   async def _handle_command(self):
+    self._wrote_response = False
     self._last_tag = await self._reader.read_atom()
     await self._reader.skip_sp()
     command = (await self._reader.read_atom()).upper()
@@ -1002,6 +1055,14 @@ class IMAPServerConnection:
           logging.debug("command failed: %s", e)
           if self._last_tag is not None:
             self._write_response(b"NO", b"command failed with internal error")
+        except IMAPConnectionLostError as e:
+          logging.warning("IMAP frontend: remote connection lost: %s", e)
+          await self._invalidate_remote()
+          if self._last_tag is None:
+            continue
+          if self._wrote_response:
+            break
+          self._write_response(b"NO", b"[UNAVAILABLE] remote connection lost")
         except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError, IMAPReadError):
           logging.debug("IMAP frontend: client disconnected")
           break

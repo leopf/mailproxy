@@ -5,6 +5,7 @@
     pkgs.python313
     pkgs.python313.pkgs.virtualenv
     pkgs.swaks
+    pkgs.dovecot
   ];
 
   profile = ''
