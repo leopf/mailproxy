@@ -1,13 +1,14 @@
-import pathlib, tempfile, unittest
+import asyncio, pathlib, tempfile, unittest
 from typing import override
 
 from mailproxy.db import DatabaseSession
+from mailproxy.imap_backend import IMAPRemoteConnection
 from mailproxy.imap_parsing import IMAPAlreadyExistsError, IMAPCommandFailedError
 
 from tests.fake_remote import FakeRemoteConnection
 from tests.harness import IMAPHarness
-from tests.helpers import make_config, seed_account, seed_mailbox, seed_message
-from mailproxy.model import Config
+from tests.helpers import BidiPipe, RecordingTlsWriter, make_config, seed_account, seed_mailbox, seed_message
+from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 
 
 class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
@@ -171,6 +172,30 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
     out = h.output()
     self.assertIn(b"INBOX", out)
     self.assertIn(b"Archive", out)
+
+
+class TestStartTlsUpgrade(unittest.IsolatedAsyncioTestCase):
+  # --- Bug: STARTTLS upgrades must pass server_hostname (check_hostname requires it) ---
+
+  async def test_imap_starttls_passes_server_hostname(self):
+    pipe = BidiPipe()
+    writer = RecordingTlsWriter(pipe.a_writer)
+    account = Account(
+      addresses=("test@example.com",),
+      imap_host="imap.example.com",
+      imap_port=143,
+      imap_tlsmode=TLSMode.STARTTLS,
+      smtp_host="smtp.example.com",
+      smtp_port=587,
+      smtp_tlsmode=TLSMode.STARTTLS,
+      auth=AuthenticationPLAIN(password="pw"),
+    )
+    conn = IMAPRemoteConnection(make_config(), account, pipe.a_reader, writer)  # pyright: ignore[reportArgumentType]
+    task = asyncio.create_task(conn._command_starttls())
+    self.assertEqual(await asyncio.wait_for(pipe.b_reader.readuntil(b"\r\n"), timeout=5), b"A1 STARTTLS\r\n")
+    pipe.feed_a(b"A1 OK begin TLS\r\n")
+    await asyncio.wait_for(task, timeout=5)
+    self.assertEqual([host for _, host in writer.tls_upgrades], ["imap.example.com"])
 
 
 def _make_account(address: str):

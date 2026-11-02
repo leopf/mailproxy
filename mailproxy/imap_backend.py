@@ -476,7 +476,7 @@ class IMAPRemoteConnection:
   async def _command_starttls(self):
     async with self.command(b"STARTTLS"):
       pass
-    await self._writer.start_tls(IMAPRemoteConnection._tls_context)
+    await self._writer.start_tls(IMAPRemoteConnection._tls_context, server_hostname=self.account.imap_host)
 
   def _start_command(self, command: bytes) -> bytes:
     self._command_counter += 1

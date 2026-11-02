@@ -125,6 +125,41 @@ class LinkedWriter:
     return default
 
 
+class RecordingTlsWriter:
+  """Wraps a test writer and records ``start_tls`` upgrades instead of doing TLS.
+
+  Enforces the same invariant as asyncio's StreamWriter: a context with
+  ``check_hostname`` set requires ``server_hostname``."""
+
+  def __init__(self, inner: LinkedWriter) -> None:
+    self._inner: LinkedWriter = inner
+    self.tls_upgrades: list[tuple[object, str | None]] = []
+
+  async def start_tls(self, sslcontext: object, *, server_hostname: str | None = None,
+      ssl_handshake_timeout: float | None = None, ssl_shutdown_timeout: float | None = None) -> None:
+    if getattr(sslcontext, "check_hostname", False) and server_hostname is None:
+      raise ValueError("check_hostname requires server_hostname")
+    self.tls_upgrades.append((sslcontext, server_hostname))
+
+  def write(self, data: bytes) -> None:
+    self._inner.write(data)
+
+  def writelines(self, lines: Iterable[bytes]) -> None:
+    self._inner.writelines(lines)
+
+  async def drain(self) -> None:
+    await self._inner.drain()
+
+  def close(self) -> None:
+    self._inner.close()
+
+  def is_closing(self) -> bool:
+    return self._inner.is_closing()
+
+  def get_extra_info(self, _name: str, default: object | None = None) -> object | None:
+    return self._inner.get_extra_info(_name, default)
+
+
 
 def make_config(db_path: pathlib.Path | None = None, *, proxy_password: str = "pw") -> Config:
   return Config(

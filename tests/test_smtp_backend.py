@@ -4,10 +4,10 @@ from typing import override
 from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 from mailproxy.smtp_backend import smtp_forward_mail
 
-from tests.helpers import BidiPipe, make_config
+from tests.helpers import BidiPipe, RecordingTlsWriter, make_config
 
 
-def _smtp_account(password: str = "pw") -> Account:
+def _smtp_account(tlsmode: TLSMode = TLSMode.DIRECT) -> Account:
   return Account(
     addresses=("test@example.com",),
     imap_host="imap.example.com",
@@ -15,8 +15,8 @@ def _smtp_account(password: str = "pw") -> Account:
     imap_tlsmode=TLSMode.DIRECT,
     smtp_host="smtp.example.com",
     smtp_port=587,
-    smtp_tlsmode=TLSMode.DIRECT,
-    auth=AuthenticationPLAIN(password=password),
+    smtp_tlsmode=tlsmode,
+    auth=AuthenticationPLAIN(password="pw"),
   )
 
 
@@ -69,6 +69,21 @@ def _greeting() -> list[tuple[int, str]]:
   ]
 
 
+def _greeting_starttls() -> list[tuple[int, str]]:
+  return [
+    (220, "smtp ready"),
+    (250, "EHLO ok"),
+    (220, "start TLS"),
+    (250, "EHLO ok"),
+    (235, "auth ok"),
+    (250, "mail ok"),
+    (250, "rcpt ok"),
+    (354, "go"),
+    (250, "message accepted"),
+    (221, "bye"),
+  ]
+
+
 class TestSMTPBackend(unittest.IsolatedAsyncioTestCase):
   @override
   def setUp(self):
@@ -79,12 +94,13 @@ class TestSMTPBackend(unittest.IsolatedAsyncioTestCase):
   def tearDown(self):
     self._tmpdir.cleanup()
 
-  async def _forward(self, server: FakeSMTPServer, mail: bytes = b"Subject: hi\r\n\r\nbody"):
+  async def _forward(self, server: FakeSMTPServer, mail: bytes = b"Subject: hi\r\n\r\nbody", account: Account | None = None, writer: RecordingTlsWriter | None = None):
     pipe: BidiPipe = server.pipe
+    out = writer if writer is not None else pipe.a_writer
     async def conn():
-      return pipe.a_reader, pipe.a_writer
+      return pipe.a_reader, out
     task = asyncio.create_task(smtp_forward_mail(
-      self.config, _smtp_account(), "me@example.com", ("you@example.com",), mail,
+      self.config, account if account is not None else _smtp_account(), "me@example.com", ("you@example.com",), mail,
       open_connection=conn))  # pyright: ignore[reportArgumentType]
     peer = asyncio.create_task(server.run())
     await asyncio.wait_for(task, timeout=5)
@@ -105,6 +121,14 @@ class TestSMTPBackend(unittest.IsolatedAsyncioTestCase):
     server = FakeSMTPServer(replies)
     with self.assertRaises(Exception):
       await self._forward(server)
+
+  async def test_starttls_upgrade_passes_server_hostname(self):
+    server = FakeSMTPServer(_greeting_starttls())
+    writer = RecordingTlsWriter(server.pipe.a_writer)
+    await self._forward(server, account=_smtp_account(TLSMode.STARTTLS), writer=writer)
+    self.assertIn(b"STARTTLS", server.commands)
+    self.assertEqual(server.commands.count(b"EHLO example.com"), 2, server.commands)
+    self.assertEqual([host for _, host in writer.tls_upgrades], ["smtp.example.com"])
 
 
 if __name__ == "__main__":

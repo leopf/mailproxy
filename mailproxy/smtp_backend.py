@@ -65,7 +65,7 @@ async def smtp_forward_mail(config: Config, account: Account, sender: str, recip
     _ = await _smtp_send(writer, reader, f"EHLO {ehlo_domain}")
     if account.smtp_tlsmode == TLSMode.STARTTLS:
       _ = await _smtp_send(writer, reader, "STARTTLS")
-      await writer.start_tls(ssl.create_default_context())
+      await writer.start_tls(ssl.create_default_context(), server_hostname=account.smtp_host)
       _ = await _smtp_send(writer, reader, f"EHLO {ehlo_domain}")
     await _smtp_authenticate(writer, reader, account, config)
     _ = await _smtp_send(writer, reader, f"MAIL FROM:<{sender}>", expect_code=250)
