@@ -42,5 +42,5 @@ class TestClientIntegration(unittest.IsolatedAsyncioTestCase):
     self.assertIn(b"* 2 EXISTS", out)
     self.assertIn(b"UID 1", out)
     self.assertIn(b"body one", out)
-    self.assertTrue(any(c[0] == "uid_store" for c in remote.calls), remote.calls)
+    self.assertTrue(any(c[0] == "uid_store_many" for c in remote.calls), remote.calls)
     self.assertIn(b"A8 OK", out)

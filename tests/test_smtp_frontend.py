@@ -115,6 +115,18 @@ class TestSMTPFrontend(unittest.IsolatedAsyncioTestCase):
     self.assertIn(b"530", sess.last_reply)
     await sess.close()
 
+  async def test_auth_credentials_are_not_logged(self):
+    sess = SMTPFRONT(self.config)
+    await sess.reply()  # 220
+    secret_b64 = _b64plain(self.account, "pw")
+    with self.assertLogs(level="DEBUG") as logs:
+      sess.send("AUTH PLAIN %s" % secret_b64)
+      await sess.reply()
+    self.assertIn(b"235", sess.last_reply)
+    self.assertTrue(any("AUTH <redacted>" in record.getMessage() for record in logs.records), logs.output)
+    self.assertFalse(any(secret_b64 in record.getMessage() for record in logs.records), logs.output)
+    await sess.close()
+
 
 if __name__ == "__main__":
   _ = unittest.main()

@@ -78,7 +78,7 @@ class TestFrontend(unittest.IsolatedAsyncioTestCase):
     def boom(*_args: object) -> None:
       raise IMAPConnectionLostError("socket gone")
 
-    remote.behaviors["uid_store"] = boom
+    remote.behaviors["uid_store_many"] = boom
     h = self._h(remote=remote)
     h.login()
     h.cmd("A2", "SELECT INBOX")

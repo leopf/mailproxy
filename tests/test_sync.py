@@ -3,6 +3,7 @@ from typing import override
 from mailproxy import imap_backend
 from mailproxy.db import DatabaseSession
 from mailproxy.imap_backend import IMAPRemoteConnection, IdleSession
+from mailproxy.imap_parsing import IMAPAlreadyExistsError, IMAPCommandFailedError
 from mailproxy.model import Account, AuthenticationPLAIN, Config, TLSMode
 
 
@@ -23,13 +24,15 @@ class _FakeIMAPServer:
   """Minimal fake remote IMAP server. Can drop the connection mid UID FETCH
   to simulate a timeout (drop_on_fetch = 1-based UID FETCH command index)."""
 
-  def __init__(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0, delay_on: bytes | None = None, delay: float = 0):
+  def __init__(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0, delay_on: bytes | None = None, delay: float = 0, fetch_descending: bool = False, create_response: bytes | None = None):
     self._messages: dict[int, bytes] = messages
     self._drop_on_fetch: int | None = drop_on_fetch
     self._drop_after_items: int = drop_after_items
     self._idle_delay: float = idle_delay
     self._delay_on: bytes | None = delay_on
     self._delay: float = delay
+    self._fetch_descending: bool = fetch_descending
+    self._create_response: bytes | None = create_response
     self._server: asyncio.Server | None = None
     self._body_fetch_count: int = 0
     self.delayed_command_seen: asyncio.Event = asyncio.Event()
@@ -73,6 +76,11 @@ class _FakeIMAPServer:
           writer.write(tag + b" OK\r\n")
         elif cmd == b"LIST":
           writer.write(b'* LIST () "/" INBOX\r\n' + tag + b" OK\r\n")
+        elif cmd == b"CREATE":
+          if self._create_response is not None:
+            writer.write(tag + b" " + self._create_response + b"\r\n")
+          else:
+            writer.write(tag + b" BAD\r\n")
         elif cmd == b"SELECT":
           writer.write(b"* FLAGS (\\Seen \\Answered)\r\n")
           writer.write(b"* %d EXISTS\r\n" % len(self._messages))
@@ -97,6 +105,8 @@ class _FakeIMAPServer:
             assert m2 is not None
             want = set(int(x) for x in m2.group(1).split(b","))
             uids = [u for u in sorted(self._messages) if u in want]
+          if self._fetch_descending:
+            uids = list(reversed(uids))
           with_body = b"BODY" in args.upper()
           if self._drop_on_fetch is not None and fetch_cmd_count == self._drop_on_fetch:
             uids = uids[:self._drop_after_items]
@@ -167,8 +177,8 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     for server in self._servers:
       await server.stop()
 
-  async def _start_server(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0, delay_on: bytes | None = None, delay: float = 0) -> _FakeIMAPServer:
-    server = _FakeIMAPServer(messages, drop_on_fetch, drop_after_items, idle_delay, delay_on, delay)
+  async def _start_server(self, messages: dict[int, bytes], drop_on_fetch: int | None = None, drop_after_items: int = 0, idle_delay: float = 0, delay_on: bytes | None = None, delay: float = 0, fetch_descending: bool = False, create_response: bytes | None = None) -> _FakeIMAPServer:
+    server = _FakeIMAPServer(messages, drop_on_fetch, drop_after_items, idle_delay, delay_on, delay, fetch_descending, create_response)
     await server.start()
     self._servers.append(server)
     return server
@@ -229,6 +239,20 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self._message_count(), 3)
     self.assertEqual(self._last_synced_uid(), 1000)
     self.assertEqual(server.body_fetch_count, 3)
+
+  async def test_descending_fetch_order_advances_watermark(self):
+    # Yahoo streams UID FETCH responses newest-first; the sync pointer must
+    # still advance past the whole batch instead of restarting at its first uid.
+    messages = {u: b"Subject: msg %d\r\n\r\nbody %d" % (u, u) for u in range(1, 121)}
+    server = await self._start_server(messages, fetch_descending=True)
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+    await conn.sync_mailbox("INBOX")
+    self.assertEqual(self._last_synced_uid(), 120)
+    self.assertEqual(self._message_count(), 120)
+    await conn.sync_mailbox("INBOX")
+    await conn.shutdown()
+    self.assertEqual(self._last_synced_uid(), 120)
+    self.assertEqual(server.body_fetch_count, 120)
 
   async def test_concurrent_sync_serializes_and_avoids_duplicate_fetch(self):
     messages = {u: b"Subject: msg %d\r\n\r\nbody %d" % (u, u) for u in range(1, 121)}
@@ -311,6 +335,28 @@ class TestSync(unittest.IsolatedAsyncioTestCase):
     await conn.sync_mailbox("INBOX")
     await conn.shutdown()
     self.assertEqual(self._message_count(), 5)
+
+  async def test_create_already_exists_response_code_maps_to_typed_error(self):
+    server = await self._start_server({1: b"one"}, create_response=b"NO [ALREADYEXISTS] mailbox already exists")
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+    with self.assertRaises(IMAPAlreadyExistsError):
+      await conn.create_mailbox("Trash")
+    await conn.shutdown()
+
+  async def test_create_legacy_exists_text_maps_to_typed_error(self):
+    server = await self._start_server({1: b"one"}, create_response=b"NO create failure: Folder: /Trash exists")
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+    with self.assertRaises(IMAPAlreadyExistsError):
+      await conn.create_mailbox("Trash")
+    await conn.shutdown()
+
+  async def test_create_other_error_maps_to_generic_error(self):
+    server = await self._start_server({1: b"one"}, create_response=b"NO permission denied")
+    conn = await IMAPRemoteConnection.open(self.config, _make_account(server.port))
+    with self.assertRaises(IMAPCommandFailedError) as cm:
+      await conn.create_mailbox("Trash")
+    self.assertNotIsInstance(cm.exception, IMAPAlreadyExistsError)
+    await conn.shutdown()
 
 
 

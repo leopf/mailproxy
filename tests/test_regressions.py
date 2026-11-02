@@ -2,6 +2,7 @@ import pathlib, tempfile, unittest
 from typing import override
 
 from mailproxy.db import DatabaseSession
+from mailproxy.imap_parsing import IMAPAlreadyExistsError, IMAPCommandFailedError
 
 from tests.fake_remote import FakeRemoteConnection
 from tests.harness import IMAPHarness
@@ -93,7 +94,50 @@ class TestBugRegressions(unittest.IsolatedAsyncioTestCase):
     h.cmd("A3", "STORE 1 +FLAGS (\\Flagged)")
     h.finish()
     await h.run()
-    self.assertTrue(any(c[0] == "uid_store" for c in self.remote.calls), self.remote.calls)
+    self.assertTrue(any(c[0] == "uid_store_many" for c in self.remote.calls), self.remote.calls)
+
+  # --- Yahoo: STORE of many messages must use one remote command, not one per message ---
+
+  async def test_store_batches_remote_updates(self):
+    mid = seed_mailbox(self.config, self.account, "INBOX", is_remote=True)
+    for _ in range(3):
+      _ = seed_message(self.config, mid, b"Subject: x\r\n\r\nbody")
+    h = self._h()
+    h.login()
+    h.cmd("A2", "SELECT INBOX")
+    h.cmd("A3", "UID STORE 1:3 +FLAGS.SILENT (\\Seen)")
+    h.finish()
+    await h.run()
+    calls = [c for c in self.remote.calls if c[0] == "uid_store_many"]
+    self.assertEqual(len(calls), 1, self.remote.calls)
+    self.assertEqual(calls[0][1][0], [1, 2, 3])
+    self.assertEqual(calls[0][1][1], b"+FLAGS.SILENT")
+
+  # --- Yahoo: CREATE of an already existing folder must not surface as an error ---
+
+  async def test_create_already_exists_is_ok(self):
+    def exists(*_args: object) -> None:
+      raise IMAPAlreadyExistsError("remote command failed: NO create failure: Folder: /Trash exists")
+
+    self.remote.behaviors["create_mailbox"] = exists
+    h = self._h()
+    h.login()
+    h.cmd("A2", "CREATE Trash")
+    h.finish()
+    await h.run()
+    self.assertIn(b"A2 OK CREATE completed", h.output())
+
+  async def test_create_other_failure_still_errors(self):
+    def denied(*_args: object) -> None:
+      raise IMAPCommandFailedError("remote command failed: NO permission denied")
+
+    self.remote.behaviors["create_mailbox"] = denied
+    h = self._h()
+    h.login()
+    h.cmd("A2", "CREATE Trash")
+    h.finish()
+    await h.run()
+    self.assertIn(b"A2 NO", h.output())
 
   # --- Bug 1: IDLE on remote drives a single-socket loop (no duplicate sync while idling) ---
 

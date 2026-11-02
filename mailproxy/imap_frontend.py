@@ -4,7 +4,7 @@ from typing import Literal
 from mailproxy.auth import authenticate, authenticate_sasl
 from mailproxy.db import DatabaseSession
 from mailproxy.imap_backend import IdleSession, IMAPRemoteConnection
-from mailproxy.imap_parsing import IMAPCommandFailedError, IMAPConnectionLostError, IMAPReadError, IMAPReader, SYSTEM_FLAGS, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
+from mailproxy.imap_parsing import IMAPAlreadyExistsError, IMAPCommandFailedError, IMAPConnectionLostError, IMAPReadError, IMAPReader, SYSTEM_FLAGS, list_match, flags_set_to_s, flags_s_to_set, flags_to_b, \
     filter_headers, flags_to_s, format_internal_date, header_contains, body_contains, text_contains, parse_search_date, \
     imap_to_quoted_string, parse_internal_date, parse_sequence_set, split_message, filter_headers_not
 from mailproxy.model import Account, Config, Mailbox, Message
@@ -28,6 +28,8 @@ _FETCH_ITEM_EXPANSION = {
 }
 
 _UNIVERSE_MAILBOX = "Universe"
+
+_STORE_BATCH_SIZE = 500
 
 class IMAPServerConnection:
   def __init__(self, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -578,8 +580,9 @@ class IMAPServerConnection:
         for mb_id, uid, new_flags in seen_uids_to_update:
           db.message_update_flags(mb_id, uid, new_flags)
       if mailbox.is_remote:
-        for _, uid, _ in seen_uids_to_update:
-          await remote.uid_store(uid, b"+FLAGS", "\\Seen\\")
+        seen_uids = [uid for _, uid, _ in seen_uids_to_update]
+        for i in range(0, len(seen_uids), _STORE_BATCH_SIZE):
+          await remote.uid_store_many(seen_uids[i:i + _STORE_BATCH_SIZE], b"+FLAGS", "\\Seen\\")
 
     self._write_response(b"OK", b"FETCH completed")
 
@@ -775,25 +778,32 @@ class IMAPServerConnection:
       messages = list(db.message_list(mailbox.id))
     matching = self._match_messages(seq_set_s, uid_mode, messages)
 
+    updates: list[tuple[int, Message, str]] = []
     for seq, msg in matching:
       current = flags_s_to_set(msg.flags_s)
       match op_mode:
         case b"+": result_flags = current | new_flags
         case b"-": result_flags = current - new_flags
         case _: result_flags = new_flags
-      flags_s = flags_set_to_s(result_flags)
+      updates.append((seq, msg, flags_set_to_s(result_flags)))
 
+    remote_op = op_s if not silent else op_s + b".SILENT"
+    for i in range(0, len(updates), _STORE_BATCH_SIZE):
+      chunk = updates[i:i + _STORE_BATCH_SIZE]
       if mailbox.is_remote and remote_flags_s != "\\":
-        await remote.uid_store(msg.uid, op_s if not silent else op_s + b".SILENT", remote_flags_s)
-        logging.debug("STORE: remote uid_store ok uid=%d op=%s flags=%s", msg.uid, op_s, remote_flags_s)
+        uids = [msg.uid for _, msg, _ in chunk]
+        await remote.uid_store_many(uids, remote_op, remote_flags_s)
+        logging.debug("STORE: remote uid_store ok uids=%s op=%s flags=%s", uids, op_s.decode(), remote_flags_s)
 
       with DatabaseSession(self._config) as db:
-        db.message_update_flags(msg.mailbox_id, msg.uid, flags_s)
+        for _, msg, flags_s in chunk:
+          db.message_update_flags(msg.mailbox_id, msg.uid, flags_s)
 
       if not silent:
-        flags_b = flags_to_b(flags_set_to_s(result_flags))
-        fetch_data = b"UID %d FLAGS (%s)" % (msg.uid, flags_b) if uid_mode else b"FLAGS (%s)" % (flags_b,)
-        self._write_line(b"* %d FETCH (%s)" % (seq, fetch_data))
+        for seq, msg, flags_s in chunk:
+          flags_b = flags_to_b(flags_s)
+          fetch_data = b"UID %d FLAGS (%s)" % (msg.uid, flags_b) if uid_mode else b"FLAGS (%s)" % (flags_b,)
+          self._write_line(b"* %d FETCH (%s)" % (seq, fetch_data))
 
     self._write_response(b"OK", b"STORE completed")
 
@@ -856,9 +866,8 @@ class IMAPServerConnection:
     remote = await self._get_remote()
     try:
       await remote.create_mailbox(mailbox_name)
-    except IMAPCommandFailedError as e:
-      if "ALREADYEXISTS" not in str(e):
-        raise
+    except IMAPAlreadyExistsError:
+      logging.debug("CREATE: mailbox '%s' already exists on remote", mailbox_name)
     self._write_response(b"OK", b"CREATE completed")
 
   async def _command_delete(self):

@@ -72,8 +72,8 @@ class FakeRemoteConnection(IMAPRemoteConnection):
     _ = self._record("shutdown")
 
   @override
-  async def uid_store(self, uid: int, op: bytes, flags_s: str) -> None:
-    _ = self._record("uid_store", uid, op, flags_s)
+  async def uid_store_many(self, uids: list[int], op: bytes, flags_s: str) -> None:
+    _ = self._record("uid_store_many", uids, op, flags_s)
 
   @override
   async def uid_append(self, mailbox_name: str, flags_s: str, internal_date: object, data: bytes) -> None:

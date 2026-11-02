@@ -99,8 +99,7 @@ class CommandContext:
     if not self._finished:
       async for _ in self.responses(): pass
     if self.state != b"OK":
-      raise IMAPCommandFailedError(
-        f"remote command failed: {(self.state or b'').decode(errors='replace')} {self.text.decode(errors='replace')}")
+      raise IMAPCommandFailedError.from_response(self.state, self.code, self.text)
 
   async def _read_completion(self) -> None:
     self.state = (await self._imap.read_atom()).upper()
@@ -277,11 +276,17 @@ class IMAPRemoteConnection:
         batch_uids = set(batch)
         uid_list = b",".join(b"%d" % (u,) for u in batch)
         count = 0
+        processed: set[int] = set()
+        prefix = 0
         async with self.command(b"UID FETCH %s (UID FLAGS INTERNALDATE BODY.PEEK[])" % (uid_list,)) as ctx:
           async for rec in self._iter_message_records(ctx, uids=batch_uids):
             received_date = parse_internal_date(rec.internal_date) if rec.internal_date else int(datetime.datetime.now().timestamp())
             db.message_add(rec.uid, state.mailbox_id, received_date, rec.flags_s, rec.body, str(rec.uid))
-            db.mailbox_update_sync(state.mailbox_id, last_synced_uid=rec.uid)
+            processed.add(rec.uid)
+            while prefix < len(batch) and batch[prefix] in processed:
+              prefix += 1
+            if prefix > 0:
+              db.mailbox_update_sync(state.mailbox_id, last_synced_uid=batch[prefix - 1])
             db.conn.commit()
             count += 1
         logging.debug("sync_mailbox: '%s' batch %s done (%d messages, %d remaining)",
@@ -355,9 +360,12 @@ class IMAPRemoteConnection:
             added += 1
       logging.debug("sync_mailbox_list: %d remote mailboxes, %d new", len(remote_mailboxes), added)
 
-  async def uid_store(self, uid: int, op: bytes, flags_s: str):
+  async def uid_store_many(self, uids: list[int], op: bytes, flags_s: str):
+    if not uids:
+      return
     flags_b = flags_to_b(flags_s) if flags_s != "\\" else b""
-    _ = await self.execute(b"UID STORE %d %s (%s)" % (uid, op, flags_b))
+    uid_list = b",".join(b"%d" % (u,) for u in uids)
+    _ = await self.execute(b"UID STORE %s %s (%s)" % (uid_list, op, flags_b))
 
   async def uid_append(self, mailbox_name: str, flags_s: str, internal_date: int | None, data: bytes):
     flags_b = b"" if flags_s == "\\" else b" (" + flags_to_b(flags_s) + b")"

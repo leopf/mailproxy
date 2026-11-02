@@ -11,6 +11,14 @@ async def _default_forward(config: Config, account: Account, sender: str, recipi
   await smtp_forward_mail(config, account, sender, recipients, mail_data)
 
 
+_CREDENTIAL_COMMAND_RE = re.compile(r"^(AUTH|LOGIN)\b", re.IGNORECASE)
+
+def _redact_credentials(line: str) -> str:
+  if _CREDENTIAL_COMMAND_RE.match(line):
+    return line.split(" ", 1)[0] + " <redacted>"
+  return line
+
+
 def _auth_reply(account: Account | None) -> tuple[int, str]:
   if account is None:
     return 535, "5.7.8  Authentication credentials invalid"
@@ -39,7 +47,7 @@ async def smtp_server_handle_client(config: Config, reader: asyncio.StreamReader
 
     while not reader.at_eof():
       line = (await reader.readuntil(b"\r\n"))[:-2].decode("ascii")
-      logging.debug("SMTP client: %s", line)
+      logging.debug("SMTP client: %s", _redact_credentials(line))
       verb, _, rest = line.partition(" ")
       match verb.upper():
         case "QUIT":

@@ -160,6 +160,19 @@ def parse_search_date(date_s: bytes) -> int:
   return int(dt.timestamp())
 
 class IMAPCommandFailedError(Exception):
+  @classmethod
+  def from_response(cls, state: bytes | None, code: bytes | None, text: bytes) -> "IMAPCommandFailedError":
+    state_s = (state or b"").decode(errors="replace")
+    code_s = "[%s] " % (code.decode(errors="replace"),) if code is not None else ""
+    message = f"remote command failed: {state_s} {code_s}{text.decode(errors='replace')}"
+    lower = text.lower()
+    if code is not None and b"ALREADYEXISTS" in code.upper():
+      return IMAPAlreadyExistsError(message)
+    if code is None and b"exists" in lower and (b"already" in lower or b"create failure" in lower):
+      return IMAPAlreadyExistsError(message)
+    return cls(message)
+
+class IMAPAlreadyExistsError(IMAPCommandFailedError):
   pass
 
 class IMAPConnectionLostError(IMAPReadError):
